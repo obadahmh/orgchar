@@ -151,3 +151,26 @@ def test_bunched_train_triggers_are_excluded_not_mismatched(tmp_path):
     good = t[~t.index.isin(late.index)]
     assert not good.exclude.any() and len(good) == len(seg["events"]) - 5
     assert set(good.train_id) == set(trains.train_id) - {bad}
+
+
+def test_single_late_trigger_is_jitter_not_lost_rows(tmp_path):
+    """One trigger recorded ~5 ms late inside a 30-ms train (fs666 curve, 30 Sep 2026) also fits
+    "2 lost rows + 3 skipped pulses" (3 x 30 - 2 x 42.67 = 4.7 ms). Taking that explanation shifted
+    every later match and threw away most of the recording."""
+    plan = P.plan_curve_pulses([21], levels=(1, 10), ipi_ms=30, reps=6, sham_reps=4, seed=2)
+    seg = plan["segments"][0]
+    trains = pd.DataFrame(seg["events"])
+    late = trains[trains.level == 10].train_id.iloc[0]
+    trig, pulses = [], []
+    for ev in seg["events"]:
+        s = int(ev["t_s"] * S.FS)
+        if ev["train_id"] == late and ev["pulse_index"] == 2:
+            s += int(0.0047 * S.FS)
+        trig.append((s, ev["key"]))
+        if ev["kind"] == "stim":
+            pulses.append((s + 6, 21, 2.0, 100.0))
+    raw = tmp_path / "raw.h5"
+    simulate.record(simulate.Organoid(seed=3), seg["duration_s"], pulses, trig, raw)
+    t = match_triggers(seg, raw)
+    assert len(t) == len(seg["events"]) and not t.exclude.any()
+    assert (t.train_id == [e["train_id"] for e in seg["events"]]).all()

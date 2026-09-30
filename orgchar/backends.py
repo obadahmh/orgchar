@@ -32,42 +32,54 @@ def _utc():
 ROW_S = 1280 / S.FS   # the platform writes (and sometimes loses) raw data in rows of 1280 samples = 42.67 ms
 
 
-def _align(edges, times, keys, tol_s=0.004, max_rows=4, lookahead=12):
+def _align(edges, times, keys, tol_s=0.004, jitter_s=0.008, max_rows=4, lookahead=12, verify=4):
     """Pair recorded trigger edges with sent events when some are missing.
 
-    Model: recorded time = send time + offset - (rows lost so far) x 42.67 ms, within a few ms.
-    Send times come from sent.csv (actual wall-clock sends; the plan when unavailable). Edges are
-    walked in order; each is given the earliest following event with the same key that fits the
-    model with 0..max_rows newly lost rows. Because a lost row is a known 42.67 ms step and the
-    tolerance is 4 ms, a gap can't be confused with the neighbouring pulse of a 30 ms train.
-    Returns (pairs [(edge_index, event_index)], gaps [edge_index just before a lost row])."""
+    Model: recorded time = send time + offset - (rows lost so far) x 42.67 ms. Send times come from
+    sent.csv (actual wall-clock sends; the plan when unavailable). The trigger path adds latency
+    jitter of a few ms to single pulses (up to ~6 ms seen on fs666, 30 Sep 2026), so one edge alone
+    can be ambiguous: a late pulse can also fit "rows lost + pulses skipped". Edges are therefore
+    walked in order, every explanation within jitter_s is considered, and the one that also explains
+    most of the next `verify` edges wins (ties: fewest lost rows, fewest skipped events, smallest
+    residual). Returns (pairs [(edge_index, event_index)], gaps [edge_index just before a lost row])."""
     rec = np.array([s / S.FS for s, _ in edges])
     tm = np.asarray(times, float)
+    ek = [k for _, k in edges]
     cands = np.array([rec[i] - tm[j] for i in range(min(20, len(rec))) for j in range(min(20, len(tm)))
-                      if edges[i][1] == keys[j]])
+                      if ek[i] == keys[j]])
     if len(cands) == 0:
         return [], []
-    off = float(cands[np.argmax([(np.abs(cands - c) < 0.002).sum() for c in cands])])
-    rows, j, pairs, gaps = 0, 0, [], []
-    for i, (_, key) in enumerate(edges):
-        hit = None
+
+    def options(i, j, rows, off, tol):
         for jj in range(j, min(j + lookahead, len(tm))):
-            if keys[jj] != key:
+            if keys[jj] != ek[i]:
                 continue
             for dr in range(max_rows + 1):
                 r = rec[i] - (tm[jj] + off - (rows + dr) * ROW_S)
-                if abs(r) < tol_s:
-                    hit = (jj, dr, r)
-                    break
+                if abs(r) < tol:
+                    yield jj, dr, r
+
+    def support(i, j, rows, off):
+        """How many of the next edges fit, with no further lost rows, after state (j, rows, off)."""
+        n = 0
+        for ii in range(i + 1, min(i + 1 + verify, len(rec))):
+            hit = next((h for h in options(ii, j, rows, off, tol_s) if h[1] == 0), None)
             if hit:
-                break
-        if hit is None:
+                n, j = n + 1, hit[0] + 1
+        return n
+
+    off = float(cands[np.argmax([(np.abs(cands - c) < 0.002).sum() for c in cands])])
+    rows, j, pairs, gaps = 0, 0, [], []
+    for i in range(len(rec)):
+        best = max(((support(i, jj + 1, rows + dr, off), -dr, -(jj - j), -abs(r), jj, dr, r)
+                    for jj, dr, r in options(i, j, rows, off, jitter_s)), default=None)
+        if best is None:
             continue                      # an edge the plan can't explain: blanked, never counted
-        jj, dr, r = hit
+        *_, jj, dr, r = best
         if dr and pairs:
             gaps.append(pairs[-1][0])
         rows += dr
-        off += 0.3 * r                    # follow slow drift between the sample clock and wall clock
+        off += 0.3 * float(np.clip(r, -0.001, 0.001))   # follow slow clock drift, not single-pulse jitter
         pairs.append((i, jj))
         j = jj + 1
     return pairs, gaps

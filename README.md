@@ -187,6 +187,7 @@ Figures are vector graphics and stay sharp when zoomed.
 |---|---|
 | The raw file loses whole rows of 1280 samples (42.7 ms), 1–4 per 6-min recording | Aligns every recorded trigger to its send time and detects each lost row; the pulse before a lost row is left out; a train missing any pulse is left out whole |
 | Triggers sent 30 ms apart were delivered late and bunched by TCP batching (fs666 curve, 30 Sep) | Sends triggers with TCP_NODELAY; a train whose pulses are not recorded at their send times (±4 ms) is left out |
+| Single triggers arrive up to ~6 ms late (trigger-path jitter; fs666 curve, 30 Sep) | Each match is checked against the next few pulses, so one late pulse is not mistaken for lost rows |
 | "Stop recording" is often not acknowledged, although the recording stopped | Checks whether the file stopped growing; completeness is judged from the recorded duration |
 | Every upload fails with `Invalid run mode` (even `./orgchar.sh disable`) | Nothing: the board is stuck. Restart the Intan service, then re-run the step |
 
