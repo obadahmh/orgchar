@@ -32,57 +32,97 @@ def _utc():
 ROW_S = 1280 / S.FS   # the platform writes (and sometimes loses) raw data in rows of 1280 samples = 42.67 ms
 
 
-def _align(edges, times, keys, tol_s=0.004, jitter_s=0.008, max_rows=4, lookahead=12, verify=4):
-    """Pair recorded trigger edges with sent events when some are missing.
+# Costs for _align, in units of "one ms of delivery delay" x 2 (see _align). Chosen so that every
+# alternative to "this pulse was simply late" needs several unlikely events at once.
+DELAY_SCALE_S = 0.002   # typical delivery delay beyond the fastest; cost = delay / scale
+EARLY_TOL_S = 0.0015    # an edge cannot be recorded earlier than its send time allows (clock noise only)
+EARLY_TOL_ROUGH_S = 0.006  # first pass, before clock drift is known (still far below a 27 ms pulse spacing)
+ROW_COST, MISSING_EDGE_COST, EXTRA_EDGE_COST = 8.0, 6.0, 12.0
+MAX_LOST_ROWS = 16
 
-    Model: recorded time = send time + offset - (rows lost so far) x 42.67 ms. Send times come from
-    sent.csv (actual wall-clock sends; the plan when unavailable). The trigger path adds latency
-    jitter of a few ms to single pulses (up to ~6 ms seen on fs666, 30 Sep 2026), so one edge alone
-    can be ambiguous: a late pulse can also fit "rows lost + pulses skipped". Edges are therefore
-    walked in order, every explanation within jitter_s is considered, and the one that also explains
-    most of the next `verify` edges wins (ties: fewest lost rows, fewest skipped events, smallest
-    residual). Returns (pairs [(edge_index, event_index)], gaps [edge_index just before a lost row])."""
+
+def _align(edges, times, keys):
+    """Pair recorded trigger edges with sent events: a global, minimum-cost alignment.
+
+    What can happen between a send and its recorded edge (all seen on the platform, Sep 2026):
+      * delivery delay: the edge is recorded LATER than its send time (0-13 ms seen; up to ~200 ms
+        before TCP_NODELAY), never earlier;
+      * lost rows: the file silently drops rows of 42.67 ms, so every later edge appears exactly
+        k x 42.67 ms EARLIER, and edges inside a dropped row are missing;
+      * slow drift between the PC clock and the recording's sample clock (< 1 ms per 6 min).
+    So  recorded = send + offset(t) + delay - rows_lost x 42.67 ms,  with delay >= 0.
+
+    Dynamic programming over (edges, events, rows lost so far) finds the explanation of the whole
+    recording with the lowest total cost: delay/DELAY_SCALE_S per match, ROW_COST per lost row,
+    MISSING_EDGE_COST per event with no edge, EXTRA_EDGE_COST per edge with no event. Order and keys
+    must agree. Unlike walking edges one at a time, one odd edge cannot derail everything after it:
+    a wrong local choice makes the rest of the recording expensive, so it is not chosen.
+    offset(t) is fitted in two passes: a rough one (constant offset, looser early limit), then a
+    linear fit to the promptly delivered edges of the whole recording, then the final alignment.
+    Returns (pairs [(edge_index, event_index)], gaps [edge_index just before a lost row])."""
+    if not len(edges) or not len(times):
+        return [], []
     rec = np.array([s / S.FS for s, _ in edges])
     tm = np.asarray(times, float)
-    ek = [k for _, k in edges]
-    cands = np.array([rec[i] - tm[j] for i in range(min(20, len(rec))) for j in range(min(20, len(tm)))
-                      if ek[i] == keys[j]])
-    if len(cands) == 0:
+    ek, kk = np.array([k for _, k in edges]), np.asarray(keys)
+    # starting offset: the fastest common delivery among the first edges (most pulses have ~no delay)
+    d0 = np.array([rec[i] - tm[j] for i in range(min(20, len(rec))) for j in range(min(20, len(tm)))
+                   if ek[i] == kk[j]])
+    if not len(d0):
         return [], []
-
-    def options(i, j, rows, off, tol):
-        for jj in range(j, min(j + lookahead, len(tm))):
-            if keys[jj] != ek[i]:
-                continue
-            for dr in range(max_rows + 1):
-                r = rec[i] - (tm[jj] + off - (rows + dr) * ROW_S)
-                if abs(r) < tol:
-                    yield jj, dr, r
-
-    def support(i, j, rows, off):
-        """How many of the next edges fit, with no further lost rows, after state (j, rows, off)."""
-        n = 0
-        for ii in range(i + 1, min(i + 1 + verify, len(rec))):
-            hit = next((h for h in options(ii, j, rows, off, tol_s) if h[1] == 0), None)
-            if hit:
-                n, j = n + 1, hit[0] + 1
-        return n
-
-    off = float(cands[np.argmax([(np.abs(cands - c) < 0.002).sum() for c in cands])])
-    rows, j, pairs, gaps = 0, 0, [], []
-    for i in range(len(rec)):
-        best = max(((support(i, jj + 1, rows + dr, off), -dr, -(jj - j), -abs(r), jj, dr, r)
-                    for jj, dr, r in options(i, j, rows, off, jitter_s)), default=None)
-        if best is None:
-            continue                      # an edge the plan can't explain: blanked, never counted
-        *_, jj, dr, r = best
-        if dr and pairs:
-            gaps.append(pairs[-1][0])
-        rows += dr
-        off += 0.3 * float(np.clip(r, -0.001, 0.001))   # follow slow clock drift, not single-pulse jitter
-        pairs.append((i, jj))
-        j = jj + 1
+    mode = d0[np.argmax([(np.abs(d0 - c) < 0.002).sum() for c in d0])]
+    off = np.full(len(tm), d0[np.abs(d0 - mode) < 0.002].min())
+    pairs, gaps, rows = _align_pass(rec, tm, ek, kk, off, EARLY_TOL_ROUGH_S)
+    if len(pairs) >= 10:                    # linear drift, fitted to the promptly delivered edges
+        i, j = np.array(pairs).T
+        base = rec[i] - tm[j] + rows * ROW_S
+        fast = np.ones(len(base), bool)
+        for _ in range(3):                  # lower envelope: drop late deliveries, refit
+            a, b = np.polyfit(tm[j[fast]], base[fast], 1)
+            fast = base - (a * tm[j] + b) < 0.0005
+        off = a * tm + b + min(0.0, float((base - (a * tm[j] + b)).min()))
+    pairs, gaps, _ = _align_pass(rec, tm, ek, kk, off, EARLY_TOL_S)
     return pairs, gaps
+
+
+def _align_pass(rec, tm, ek, kk, off, early_tol):
+    n, m, nr = len(rec), len(tm), MAX_LOST_ROWS + 1
+    R = np.arange(nr)
+    inf = np.inf
+    D = np.full((n + 1, m + 1, nr), inf)
+    D[0, :, 0] = np.arange(m + 1) * MISSING_EDGE_COST
+    jcost = np.arange(m + 1)[:, None] * MISSING_EDGE_COST
+    for i in range(n):
+        # match edge i with event j, possibly after losing more rows (rows can only accumulate)
+        d = rec[i] - (tm + off)[:, None] + R[None, :] * ROW_S                  # (m, nr) delay
+        c = np.where((ek[i] == kk)[:, None] & (d > -early_tol), np.maximum(d, 0) / DELAY_SCALE_S, inf)
+        prev = np.minimum.accumulate(D[i, :m] - R * ROW_COST, axis=1) + R * ROW_COST
+        nxt = np.full((m + 1, nr), inf)
+        nxt[1:] = prev + c
+        nxt = np.minimum(nxt, D[i] + EXTRA_EDGE_COST)                         # edge i unexplained
+        # events with no edge: D[j] = min_k<=j D[k] + cost x (j - k)
+        D[i + 1] = np.minimum.accumulate(nxt - jcost, axis=0) + jcost
+    # trace back
+    i, j, r = n, m, int(np.argmin(D[n, m]))
+    out = []
+    while i > 0:
+        v = D[i, j, r]
+        if j > 0 and np.isclose(v, D[i, j - 1, r] + MISSING_EDGE_COST):
+            j -= 1
+            continue
+        if np.isclose(v, D[i - 1, j, r] + EXTRA_EDGE_COST):
+            i -= 1
+            continue
+        d = rec[i - 1] - (tm[j - 1] + off[j - 1]) + r * ROW_S
+        c = max(d, 0) / DELAY_SCALE_S
+        r0 = next(q for q in range(r, -1, -1) if np.isclose(v, D[i - 1, j - 1, q] + (r - q) * ROW_COST + c))
+        out.append((i - 1, j - 1, r))
+        i, j, r = i - 1, j - 1, r0
+    out.reverse()
+    pairs = [(a, b) for a, b, _ in out]
+    rows = np.array([q for *_, q in out])
+    gaps = [out[k - 1][0] for k in range(1, len(out)) if out[k][2] > out[k - 1][2]]
+    return pairs, gaps, rows
 
 
 def match_triggers(seg: dict, raw_path, sent: pd.DataFrame | None = None, min_fraction=0.9) -> pd.DataFrame:

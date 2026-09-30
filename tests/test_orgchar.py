@@ -174,3 +174,27 @@ def test_single_late_trigger_is_jitter_not_lost_rows(tmp_path):
     t = match_triggers(seg, raw)
     assert len(t) == len(seg["events"]) and not t.exclude.any()
     assert (t.train_id == [e["train_id"] for e in seg["events"]]).all()
+
+
+def test_late_bursts_and_clock_drift_align(tmp_path):
+    """fs666 curve seg02, 30 Sep 2026: three pulses of one train recorded 8-13 ms late, on top of
+    <1 ms of drift between the PC clock and the recording clock. Every trigger was recorded, so
+    the correct answer is the in-order pairing with nothing excluded."""
+    plan = P.plan_curve_pulses([21], levels=(1, 10), ipi_ms=30, reps=6, sham_reps=4, seed=2)
+    seg = plan["segments"][0]
+    trains = pd.DataFrame(seg["events"])
+    late = trains[trains.level == 10].train_id.iloc[1]
+    delay = {6: 0.013, 7: 0.010, 9: 0.008}
+    trig, pulses = [], []
+    for ev in seg["events"]:
+        t = ev["t_s"] * (1 - 3e-6)                                   # recording clock slightly slow
+        if ev["train_id"] == late:
+            t += delay.get(ev["pulse_index"], 0.0)
+        s = int(t * S.FS)
+        trig.append((s, ev["key"]))
+        if ev["kind"] == "stim":
+            pulses.append((s + 6, 21, 2.0, 100.0))
+    raw = tmp_path / "raw.h5"
+    simulate.record(simulate.Organoid(seed=3), seg["duration_s"], pulses, trig, raw)
+    t = match_triggers(seg, raw)
+    assert list(t.train_id) == [e["train_id"] for e in seg["events"]] and not t.exclude.any()

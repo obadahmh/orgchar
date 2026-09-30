@@ -186,8 +186,8 @@ Figures are vector graphics and stay sharp when zoomed.
 | What happens | What orgchar does |
 |---|---|
 | The raw file loses whole rows of 1280 samples (42.7 ms), 1–4 per 6-min recording | Aligns every recorded trigger to its send time and detects each lost row; the pulse before a lost row is left out; a train missing any pulse is left out whole |
-| Triggers sent 30 ms apart were delivered late and bunched by TCP batching (fs666 curve, 30 Sep) | Sends triggers with TCP_NODELAY; a train whose pulses are not recorded at their send times (±4 ms) is left out |
-| Single triggers arrive up to ~6 ms late (trigger-path jitter; fs666 curve, 30 Sep) | Each match is checked against the next few pulses, so one late pulse is not mistaken for lost rows |
+| Triggers sent 30 ms apart were delivered late and bunched by TCP batching (fs666 curve, 30 Sep) | Sends triggers with TCP_NODELAY; bunched triggers cannot be explained by the alignment below, so they are left unmatched and their trains excluded |
+| Single triggers are recorded up to ~13 ms after their send time (trigger-path delay; fs666 curves, 30 Sep) | Global minimum-cost alignment of the whole recording (`backends._align`): delays can only be positive, lost rows only shift edges by exactly −42.67 ms, clock drift is fitted; one odd pulse cannot derail the rest |
 | "Stop recording" is often not acknowledged, although the recording stopped | Checks whether the file stopped growing; completeness is judged from the recorded duration |
 | Every upload fails with `Invalid run mode` (even `./orgchar.sh disable`) | Nothing: the board is stuck. Restart the Intan service, then re-run the step |
 
