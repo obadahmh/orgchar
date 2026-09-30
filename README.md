@@ -77,11 +77,19 @@ A pair is **responsive** if all of the following hold:
 - ≥ 0.1 extra spikes per pulse and ≥ 5 extra spikes in total;
 - the evoked spikes have the same shape as that electrode's spontaneous spikes (r ≥ 0.8).
 
-Two warnings mark responsive pairs that may still be leftover artifact. They are warnings, not exclusions, because a very reliable direct response can look the same. Decide from the raw-trace figure.
-- **TIME-LOCKED**: ≥ 40 % of evoked spikes fall in a single 1 ms latency window. Artifact recurs at a fixed time; synaptic responses vary by milliseconds.
-- **BLANK-EDGE**: evoked spikes pile up in the first 1 ms after the blank ends (≥ 3× an even spread). The artifact tail was not fully removed.
+Each responsive pair gets a status:
 
-On fs647, 8 Sep, the strong pairs (21→23, 23→21, 8→15) raised no warning. e15→e14 was TIME-LOCKED: a small bump at ~9 ms on every pulse. e15→e13 was BLANK-EDGE: a 3–4 ms cluster, on top of a genuine 12–17 ms response.
+| Status | Meaning |
+|---|---|
+| **✓ Use** | ≥ 0.5 extra spikes per pulse, no artifact warning, not contradicted by an earlier screen of the same organoid |
+| **◐ Weak** | responsive but below 0.5 extra spikes per pulse. On fs666 (30 Sep) such pairs did not reproduce |
+| **! Check** | an artifact warning (below), or not responsive in the earlier screen; decide from the evidence traces |
+
+The two artifact warnings are not automatic exclusions, because a very reliable direct response can look the same:
+- **Locked to one latency**: ≥ 40 % of evoked spikes fall in a single 1 ms window. Artifact recurs at a fixed time; synaptic responses vary by milliseconds.
+- **Pile-up where the blank ends**: evoked spikes crowd into the first 1 ms after the blank (≥ 3× an even spread). The artifact tail was not fully removed.
+
+On fs647, 8 Sep, the strong pairs (21→23, 23→21, 8→15) raised no warning. e15→e14 was locked to ~9 ms (a small bump on every pulse); e15→e13 had a 3–4 ms pile-up on top of a genuine 12–17 ms response.
 
 **Built-in negative controls**, analysed exactly like the real pairs:
 - **Cross-organoid pairs** (stimulate block A, record block B). No synapse connects them, but they get the mirror cross-talk. They measure whether artifact leaks into the readout.
@@ -91,7 +99,7 @@ If any control comes out significant, the verdict is `PIPELINE_LEAK` and no pair
 
 ### Step 3 — curve (input → output)
 
-For the responsive pairs (up to 3 stimulating electrodes), sweep the input.
+By default `curve` takes the pairs the screen report recommends: one stimulating electrode per organoid (up to 4), the one with the best **Use** pair (pairs reproduced in an earlier screen first), and its best **Use** pairs (up to 3). Pass `--pairs` to choose differently.
 - **Pulse count (default).**
   - 1, 2, 4, 6, 8, 10 pulses, 30 ms apart. That is long enough to read the 8–20 ms response of every pulse.
   - The pulses are timed in software, so all levels and electrodes are randomly interleaved in one recording.
@@ -139,13 +147,17 @@ Each step directory contains:
 - `result.json`;
 - `report.html` (open in a browser; figures are embedded).
 
-The screen report includes a **raw-trace figure**, one row per responsive pair plus a cross-organoid mirror control (31 − e) for each stimulating electrode:
-1. every pulse's raw voltage, with the median artifact template;
-2. the signal after subtraction, with the blanked stretch shaded;
-3. the 300–3000 Hz signal, with the threshold and the detected spikes;
-4. a raster of detected spikes per pulse, with each pulse's own blank.
+The **screen report** follows the decisions it supports:
+1. **Checks**: recordings complete, controls clean, data lost by the platform, artifact duration.
+2. **Next step**: the `curve` command and the recommended pairs; then the pairs to check, with the reason.
+3. **Response maps**: one 8 × 8 grid per organoid; coloured cells respond (hover for numbers).
+4. **Evidence**, one card per recommended or flagged pair:
+   - *Every pulse*: each row is one pulse, 30 ms before to 30 ms after it; blue = detected spikes, shaded = blanked artifact. A real response has more spikes after the pulse than before, scattered over several ms. A column of spikes at one latency, or crowding where the shading ends, is leftover artifact.
+   - *Spike timing*: spikes per second around the pulse against the channel's spontaneous rate.
+   - *Artifact*: the raw artifact (median and 5–95 % band across pulses) and where the blank ends.
+5. **Controls**: every pair's effect, same-organoid vs other-organoid vs sham. Controls must sit at zero.
 
-Look at it before trusting any pair. If what was counted is not what you would call a spike, the numbers are wrong.
+Figures are vector graphics and stay sharp when zoomed.
 
 ## Reading the verdicts
 
@@ -155,7 +167,7 @@ Look at it before trusting any pair. If what was counted is not what you would c
 | census | `NO-GO` | do not stimulate; re-check later, contact FinalSpark |
 | screen | `RESPONSES_FOUND` | run curve |
 | screen | `NO_RESPONSE` (controls clean) | tissue fires but does not follow this stimulus; try `--amplitude 3` or `--phase 150` once, then stop |
-| screen | `PIPELINE_LEAK` | artifact reaches the readout; look at the artifact map in the report before anything else |
+| screen | `PIPELINE_LEAK` | artifact reaches the readout; look at the Controls section and the evidence traces before anything else |
 | curve | `USABLE_CURVES` | use `card_latest.json` |
 | curve | `NO_USABLE_CURVE` | the pair responds but not reliably enough to compute with |
 
@@ -168,6 +180,17 @@ Look at it before trusting any pair. If what was counted is not what you would c
 - Before each session, run `screen --electrodes <stims> --reps 20`. If a pair's spikes per pulse have dropped by more than about half, re-run `curve`.
 - After any medium change or new week, start again from `census`.
 - Do not read the vendor spike database for evoked responses. It counts artifacts and knows nothing about sham or cross-talk.
+
+## Platform quirks (handled)
+
+| What happens | What orgchar does |
+|---|---|
+| The raw file loses whole rows of 1280 samples (42.7 ms), 1–4 per 6-min recording | Aligns every recorded trigger to its send time and detects each lost row; the pulse before a lost row is left out; a train missing any pulse is left out whole |
+| Triggers sent 30 ms apart were delivered late and bunched by TCP batching (fs666 curve, 30 Sep) | Sends triggers with TCP_NODELAY; a train whose pulses are not recorded at their send times (±4 ms) is left out |
+| "Stop recording" is often not acknowledged, although the recording stopped | Checks whether the file stopped growing; completeness is judged from the recorded duration |
+| Every upload fails with `Invalid run mode` (even `./orgchar.sh disable`) | Nothing: the board is stuck. Restart the Intan service, then re-run the step |
+
+Every recorded pulse is blanked, even one that is left out of the counts, so its artifact can't reach the spontaneous-rate baseline.
 
 ## What is and is not verified
 

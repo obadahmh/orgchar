@@ -123,3 +123,31 @@ def test_recording_gaps_do_not_break_trigger_matching(tmp_path):
     assert all(planned[r.train_id] == r.stim_electrode for r in kept.itertuples())
     r = A.screen([(str(raw), t)], n_draws=3000)
     assert (21, 23) in set(zip(*[pd.DataFrame(r["pairs"]).query("responsive")[c] for c in ("stim", "rec")]))
+
+
+def test_bunched_train_triggers_are_excluded_not_mismatched(tmp_path):
+    """TCP batching delivered a 30-ms train's triggers late and bunched (fs666 curve, 30 Sep 2026).
+    Such a train was not delivered as planned: it must be excluded, and must not derail the matching
+    of the other trains."""
+    plan = P.plan_curve_pulses([21], levels=(1, 5), ipi_ms=30, reps=6, sham_reps=4, seed=2)
+    seg = plan["segments"][0]
+    trains = pd.DataFrame(seg["events"])
+    bad = trains[trains.level == 5].train_id.iloc[1]
+    trig, pulses = [], []
+    for ev in seg["events"]:
+        s = int(ev["t_s"] * S.FS)
+        if ev["train_id"] == bad:          # arrives 188 ms late, 3 of 5 triggers within 0.5 ms, 2 merged away
+            if ev["pulse_index"] > 2:
+                continue
+            s = int((trains[trains.train_id == bad].t_s.min() + 0.188) * S.FS) + 6 * ev["pulse_index"]
+        trig.append((s, ev["key"]))
+        if ev["kind"] == "stim":
+            pulses.append((s + 6, 21, 2.0, 100.0))
+    raw = tmp_path / "raw.h5"
+    simulate.record(simulate.Organoid(seed=3), seg["duration_s"], pulses, trig, raw)
+    t = match_triggers(seg, raw)
+    late = t[(t.train_id == bad) | (t.note == "unmatched")]
+    assert len(late) == 3 and late.exclude.all()          # the 3 recorded bunched edges: blanked, not counted
+    good = t[~t.index.isin(late.index)]
+    assert not good.exclude.any() and len(good) == len(seg["events"]) - 5
+    assert set(good.train_id) == set(trains.train_id) - {bad}

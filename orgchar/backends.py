@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import socket
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,77 +29,111 @@ def _utc():
     return datetime.now(timezone.utc).isoformat()
 
 
-GAP_JUMP_S = 0.02   # a lost 1280-sample file row shifts later data by 42.7 ms
+ROW_S = 1280 / S.FS   # the platform writes (and sometimes loses) raw data in rows of 1280 samples = 42.67 ms
 
 
-def _align(edges, evs, tol_s=0.035):
-    """Pair recorded trigger edges with planned events, in order, when they are not identical.
+def _align(edges, times, keys, tol_s=0.004, max_rows=4, lookahead=12):
+    """Pair recorded trigger edges with sent events when some are missing.
 
-    The platform can drop whole 1280-sample rows (42.7 ms) from the raw file: the triggers inside
-    a lost row disappear and everything after it arrives 42.7 ms 'early' relative to the plan. So
-    the plan-to-recording offset is tracked from match to match instead of assumed constant; a
-    jump in that offset marks a recording gap between two consecutive matched triggers.
-    Returns (pairs, gaps): pairs = [(edge_index, event_index)], gaps = [edge_index before a gap]."""
+    Model: recorded time = send time + offset - (rows lost so far) x 42.67 ms, within a few ms.
+    Send times come from sent.csv (actual wall-clock sends; the plan when unavailable). Edges are
+    walked in order; each is given the earliest following event with the same key that fits the
+    model with 0..max_rows newly lost rows. Because a lost row is a known 42.67 ms step and the
+    tolerance is 4 ms, a gap can't be confused with the neighbouring pulse of a 30 ms train.
+    Returns (pairs [(edge_index, event_index)], gaps [edge_index just before a lost row])."""
     rec = np.array([s / S.FS for s, _ in edges])
-    plan = np.array([e["t_s"] for e in evs])
-    # starting offset: the most common key-consistent offset among the first few edges and events
-    cands = [round(rec[i] - plan[j], 2) for i in range(min(15, len(rec))) for j in range(min(15, len(plan)))
-             if edges[i][1] == evs[j]["key"]]
-    off = max(set(cands), key=cands.count) if cands else 0.0
-    pairs, gaps, j = [], [], 0
+    tm = np.asarray(times, float)
+    cands = np.array([rec[i] - tm[j] for i in range(min(20, len(rec))) for j in range(min(20, len(tm)))
+                      if edges[i][1] == keys[j]])
+    if len(cands) == 0:
+        return [], []
+    off = float(cands[np.argmax([(np.abs(cands - c) < 0.002).sum() for c in cands])])
+    rows, j, pairs, gaps = 0, 0, [], []
     for i, (_, key) in enumerate(edges):
-        for jj in range(j, min(j + 6, len(evs))):
-            if evs[jj]["key"] != key:
+        hit = None
+        for jj in range(j, min(j + lookahead, len(tm))):
+            if keys[jj] != key:
                 continue
-            o = rec[i] - plan[jj]
-            # recordings only lose data, so the offset can only shrink (by whole rows)
-            if -3 * 0.0427 - tol_s < o - off < tol_s:
-                if pairs and abs(o - off) > GAP_JUMP_S:
-                    gaps.append(pairs[-1][0])
-                pairs.append((i, jj))
-                off, j = o, jj + 1
+            for dr in range(max_rows + 1):
+                r = rec[i] - (tm[jj] + off - (rows + dr) * ROW_S)
+                if abs(r) < tol_s:
+                    hit = (jj, dr, r)
+                    break
+            if hit:
                 break
+        if hit is None:
+            continue                      # an edge the plan can't explain: blanked, never counted
+        jj, dr, r = hit
+        if dr and pairs:
+            gaps.append(pairs[-1][0])
+        rows += dr
+        off += 0.3 * r                    # follow slow drift between the sample clock and wall clock
+        pairs.append((i, jj))
+        j = jj + 1
     return pairs, gaps
 
 
-def match_triggers(seg: dict, raw_path, min_fraction=0.9) -> pd.DataFrame:
+def match_triggers(seg: dict, raw_path, sent: pd.DataFrame | None = None, min_fraction=0.9) -> pd.DataFrame:
     """One row per recorded trigger edge, with its planned event.
 
     Every recorded stimulation edge is kept (its artifact must be blanked even if it cannot be
-    used); rows with exclude=True are blanked but not counted: edges not matched to the plan, and
-    the pulse just before a recording gap (its response window may straddle the missing data)."""
+    used); rows with exclude=True are blanked but not counted:
+      * edges not matched to the plan;
+      * the pulse just before a lost row (its response window may straddle the missing data);
+      * every pulse of a multi-pulse train that lost any pulse (the train's total would be wrong)."""
     _, T = S.load_raw(raw_path)
     edges = S.trigger_edges(T)
     evs = seg["events"]
     els = {int(k): v for k, v in seg["electrodes"].items()}
     by_key = {v["key"]: e for e, v in els.items()}
-    if [k for _, k in edges] == [e["key"] for e in evs]:
-        pairs, gaps = [(i, i) for i in range(len(edges))], []
-    else:
-        pairs, gaps = _align(edges, evs)
+    # always align by timing, even when the key sequence matches: lost rows must still be found
+    times = [e["t_s"] for e in evs]
+    if sent is not None and len(sent) == len(evs) and "utc" in sent:
+        t = pd.to_datetime(sent["utc"])
+        times = list((t - t.iloc[0]).dt.total_seconds() + evs[0]["t_s"])
+    pairs, gaps = _align(edges, times, [e["key"] for e in evs]) if evs else ([], [])
     matched = dict(pairs)
+    got = {evs[j]["train_id"] for j in matched.values()}
+    per_train = pd.Series([e["train_id"] for e in evs]).value_counts()
+    seen = pd.Series([evs[j]["train_id"] for j in matched.values()]).value_counts() if matched else pd.Series(dtype=int)
+    gap_trains = {evs[matched[i]]["train_id"] for i in gaps}
+    broken = {t for t in got if seen.get(t, 0) < per_train[t] and per_train[t] > 1} | \
+             {t for t in gap_trains if per_train[t] > 1}
     rows = []
     for i, (s, key) in enumerate(edges):
         ev = evs[matched[i]] if i in matched else None
         e = ev["stim_electrode"] if ev else by_key.get(key, -1)
         kind = ev["kind"] if ev else ("stim" if key in by_key else "sham")
         el = els.get(e, {}) if kind == "stim" else {}
+        note = ("unmatched" if ev is None else "before recording gap" if i in gaps
+                else "incomplete train" if ev["train_id"] in broken else "")
         rows.append(dict(segment=seg["id"], onset=s, key=key, kind=kind, stim_electrode=e,
                          amplitude_uA=el.get("amplitude_uA", 0.0), phase_us=el.get("phase_us", 0.0),
                          polarity=el.get("polarity", ""), n_pulses=1, ipi_ms=0.0,
                          level=ev["level"] if ev else float("nan"),
                          train_id=ev["train_id"] if ev else f"unmatched{i}",
                          pulse_index=ev["pulse_index"] if ev else 0, planned_t_s=ev["t_s"] if ev else float("nan"),
-                         exclude=(i not in matched) or (i in gaps),
-                         note="unmatched" if i not in matched else ("before recording gap" if i in gaps else "")))
+                         exclude=bool(note), note=note))
     df = pd.DataFrame(rows)
-    usable = int((~df.exclude).sum()) if len(df) else 0
+    usable_trials = df[~df.exclude].train_id.nunique() if len(df) else 0
+    planned_trials = len(per_train)
     if len(pairs) != len(evs) or gaps:
         print(f"  NOTE {seg['id']}: {len(evs)} triggers sent, {len(edges)} in the recording, {len(pairs)} matched; "
-              f"{len(gaps)} recording gap(s) detected (platform dropped data); {usable} trials usable.")
-    if usable < min_fraction * len(evs):
-        raise RuntimeError(f"Only {usable}/{len(evs)} trials usable in {raw_path}; segment not analysed. Raw file kept.")
+              f"{len(gaps)} lost row(s) in the platform's recording; {usable_trials} of {planned_trials} trials usable.")
+    if usable_trials < min_fraction * planned_trials:
+        raise RuntimeError(f"Only {usable_trials}/{planned_trials} trials usable in {raw_path}; segment not analysed. "
+                           "Raw file kept.")
     return df
+
+
+def _remote_stopped(tag: str, wait_s: float = 10.0) -> bool:
+    """True if the platform's raw file for this tag exists and did not grow for wait_s."""
+    hits = list(RAW_ROOT.glob(f"*_{tag}.h5"))
+    if len(hits) != 1:
+        return False
+    a = hits[0].stat().st_size
+    time.sleep(wait_s)
+    return hits[0].stat().st_size == a and a > 0
 
 
 class SimBackend:
@@ -161,6 +196,9 @@ class HardwareBackend:
             self.log(f"  recording {tag} ({seg['duration_s']:.0f} s, {len(seg['events'])} triggers)")
             if seg["events"]:
                 trig = TriggerController(self.operator)
+                # Send every 16-byte trigger at once. With TCP's default batching (Nagle), triggers
+                # 30 ms apart were held back and delivered in bursts (fs666 curve, 30 Sep 2026).
+                trig.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             start = time.monotonic() + PRE_S
             await asyncio.sleep(PRE_S)
             for ev in seg["events"]:
@@ -184,7 +222,11 @@ class HardwareBackend:
                         break
                     except Exception as e:  # noqa: BLE001 - keep trying, then report
                         errors.append(f"stop recording attempt {attempt + 1}: {e!r}")
-                        await asyncio.sleep(5)
+                        # the platform often stops without acknowledging: check the file itself
+                        if await asyncio.to_thread(_remote_stopped, tag):
+                            errors.append("no acknowledgement, but the recording file stopped growing: stopped")
+                            stop_ok = True
+                            break
             try:
                 await self._ack("disable all stimulation", intan._disable_all_stim())
                 disable_ok = True

@@ -21,6 +21,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
+import h5py
 import pandas as pd
 
 from . import analysis as A
@@ -110,7 +111,9 @@ def _execute(args, plan):
             print(f"[{_now():%H:%M:%S}] segment {s['id']}")
             raw = backend.run_segment(s, seg_dir, tag)
             from .backends import match_triggers
-            trials = match_triggers(s, raw)
+            sent_csv = seg_dir / "sent.csv"
+            sent = pd.read_csv(sent_csv) if sent_csv.exists() and sent_csv.stat().st_size > 1 else None
+            trials = match_triggers(s, raw, sent)
             trials.to_csv(seg_dir / "trials.csv", index=False)
             segs.append((str(raw), trials))
     except BaseException:
@@ -137,7 +140,8 @@ def _segments_from_dir(step_dir: Path, plan: dict):
         if t.exists() and t.stat().st_size > 1:
             trials = pd.read_csv(t)
         elif s["events"]:
-            trials = match_triggers(s, sd / "raw.h5")
+            sent = pd.read_csv(sd / "sent.csv") if (sd / "sent.csv").exists() and (sd / "sent.csv").stat().st_size > 1 else None
+            trials = match_triggers(s, sd / "raw.h5", sent)
             trials.to_csv(t, index=False)
         else:
             trials = pd.DataFrame()
@@ -163,32 +167,25 @@ def analyse(step_dir: Path, plan: dict, segs) -> dict:
         table = pd.DataFrame(r["channels"]).drop(columns=["waveform"])
     elif step == "screen":
         r = A.screen(segs, window_ms=plan.get("window_ms", 30.0))
-        Rt = pd.DataFrame(r["pairs"])
+        earlier_dir, earlier = _earlier_screen(step_dir)
+        Rt = A.classify(r["pairs"], earlier["pairs"] if earlier else None)
+        rec = A.recommend(Rt)
+        r["pairs"] = Rt.to_dict("records")
+        r["recommended_pairs"] = rec
+        r["earlier_screen"] = earlier_dir.name if earlier_dir else None
         resp = Rt[Rt.responsive]
         c = r["controls"]
-        lines = [f"{r['candidate_tests']} stim→record pairs tested inside organoids; {len(resp)} responsive "
-                 f"(Bonferroni p<{r['alpha']}, ≥{r['min_effect_spikes_per_pulse']} extra spikes/pulse, spike-shaped).",
-                 f"Negative controls: {c['cross_organoid_control']['significant_bonferroni']} of "
-                 f"{c['cross_organoid_control']['tests']} cross-organoid pairs and "
-                 f"{c['sham_control']['significant_bonferroni']} of {c['sham_control']['tests']} sham pairs significant "
-                 "(must be 0; otherwise artifact is leaking into the readout).",
-                 f"Artifact blank after template subtraction, same organoid: median "
-                 f"{r['artifact_blank_ms']['same_organoid_median'] or float('nan'):.1f} ms, p90 {r['artifact_blank_ms']['same_organoid_p90'] or float('nan'):.1f} ms."]
-        for _, x in resp.head(12).iterrows():
-            lines.append(f"e{int(x.stim)} → e{int(x.rec)}: +{x.delta_per_pulse:.2f} spikes/pulse "
-                         f"({int(x.spikes)} vs {x.expected:.1f} expected), latency ~{x.median_latency_ms:.0f} ms, "
-                         f"waveform r={x.waveform_corr if pd.isna(x.waveform_corr) else round(x.waveform_corr, 2)}"
-                         + (f"  ⚠ TIME-LOCKED ({x.peak_1ms_fraction:.0%} of spikes in one 1-ms window)"
-                            if x.time_locked else "")
-                         + (f"  ⚠ BLANK-EDGE ({int(x.edge_spikes)} spikes in the 1st ms after the blank)"
-                            if x.blank_edge else "")
-                         + ("  → could be artifact; check the raw-trace figure" if x.time_locked or x.blank_edge else ""))
+        n = {k: int((Rt.status == k).sum()) for k in ("Use", "Weak", "Check")}
+        lines = [f"{len(resp)} responsive pairs: {n['Use']} Use, {n['Weak']} Weak, {n['Check']} Check.",
+                 f"Controls: {c['cross_organoid_control']['significant_bonferroni']} of "
+                 f"{c['cross_organoid_control']['tests']} other-organoid pairs and "
+                 f"{c['sham_control']['significant_bonferroni']} of {c['sham_control']['tests']} sham pairs respond "
+                 "(must be 0)."]
+        if rec:
+            lines.append("Next: ./orgchar.sh curve --fsname " + plan["fsname"]
+                         + "   (pairs " + ", ".join(f"e{a}→e{b}" for a, b in rec) + ")")
         verdict = r["verdict"]
-        figs = R.screen_figures(r)
-        cols = ["role", "stim", "rec", "n_pulses", "spikes", "expected", "delta_per_pulse", "z", "p", "p_bonf",
-                "waveform_corr", "median_latency_ms", "latency_spread_ms", "peak_1ms_fraction", "time_locked",
-                "edge_spikes", "blank_edge", "mean_blank_ms", "responsive"]
-        table = Rt[Rt.role == "candidate"][cols].head(60)
+        figs, table = [], None
     elif step == "curve":
         pairs = [tuple(p) for p in plan["pairs"]]
         unit = "pulse" if plan["vary"] == "amplitude" else "train"
@@ -219,13 +216,48 @@ def analyse(step_dir: Path, plan: dict, segs) -> dict:
     lines.append(f"Acquired with orgchar {plan.get('code_version', 'unknown (before versioning)')}; "
                  f"analysed with {r['code_version']}.")
     (step_dir / "result.json").write_text(R.to_json(r))
-    title = f"{plan['fsname']} — {step} — {step_dir.name[:15]}" + ("  [SIMULATED]" if plan.get("backend") == "simulated" else "")
-    R.write_html(step_dir / "report.html", title, verdict, lines, figs, table)
+    if step == "screen":
+        R.screen_page(step_dir / "report.html", r, Rt, _screen_context(step_dir, plan, segs, r, problems))
+    else:
+        title = f"{plan['fsname']} · {step} · {_when(step_dir)}" + (" · SIMULATED" if plan.get("backend") == "simulated" else "")
+        R.write_html(step_dir / "report.html", title, verdict, lines, figs, table)
     print("\n" + verdict)
     for s in lines:
         print("  " + s)
     print(f"\nReport: {step_dir / 'report.html'}")
     return r
+
+
+def _when(step_dir: Path) -> str:
+    try:
+        return datetime.strptime(step_dir.name[:15], "%Y%m%dT%H%M%S").strftime("%d %b %Y %H:%M UTC")
+    except ValueError:
+        return step_dir.name
+
+
+def _earlier_screen(step_dir: Path):
+    """Most recent screen of the same organoid before this one (complete or not: its analysed
+    segments are still valid evidence for reproducibility)."""
+    earlier = sorted(p for p in step_dir.parent.glob("*_screen") if p.name < step_dir.name and (p / "result.json").exists())
+    if not earlier:
+        return None, None
+    return earlier[-1], json.loads((earlier[-1] / "result.json").read_text())
+
+
+def _screen_context(step_dir: Path, plan: dict, segs, r: dict, problems: list[str]) -> dict:
+    notes = pd.concat([t.get("note", pd.Series(dtype=str)) for _, t in segs if len(t)]) if segs else pd.Series(dtype=str)
+    excl = pd.concat([t.get("exclude", pd.Series(dtype=bool)) for _, t in segs if len(t)]) if segs else pd.Series(dtype=bool)
+    stims = sorted({int(e) for s in plan["segments"] for e in s["electrodes"]})
+    blocks = sorted({e // 8 for e in stims})
+    return dict(fsname=plan["fsname"], when=_when(step_dir), code=r.get("code_version", "unknown"),
+                simulated=plan.get("backend") == "simulated", problems=problems,
+                n_segments=len(plan["segments"]),
+                stimulus=(f"{plan.get('amplitude_uA')} µA × {plan.get('phase_us'):g} µs, {plan.get('polarity')}, "
+                          f"{plan.get('reps')} pulses per electrode, organoid{'s' if len(blocks) > 1 else ''} "
+                          + ", ".join(map(str, blocks))),
+                gaps=int((notes == "before recording gap").sum()), excluded=int(excl.fillna(False).astype(bool).sum()),
+                recommended=[tuple(p) for p in r.get("recommended_pairs", [])],
+                earlier=r.get("earlier_screen"))
 
 
 def _close_status(seg_dir: Path) -> dict | None:
@@ -247,16 +279,17 @@ def _completeness_problems(step_dir: Path, plan: dict, r: dict) -> list[str]:
     problems = []
     for s in plan["segments"]:
         st = _close_status(step_dir / s["id"])
-        if st and not st["stop_ok"]:
-            problems.append(f"recording of segment {s['id']} was never stopped cleanly")
+        raw = step_dir / s["id"] / "raw.h5"
         if st and not st["disable_ok"]:
             problems.append(f"final 'disable all stimulation' failed for segment {s['id']}")
-        if not (step_dir / s["id"] / "raw.h5").exists():
+        if not raw.exists():
             problems.append(f"segment {s['id']} has no recording")
-    if plan["step"] == "census":
-        planned = plan["segments"][0]["duration_s"]
-        if r["duration_s"] < 0.9 * planned:
-            problems.append(f"recording ended after {r['duration_s']:.0f} of {planned:.0f} s")
+            continue
+        # a stop without acknowledgement is fine if the file holds the whole segment
+        with h5py.File(raw, "r") as f:
+            got_s = f["triggers"].size / 30000.0
+        if got_s < 0.9 * s["duration_s"]:
+            problems.append(f"segment {s['id']} recorded {got_s:.0f} of {s['duration_s']:.0f} s")
     return problems
 
 
@@ -326,20 +359,15 @@ def cmd_curve(a):
             sys.exit("No screen for this organoid yet. Run `orgchar screen` first, or pass --pairs stim:rec,...")
         if s.get("incomplete"):
             sys.exit(f"Latest screen ({d.name}) is INCOMPLETE. Re-run it, or pass --pairs explicitly.")
-        resp = [p for p in s["pairs"] if p["responsive"]]
-        flagged = [p for p in resp if p.get("time_locked") or p.get("blank_edge")]
-        if flagged:
-            print("Skipping pairs flagged as possible artifact (pass them with --pairs if the traces convince you): "
-                  + ", ".join(f"e{p['stim']}→e{p['rec']}" for p in flagged))
-        resp = [p for p in resp if p not in flagged]
-        if not resp:
-            sys.exit(f"Latest screen ({d.name}) found no responsive pair; nothing to build a curve on.")
-        best = {}
-        for p in sorted(resp, key=lambda p: -p["z"]):
-            best.setdefault(p["stim"], []).append(p["rec"])
-        stims = list(best)[:a.max_stims]
-        pairs = [(e, c) for e in stims for c in best[e]]
-        print(f"Using responsive pairs from screen {d.name}: " + ", ".join(f"e{e}→e{c}" for e, c in pairs))
+        rec = s.get("recommended_pairs")
+        if rec is None:  # screens analysed before recommendations existed
+            rec = A.recommend(A.classify(s["pairs"]))
+        if not rec:
+            sys.exit(f"Latest screen ({d.name}) has no pair with status Use. Pass --pairs to choose Weak or Check "
+                     "pairs deliberately.")
+        keep = list(dict.fromkeys(e for e, _ in rec))[:a.max_stims]
+        pairs = [tuple(p) for p in rec if p[0] in keep]
+        print(f"Using the recommended pairs from screen {d.name}: " + ", ".join(f"e{e}→e{c}" for e, c in pairs))
     stims = sorted({e for e, _ in pairs})
     if a.vary == "pulses":
         levels = [int(x) for x in (a.levels or "1,2,4,6,8,10").split(",")]
@@ -438,7 +466,7 @@ def main(argv=None):
     p = sub.add_parser("curve", help="input-output curve for responsive pairs")
     common(p)
     p.add_argument("--pairs", help="stim:rec,... (default: responsive pairs from latest screen)")
-    p.add_argument("--max-stims", type=int, default=3)
+    p.add_argument("--max-stims", type=int, default=4, help="at most this many stimulating electrodes")
     p.add_argument("--vary", default="pulses", choices=["pulses", "amplitude"])
     p.add_argument("--levels", help="pulses: 1,2,4,6,8,10  amplitude: 0.5,1,1.5,2,3")
     p.add_argument("--ipi", type=float, default=30.0, help="ms between pulses of a train (pulses mode)")

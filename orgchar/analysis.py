@@ -143,7 +143,7 @@ def _pvalue(obs: int, null: np.ndarray) -> float:
 
 # ============================================================================== screen
 
-TRACE_PRE_MS = 2.0
+TRACE_PRE_MS = 30.0   # traces start this long before each pulse, to show spontaneous firing for comparison
 EDGE_MS = 1.0
 
 
@@ -171,12 +171,14 @@ def _trace_channels(e: int) -> list[int]:
     return same + mirror
 
 
-def _collect_traces(traces: dict, P: pd.DataFrame, X, p: dict, W: int, k: float):
-    """Per (stim, rec): every pulse's snippet at three stages (raw, artifact removed, filtered),
-    the detected spikes and the threshold, so the report can show exactly what was counted."""
+def _collect_traces(traces: dict, P: pd.DataFrame, X, p: dict, W: int, k: float, quiet: np.ndarray):
+    """Per (stim, rec): every counted pulse's filtered trace from TRACE_PRE_MS before to W after the
+    pulse, where the artifact was blanked, the detected spikes, the raw artifact (median and 5-95 %
+    band across pulses) and the channel's spontaneous rate, so the report can show what was counted."""
     pre = S.samples(TRACE_PRE_MS)
-    Xc, Y, valid, spk, noise = p["X_clean"], p["Y"], p["valid"], p["spikes"], p["noise"]
-    stim = P[P.kind == "stim"]
+    Y, valid, spk, noise = p["Y"], p["valid"], p["spikes"], p["noise"]
+    quiet_s = max(quiet.sum() / S.FS, 1e-9)
+    stim = P[(P.kind == "stim") & ~P.exclude]
     for e, g in stim.groupby("stim_electrode"):
         on = g.pulse_onset.values.astype(np.int64)
         on = on[(on - pre >= 0) & (on + W < X.shape[1])]
@@ -185,10 +187,14 @@ def _collect_traces(traces: dict, P: pd.DataFrame, X, p: dict, W: int, k: float)
         idx = on[:, None] + np.arange(-pre, W)[None, :]
         for c in _trace_channels(int(e)):
             sp = spk[c]
-            hits = [sp[(sp >= o) & (sp < o + W)] for o in on]
-            traces[(int(e), c)] = dict(raw=X[c][idx], clean=Xc[c][idx], filt=Y[c][idx], valid=valid[c][idx],
+            hits = [sp[(sp >= o - pre) & (sp < o + W)] for o in on]
+            raw = X[c][idx]
+            traces[(int(e), c)] = dict(filt=Y[c][idx].astype(np.float32), valid=valid[c][idx],
+                                       raw_med=np.median(raw, 0), raw_lo=np.percentile(raw, 5, 0),
+                                       raw_hi=np.percentile(raw, 95, 0),
                                        spikes=[np.c_[S.ms(h - o), Y[c][h]] for o, h in zip(on, hits)],
-                                       thr=float(-k * noise[c]), pre_ms=TRACE_PRE_MS)
+                                       noise=float(noise[c]), thr=float(-k * noise[c]), pre_ms=TRACE_PRE_MS,
+                                       spont_hz=float(np.count_nonzero(quiet[sp]) / quiet_s))
 
 
 def screen(segments: list[tuple[str, pd.DataFrame]], window_ms: float = 30.0, k: float = 5.0,
@@ -224,7 +230,7 @@ def screen(segments: list[tuple[str, pd.DataFrame]], window_ms: float = 30.0, k:
         samplers = [_NullSampler(spk[c], quiet, rng) for c in range(S.N_CH)]
         for c in range(S.N_CH):
             wave_spont.setdefault(c, []).append(S.waveforms(Y, c, spk[c][quiet[spk[c]]], max_n=300))
-        _collect_traces(traces, P, X, p, W, k)
+        _collect_traces(traces, P, X, p, W, k, quiet)
         P["end"] = P.pulse_onset + np.minimum(W, P.gap.fillna(W).astype(int))
         for (kind, e), g in P[~P.exclude].groupby(["kind", "stim_electrode"]):
             on, end = g.pulse_onset.values.astype(np.int64), g.end.values.astype(np.int64)
@@ -388,3 +394,67 @@ def curve(segments: list[tuple[str, pd.DataFrame]], pairs: list[tuple[int, int]]
                         snr=float(dynamic / mean_sd) if mean_sd > 0 else None, usable=usable))
     return dict(step="curve", unit=unit, window_ms=window_ms, pairs=out,
                 verdict="USABLE_CURVES" if any(o["usable"] for o in out) else "NO_USABLE_CURVE", _trials=D)
+
+
+# ============================================================================== decisions
+
+STRONG_EFFECT = 0.5   # extra spikes/pulse. On fs666 (30 Sep 2026) weaker pairs did not reproduce.
+
+
+def classify(pairs: list[dict], earlier: list[dict] | None = None) -> pd.DataFrame:
+    """Status of each responsive pair, with the reason in plain words.
+      Use   - responsive, >= STRONG_EFFECT extra spikes/pulse, no artifact flag, not contradicted
+      Weak  - responsive but small; may not reproduce
+      Check - an artifact flag, or not responsive where an earlier screen tested it
+    `earlier`: pairs of the previous screen of the same organoid (for reproducibility)."""
+    R = pd.DataFrame(pairs)
+    for col in ("time_locked", "blank_edge"):
+        R[col] = R[col].fillna(False).astype(bool) if col in R else False
+    E = {}
+    if earlier:
+        for p in earlier:
+            if p.get("role") == "candidate":
+                E[(p["stim"], p["rec"])] = p
+    status, reason, e_delta, e_resp = [], [], [], []
+    for _, x in R.iterrows():
+        pv = E.get((x.stim, x.rec)) if x.role == "candidate" else None
+        e_delta.append(pv["delta_per_pulse"] if pv else None)
+        e_resp.append(bool(pv["responsive"]) if pv else None)
+        if not x.responsive:
+            status.append("")
+            reason.append("")
+            continue
+        why = []
+        if x.time_locked:
+            why.append("spikes locked to one latency")
+        if x.blank_edge:
+            why.append("spikes pile up where the blank ends")
+        contradicted = pv is not None and not pv["responsive"]
+        if contradicted:
+            why.append("not responsive in the earlier screen")
+        if why:
+            s = "Check"
+        elif x.delta_per_pulse < STRONG_EFFECT:
+            s = "Weak"
+            why.append(f"under {STRONG_EFFECT} extra spikes/pulse, may not reproduce")
+        else:
+            s = "Use"
+            if pv is not None:
+                why.append("reproduced")
+        status.append(s)
+        reason.append("; ".join(why))
+    R["status"], R["reason"], R["earlier_delta"], R["earlier_responsive"] = status, reason, e_delta, e_resp
+    return R
+
+
+def recommend(R: pd.DataFrame, max_stims: int = 4, max_recs: int = 3) -> list[tuple[int, int]]:
+    """Pairs for the curve step: one stimulating electrode per organoid (independent input-output
+    curves), the one with the best 'Use' pair (reproduced pairs first, then by z); for each chosen
+    electrode its best 'Use' pairs."""
+    use = R[R.status == "Use"].copy()
+    if use.empty:
+        return []
+    use["reproduced"] = use.earlier_responsive.fillna(False).astype(bool)
+    use = use.sort_values(["reproduced", "z"], ascending=False)
+    stims = use.drop_duplicates("stim").drop_duplicates("stim_block").stim.head(max_stims).tolist()
+    return [(int(s), int(r)) for s in stims for r in use[use.stim == s].rec.head(max_recs)]
