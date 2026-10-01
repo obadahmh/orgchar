@@ -347,7 +347,9 @@ def _completeness_problems(step_dir: Path, plan: dict, r: dict) -> list[str]:
     for s in plan["segments"]:
         st = _close_status(step_dir / s["id"])
         raw = step_dir / s["id"] / "raw.h5"
-        if st and not st["disable_ok"]:
+        # a segment that uploaded no stimulation (census) has nothing to disable: an unanswered
+        # final disable there is not a problem (it starts with an acknowledged disable)
+        if st and not st["disable_ok"] and s["electrodes"]:
             problems.append(f"final 'disable all stimulation' failed for segment {s['id']}")
         if not raw.exists():
             problems.append(f"segment {s['id']} has no recording")

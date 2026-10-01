@@ -24,6 +24,7 @@ from . import simulate
 RAW_ROOT = Path("/mnt/s3-intanraws")
 PRE_S, POST_S, UPLOAD_WAIT_S = 2.0, 2.0, 10.0
 STOP_ACK_S = 20.0
+DISABLE_ATTEMPTS = 5   # x 60 s
 
 
 def _utc():
@@ -347,11 +348,20 @@ class HardwareBackend:
                 except Exception as e:  # noqa: BLE001
                     stop_ok = None
                     notes.append(f"stop recording not acknowledged ({e!r}); the file is checked when copied")
-            try:
-                await self._ack("disable all stimulation", intan._disable_all_stim())
-                disable_ok = True
-            except Exception as e:  # noqa: BLE001
-                errors.append(f"final disable: {e!r}")
+            # After a stop the platform can stay unresponsive for minutes while it saves the file
+            # (fs666 census, 1 Oct 2026: a 1.2 GB recording, no reply to a disable sent 15 s
+            # later). Disabling is safe to repeat and is the request that matters: keep asking.
+            failed = []
+            for attempt in range(DISABLE_ATTEMPTS):
+                try:
+                    await self._ack("disable all stimulation", intan._disable_all_stim(), 60)
+                    disable_ok = True
+                    break
+                except Exception as e:  # noqa: BLE001
+                    failed.append(f"final disable attempt {attempt + 1}: {e!r}")
+            (notes if disable_ok else errors).extend(failed)
+            if failed and disable_ok:
+                self.log(f"  Final disable acknowledged after {len(failed)} unanswered attempt(s) (platform busy saving).")
             await intan._close()
             self.close_status = dict(stop_ok=stop_ok, disable_ok=disable_ok, messages=errors + notes)
             if errors:
