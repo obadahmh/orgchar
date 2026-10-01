@@ -364,3 +364,27 @@ def test_funcsolver_artifact_in_window_is_caught(tmp_path):
     D, thr, art = F.measure(segs, plan)
     assert max(art[(21, 22, n)] for n in (2, 4, 6)) > F.ARTIFACT_LIMIT
     assert max(art[(21, c, n)] for c in (16, 17, 18, 19, 20, 23) for n in (2, 4, 6)) < F.ARTIFACT_LIMIT  # e20: bursts, no artifact
+
+
+def test_train_screen_deals_electrodes_two_per_organoid():
+    plan = P.plan_train_screen(blocks=[0, 1, 2, 3], reps=2, sham_reps=1, seed=0)
+    assert len(plan["segments"]) == 4 * 4
+    for s in plan["segments"]:
+        orgs = [e // 8 for e in s["electrodes"]]
+        assert len(orgs) == P.MAX_UPLOAD_STIMS and all(orgs.count(o) == 2 for o in range(4))
+    P.add_train_codes(plan)                                        # codes still fit
+
+
+def test_train_screen_finds_the_planted_shapes(tmp_path):
+    from orgchar import funcsolver as F
+    plan = P.plan_train_screen(blocks=[0, 1, 2], seed=2)
+    segs = []
+    for s in plan["segments"]:
+        d = tmp_path / s["id"]
+        d.mkdir()
+        raw = SimBackend(simulate.demo_organoid()).run_segment(s, d, "s")
+        segs.append((str(raw), match_triggers(s, raw)))
+    r = F.scout(segs, plan)
+    assert {k: (v["stim"], v["rec"]) for k, v in r["best"].items()} == {"short": (13, 10), "band": (5, 3), "long": (21, 22)}
+    assert sorted(r["curve_stims"]) == [5, 13, 21] and r["verdict"] == "CANDIDATES_FOUND"
+    assert r["controls"]["cross_organoid_passing"] <= r["controls"]["expected_by_chance"]

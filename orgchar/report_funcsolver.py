@@ -256,3 +256,161 @@ def page(path, plan, r, problems, when):
                 "</ul></details>")
     with open(path, "w") as fh:
         fh.write(_page(title, body))
+
+
+# ============================================================================== after-train screen
+
+SHAPE_COLOUR = dict(short=ORANGE, band="#1baf7a", long=BLUE)   # reference palette slots 2, 3, 1
+SHAPE_NAME = dict(short="falling", band="peaked", long="rising")
+
+
+def _shape_maps(pairs, stims):
+    """One 8 x 8 grid per organoid: rows = stimulated electrode, columns = recording electrode.
+    A coloured cell with its symbol = a candidate shape; hover for the numbers."""
+    by = {(p["stim"], p["rec"]): p for p in pairs}
+    out = []
+    for o in sorted({e // 8 for e in stims}):
+        cs, x0, y0 = 26, 34, 30
+        es = list(range(8 * o, 8 * o + 8))
+        svg = [f"<svg viewBox='0 0 {x0 + 8 * cs + 4} {y0 + 8 * cs + 4}' style='width:{x0 + 8 * cs + 4}px;max-width:100%'>"
+               f"<text x='{x0 + 4 * cs}' y='10' font-size='10' text-anchor='middle' fill='{MUTED}'>recording electrode</text>"]
+        for j, c in enumerate(es):
+            svg.append(f"<text x='{x0 + j * cs + cs / 2}' y='{y0 - 6}' font-size='10' text-anchor='middle' fill='{MUTED}'>{c}</text>")
+        for i, e in enumerate(es):
+            tested = e in stims
+            svg.append(f"<text x='{x0 - 6}' y='{y0 + i * cs + cs / 2 + 4}' font-size='10' text-anchor='end' "
+                       f"fill='{INK if tested else '#c9c8c2'}'>e{e}</text>")
+            for j, c in enumerate(es):
+                x, y = x0 + j * cs, y0 + i * cs
+                p = by.get((e, c))
+                if e == c or not tested or p is None:
+                    svg.append(f"<rect x='{x + 1}' y='{y + 1}' width='{cs - 2}' height='{cs - 2}' rx='3' fill='#f1f0eb'/>")
+                    continue
+                shp = max(p["shapes"], key=lambda k: p["scores"][k]["win"]) if p["shapes"] else None
+                tip = (f"e{e}→e{c}: " + ", ".join(f"{n} p: {m:.1f}" for n, m in zip(p["levels"], p["means"]))
+                       + (f" · {SHAPE_NAME[shp]}, single trial wins {p['scores'][shp]['win']:.0%}" if shp else " · no shape"))
+                fill = SHAPE_COLOUR[shp] if shp else "#ffffff"
+                svg.append(f"<g><title>{html.escape(tip)}</title><rect x='{x + 1}' y='{y + 1}' width='{cs - 2}' "
+                           f"height='{cs - 2}' rx='3' fill='{fill}' stroke='#e3e2dc'/>"
+                           + (f"<text x='{x + cs / 2}' y='{y + cs / 2 + 5}' font-size='14' text-anchor='middle' "
+                              f"fill='white' font-weight='700'>{F.SHAPE_SYMBOL[shp]}</text>" if shp else "") + "</g>")
+        svg.append("</svg>")
+        out.append(f"<figure><figcaption>Organoid {o + 1} (e{8 * o}–e{8 * o + 7})</figcaption>{''.join(svg)}</figure>")
+    legend = " ".join(f"<span style='display:inline-block;width:12px;height:12px;border-radius:3px;background:{SHAPE_COLOUR[k]};"
+                      f"vertical-align:-1px'></span> {F.SHAPE_SYMBOL[k]} {SHAPE_NAME[k]}" for k in F.ROLES)
+    return f"<p class=note>{legend} &nbsp;·&nbsp; white: tested, no shape &nbsp;·&nbsp; grey: not stimulated</p><div class=maps>{''.join(out)}</div>"
+
+
+def _candidate_figure(cands, D, levels):
+    n = len(cands)
+    ncol = min(4, n)
+    nrow = -(-n // ncol)
+    fig, axes = plt.subplots(nrow, ncol, figsize=(2.3 * ncol, 2.0 * nrow), squeeze=False,
+                             gridspec_kw=dict(hspace=0.85, wspace=0.4))
+    for k, (role, p) in enumerate(cands):
+        ax = axes[k // ncol, k % ncol]
+        g = D[(D.kind == "stim") & (D.stim == p["stim"]) & (D.rec == p["rec"])]
+        y = g.adjusted - p.get("control", 0.0)
+        xs = np.array([levels.index(v) for v in g.level])
+        ax.scatter(xs + _jitter(len(xs), 0.12, k), y, s=10, color=SHAPE_COLOUR[role], alpha=0.7, linewidths=0)
+        ax.plot(range(len(levels)), p["means"], color=INK, lw=1.8, marker="o", ms=3.5)
+        ax.axhline(0, color=GREY, lw=0.5)
+        ax.set_xticks(range(len(levels)))
+        ax.set_xticklabels(levels)
+        ax.tick_params(labelsize=7)
+        ax.set_title(f"e{p['stim']}→e{p['rec']}  {F.SHAPE_SYMBOL[role]} {SHAPE_NAME[role]}\n"
+                     f"wins {p['scores'][role]['win']:.0%}, {p['scores'][role]['diff']:.1f} events", fontsize=7.5, loc="left")
+        if k % ncol == 0:
+            ax.set_ylabel("events after train", fontsize=7.5)
+        if k // ncol == nrow - 1:
+            ax.set_xlabel("pulses in the train", fontsize=7.5)
+    for k in range(n, nrow * ncol):
+        axes[k // ncol, k % ncol].axis("off")
+    return _svg(fig)
+
+
+def screen_page(path, plan, r, problems, when):
+    D = r["_D"]
+    levels = list(plan["levels"])
+    fs = plan["fsname"]
+    sim = plan.get("backend") == "simulated"
+    best, stims = r["best"], plan["stims"]
+    body = [f"<h1>{html.escape(fs)} · after-train screen</h1>",
+            f"<p class=meta>{html.escape(when)}{' · SIMULATED' if sim else ''} · every electrode of organoid(s) "
+            f"{', '.join(str(o + 1) for o in sorted({e // 8 for e in stims}))} · trains of {', '.join(map(str, levels))} "
+            f"pulses, {plan['ipi_ms']:g} ms apart, {plan['amplitude_uA']} µA × {plan['phase_us']:g} µs · "
+            f"{r['n_trials']} trains</p>"]
+    if r["curve_stims"]:
+        lede = (f"Next, the curve stimulates e{', e'.join(map(str, r['curve_stims']))}. Candidates found for "
+                + ", ".join(SHAPE_NAME[k] for k in F.ROLES if k in best)
+                + ("" if len(best) == 3 else "; none for " + ", ".join(SHAPE_NAME[k] for k in F.ROLES if k not in best)) + ".")
+    else:
+        lede = "No electrode gives a falling, peaked or rising response after trains."
+    if r["verdict"] == "CONTROLS_FAILED":
+        lede = "Controls failed: too many other-organoid pairs pass. Do not trust the candidates below."
+    body.append(f"<p class=lede>{html.escape(lede)}</p>")
+    rows = []
+    for role in F.ROLES:
+        v = best.get(role)
+        if v:
+            p = next(q for q in r["pairs"] if q["stim"] == v["stim"] and q["rec"] == v["rec"])
+            rows.append(f"<tr><td><b>{SHAPE_NAME[role]}</b> {F.SHAPE_SYMBOL[role]} <span class=note>({role})</span></td>"
+                        f"<td>e{v['stim']} → e{v['rec']}</td><td class=n>{v['win']:.0%}</td><td class=n>{v['diff']:.1f}</td>"
+                        f"<td class=n>{' · '.join(f'{m:.1f}' for m in p['means'])}</td>"
+                        f"<td class=n>{v['n_candidates'] - 1}</td></tr>")
+        else:
+            rows.append(f"<tr><td><b>{SHAPE_NAME[role]}</b> {F.SHAPE_SYMBOL[role]} <span class=note>({role})</span></td>"
+                        f"<td>{_icon(CHECK_BAD)}none</td><td></td><td></td><td></td><td></td></tr>")
+    body.append("<div class=wrap><table><tr><th>Shape FuncSolver needs</th><th>Best pair</th>"
+                "<th class=n title='How often one trial at the favoured length beats one at the other'>Single trial wins</th>"
+                "<th class=n>Difference (events)</th>"
+                f"<th class=n>Mean events at {' · '.join(map(str, levels))} pulses</th><th class=n>Other candidates</th></tr>"
+                + "".join(rows) + "</table></div>")
+    body.append("<p class=note><b>How to read this.</b> FuncSolver reads one response per train, so a shape is only "
+                "useful if single trials differ. <b>Single trial wins</b>: how often one trial at the length that should "
+                "give more events (2 pulses for falling, 20 for rising, the middle for peaked) beats one at the length "
+                "that should give fewer. 50% = no difference, 100% = always. A pair counts as a candidate at p &lt; "
+                f"{F.SCOUT_MAX_P:g} (one-sided rank test) and ≥ {F.SCOUT_MIN_EVENTS:g} events apart. The curve step then "
+                "measures the full curve for the chosen electrodes and checks it on new trials.</p>")
+    c = r["controls"]
+    body.append("<h2>Checks</h2><ul class=checks>")
+    body.append(f"<li>{_icon(CHECK_BAD if problems else CHECK_OK)}<span>"
+                + (f"<b>Incomplete:</b> {html.escape('; '.join(problems))}." if problems
+                   else f"All {len(plan['segments'])} recordings complete.") + "</span></li>")
+    ok = r["verdict"] != "CONTROLS_FAILED"
+    body.append(f"<li>{_icon(CHECK_OK if ok else CHECK_BAD)}<span>Negative controls: {c['cross_organoid_passing']} of "
+                f"{c['cross_organoid_pairs']} other-organoid pairs pass (about {c['expected_by_chance']:g} expected by "
+                "chance; a train cannot reach another organoid).</span></li>")
+    bad = [p for p in r["pairs"] if not p["artifact_ok"]]
+    body.append(f"<li>{_icon(CHECK_OK if not bad else CHECK_WARN)}<span>Stimulation artifact gone 10 ms after the train"
+                + (" on every pair." if not bad else f": not on {len(bad)} pair(s), which were excluded.") + "</span></li>")
+    body.append(f"<li>{_icon(CHECK_OK)}<span>Sham correction from {c['sham_trials']} no-current trials.</span></li></ul>")
+    body.append("<h2>Next step</h2>")
+    if r["curve_stims"]:
+        body.append(f"<pre class=cmd>./orgchar.sh curve --fsname {html.escape(fs)}</pre><p class=note>Same as "
+                    f"<code>--stims {','.join(map(str, r['curve_stims']))}</code>. About "
+                    f"{20 + 10 * len(r['curve_stims'])}–{30 + 15 * len(r['curve_stims'])} min.</p>")
+    else:
+        body.append("<p>Nothing for FuncSolver with these trains. Options: more current (<code>--amplitude 3</code>), "
+                    "or re-check the census: the organoids may be quiet today.</p>")
+    body.append("<h2>Every electrode pair</h2>" + _shape_maps(r["pairs"], stims))
+    cands = []
+    for role in F.ROLES:
+        cands += [(role, p) for p in sorted([q for q in r["pairs"] if role in q["shapes"]],
+                                            key=lambda q: -q["scores"][role]["win"])[:4]]
+    if cands:
+        body.append("<h2>The candidates</h2><p class=note>Up to four per shape, best first. Dots: single trials; line: "
+                    "mean. Events are counted 10–210 ms after the train, minus the 500 ms before it and the sham mean.</p>"
+                    f"<div class=fig>{_candidate_figure(cands, D, levels)}</div>")
+    trs = "".join(
+        f"<tr><td>e{p['stim']}→e{p['rec']}</td><td>{', '.join(SHAPE_NAME[k] for k in p['shapes']) or '–'}</td>"
+        f"<td class=n>{' · '.join(f'{m:.1f}' for m in p['means'])}</td>"
+        + "".join(f"<td class=n>{p['scores'][k]['win']:.0%} (p {p['scores'][k]['p']:.1g})</td>" if k in p["scores"] else "<td></td>"
+                  for k in F.ROLES)
+        + f"<td class=n>{p['artifact']:.1f}</td></tr>" for p in sorted(r["pairs"], key=lambda q: (q["stim"], q["rec"])))
+    body.append("<details><summary>All pairs as a table</summary><div class=wrap><table><tr><th>Pair</th><th>Shape</th>"
+                f"<th class=n>Mean events at {' · '.join(map(str, levels))}</th><th class=n>Falling: wins</th>"
+                "<th class=n>Peaked: wins</th><th class=n>Rising: wins</th><th class=n>Artifact ×</th></tr>"
+                + trs + "</table></div></details>")
+    with open(path, "w") as fh:
+        fh.write(_page(f"{fs} · after-train screen · {when}", body))

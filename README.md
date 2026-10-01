@@ -1,19 +1,24 @@
-# orgchar — weekly organoid characterisation
+# orgchar — weekly organoid characterisation for FuncSolver
 
-Three short steps tell you, for this week's FinalSpark organoids:
+Three steps tell you, for this week's FinalSpark organoids:
 1. which organoids fire at all;
-2. which electrode pairs give a real stimulus-evoked response;
-3. the input→output curve of those pairs.
-
-Step 3 produces `card.json`, the file function approximation should read.
+2. which electrodes give FuncSolver's three response shapes (falling, peaked, rising) after a train;
+3. the full curve of those electrodes, checked on new trials, as FuncSolver's `calibration.json`.
 
 ```
-census   5 min, no stimulation      → which organoids are alive?        GO / NO-GO
-screen   ~6 min per live organoid   → which stim→record pairs respond?  responsive pairs
-curve    ~10–15 min                 → input-output curves               card.json
+census   5 min, no stimulation            → which organoids are alive?             GO / NO-GO
+screen   15–30 min (1–4 live organoids)   → which electrodes give which shape?     candidates
+curve    ~50 min                          → curves checked on new trials           calibration.json
 ```
 
-About 30–40 min of platform time per week in total.
+One paste runs all three; each step only starts if the previous one found something:
+
+```bash
+cd ~/Documents/orgchar && git pull && FS=fs666 && \
+./orgchar.sh census --fsname $FS --yes && \
+./orgchar.sh screen --fsname $FS --yes && \
+./orgchar.sh curve  --fsname $FS --yes
+```
 
 ## Why the output could not be read before
 
@@ -59,7 +64,18 @@ An organoid (block of 8) with ≥ 1 active electrode is **LIVE**.
 
 **Rule: never stimulate a silent organoid for characterisation.** With nothing firing, every "response" is artifact. Re-run the census later in the week, or ask FinalSpark about the preparation.
 
-### Step 2 — screen (which pairs respond)
+### Step 2 — screen: which electrodes give which shape after a train
+
+Every electrode of each live organoid gets hardware trains of 2, 6, 12 and 20 pulses (6 trials each), measured exactly as FuncSolver will (events 10–210 ms after the train; see Step 3). For every stimulating → recording pair in the same organoid:
+- **falling** if 2-pulse trials beat 20-pulse trials, **rising** if the reverse, **peaked** if the best middle length beats both ends;
+- the comparison is on single trials (rank test, one-sided p < 0.01, at least 1.5 events apart), because FuncSolver reads one response per train and evoked bursts make responses heavy-tailed;
+- "single trial wins" = how often one trial at the favoured length beats one at the other: the number that decides whether FuncSolver can use it.
+
+The best pair per shape decides which electrodes the curve stimulates (one electrode may serve two shapes). **Controls:** pairs across organoids cannot respond; the report counts how many pass anyway against the number expected by chance. One upload holds at most 8 stimulating electrodes (keys 8–14 carry train codes), so electrodes are dealt two per organoid per recording and all organoids run side by side.
+
+Why not single pulses: on fs666 (1 Oct 2026) the single-pulse screen picked e2, e20, e29 and e10; only e10 responded after trains. `--mode single` keeps the earlier single-pulse screen, described next.
+
+#### Single-pulse screen (`--mode single`)
 
 - Deliver single biphasic pulses on each electrode of each live organoid: 2 µA × 100 µs, negative first, 30 per electrode.
 - **Sham markers** go out on trigger key 15, with no electrode bound to it: 30 per organoid.
@@ -122,8 +138,8 @@ Everything runs in the FinalSpark `ncp` environment through `./orgchar.sh`:
 cd ~/Documents/orgchar
 ./orgchar.sh census --fsname fs652 --dry-run    # shows the plan, touches nothing
 ./orgchar.sh census --fsname fs652              # asks you to type the fsname to confirm
-./orgchar.sh screen --fsname fs652              # uses the live blocks from the census
-./orgchar.sh curve  --fsname fs652              # FuncSolver curves on the screen's stimulating electrodes
+./orgchar.sh screen --fsname fs652              # after-train screen of the live organoids from the census
+./orgchar.sh curve  --fsname fs652              # FuncSolver curves on the screen's candidate electrodes
 ./orgchar.sh status --fsname fs652
 ./orgchar.sh analyze sessions/fs652/<step dir>  # re-analyse offline, e.g. after changing a setting
 ```
@@ -163,7 +179,10 @@ Figures are vector graphics and stay sharp when zoomed.
 |---|---|---|
 | census | `GO: screen blocks …` | run screen |
 | census | `NO-GO` | do not stimulate; re-check later, contact FinalSpark |
-| screen | `RESPONSES_FOUND` | run curve |
+| screen | `CANDIDATES_FOUND` | run curve (it stimulates the candidates) |
+| screen | `NO_CANDIDATE` | nothing for FuncSolver with these trains; try `--amplitude 3`, or re-check the census |
+| screen | `CONTROLS_FAILED` | too many other-organoid pairs pass; the candidates are not trustworthy |
+| screen (single) | `RESPONSES_FOUND` | run `curve --mode pulses` |
 | screen | `NO_RESPONSE` (controls clean) | tissue fires but does not follow this stimulus; try `--amplitude 3` or `--phase 150` once, then stop |
 | screen | `PIPELINE_LEAK` | artifact reaches the readout; look at the Controls section and the evidence traces before anything else |
 | curve | `ALL THREE FUNCTIONS FOUND` | train FuncSolver on `calibration_latest.json` (command in the report) |

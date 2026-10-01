@@ -105,9 +105,11 @@ def _plan_index(plan):
     return {s["id"]: s for s in plan["segments"]}
 
 
-def measure(segments, plan, spec=RO.SPEC):
+def measure(segments, plan, spec=RO.SPEC, all_channels=False):
     """Every trial on every electrode of its organoid (shams: every electrode), with the readout.
-    Thresholds come from development and first-reference segments only (pre-train baselines)."""
+    all_channels: stimulation trials on every electrode, so other-organoid pairs can serve as
+    negative controls. Thresholds come from development and first-reference segments only
+    (pre-train baselines)."""
     segs = _plan_index(plan)
     nb = int(round(spec["baseline_duration_ms"] * spec["sample_rate_hz"] / 1000))
     # 1) noise -> frozen thresholds, from pre-train baselines of development + ref0 segments
@@ -135,14 +137,15 @@ def measure(segments, plan, spec=RO.SPEC):
             if o < nb or o + need > X.shape[1]:
                 continue
             stim = int(t.stim_electrode)
-            recs = range(S.N_CH) if t.kind == "sham" else [c for c in range(8 * (stim // 8), 8 * (stim // 8) + 8) if c != stim]
+            recs = (range(S.N_CH) if t.kind == "sham" else [c for c in range(S.N_CH) if c != stim] if all_channels
+                    else [c for c in range(8 * (stim // 8), 8 * (stim // 8) + 8) if c != stim])
             for c in recs:
                 m = RO.measure_trial(X[c, o - nb:o], X[c, o:o + need], n, ipi, plan["phase_us"], thr[c], spec,
                                      keep_trace=t.kind == "stim")
                 rows.append(dict(segment=seg["id"], seg_index=si, partition=seg["partition"], block=seg["block"],
                                  kind=t.kind, stim=stim, rec=c, level=n, onset=o, train_id=t.train_id,
                                  response=m["response_events"], baseline=m["baseline_events"], adjusted=m["adjusted"]))
-                if t.kind == "stim":   # start of the window, kept to check for time-locked artifact
+                if t.kind == "stim" and c // 8 == stim // 8:   # window start, to check for time-locked artifact
                     lst = traces.setdefault((stim, c, n), [])
                     if len(lst) < 24:
                         lst.append(m["trace"][:S.samples(ARTIFACT_CHECK_MS)])
@@ -343,3 +346,87 @@ def characterise(segments, plan):
                                **{k: v for k, v in p["fits"][r].items() if k != "conf_means"}) for r, p in chosen.items()},
                 pairs=[_clean({k: v for k, v in p.items()}) for p in pairs], thresholds_uV=_clean(thr),
                 n_trials=int(D[D.kind == "stim"].train_id.nunique()), _D=D, _chosen=chosen)
+
+
+# ------------------------------------------------------------------------------ screen: find candidates
+
+SCOUT_MAX_P = 0.01       # one-sided Mann-Whitney between the two train lengths that define the shape
+SCOUT_MIN_EVENTS = 1.5   # and at least this many events apart (a curve FuncSolver can use)
+SHAPE_SYMBOL = dict(short="↘", band="∧", long="↗")
+
+
+def _compare(a, b):
+    """a vs b, single trials. Rank-based, because evoked bursts make responses heavy-tailed (fs666
+    e10: 46 events apart with SD 37 failed a t-test; every rank comparison separated them).
+    Returns mean difference (events), P(a single a-trial > a single b-trial) and its p-value."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    if len(a) < 2 or len(b) < 2:
+        return dict(diff=0.0, win=0.5, p=1.0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        u = stats.mannwhitneyu(a, b, alternative="greater")
+    return dict(diff=float(a.mean() - b.mean()), win=float(u.statistic / (len(a) * len(b))), p=float(u.pvalue))
+
+
+def shape_scores(g, levels):
+    """For one pair's trials (column y, by level): how clearly it falls, rises and peaks.
+    falling: shortest vs longest train; rising: the reverse; peaked: best middle length vs the
+    higher of the two ends. 'win' = how often a single trial of the first beats one of the second."""
+    by = {n: g[g.level == n].y.values for n in levels}
+    lo, hi = by[levels[0]], by[levels[-1]]
+    out = dict(short=_compare(lo, hi), long=_compare(hi, lo))
+    mids = levels[1:-1]
+    if mids:
+        peak = max(mids, key=lambda n: by[n].mean())
+        out["band"] = _compare(by[peak], lo if lo.mean() >= hi.mean() else hi) | dict(peak=int(peak))
+    return out
+
+
+def scout(segments, plan):
+    """The after-train screen: for every electrode pair, the response to trains of each length,
+    and which pairs look like FuncSolver's falling, peaked and rising functions."""
+    D, thr, art = measure(segments, plan, all_channels=True)
+    levels = list(plan["levels"])
+    sham = D[D.kind == "sham"]
+    control = sham.groupby("rec").adjusted.mean().to_dict()
+    stim = D[D.kind == "stim"].copy()
+    stim["y"] = stim.adjusted - stim.rec.map(control)
+    pairs = []
+    for (e, c), g in stim.groupby(["stim", "rec"]):
+        if g.level.nunique() < len(levels) or g.groupby("level").size().min() < 3:
+            continue
+        sc = shape_scores(g, levels)
+        same = e // 8 == c // 8
+        a = max((art.get((e, c, n), 0.0) for n in levels), default=0.0)
+        means = g.groupby("level").y.mean().reindex(levels)
+        row = dict(stim=int(e), rec=int(c), same_organoid=same, levels=[int(n) for n in levels],
+                   control=float(control.get(c, 0.0)), means=means.round(3).tolist(),
+                   sd=g.groupby("level").y.std().reindex(levels).round(3).tolist(), artifact=a,
+                   artifact_ok=a < ARTIFACT_LIMIT, scores=sc)
+        row["shapes"] = [k for k, v in sc.items()
+                         if v["p"] < SCOUT_MAX_P and v["diff"] >= SCOUT_MIN_EVENTS and row["artifact_ok"]]
+        pairs.append(row)
+    same = [p for p in pairs if p["same_organoid"]]
+    cross = [p for p in pairs if not p["same_organoid"]]
+    # the best pair per shape: the one whose single trials separate most often, then by size;
+    # one electrode may serve two shapes (on different recording electrodes)
+    best = {}
+    for role in ROLES:
+        cands = sorted([p for p in same if role in p["shapes"]],
+                       key=lambda p: (-p["scores"][role]["win"], -p["scores"][role]["diff"]))
+        if cands:
+            sc = cands[0]["scores"][role]
+            best[role] = dict(stim=cands[0]["stim"], rec=cands[0]["rec"], win=sc["win"], diff=sc["diff"],
+                              p=sc["p"], n_candidates=len(cands), others=[[p["stim"], p["rec"]] for p in cands[1:6]])
+    curve_stims = list(dict.fromkeys(v["stim"] for v in best.values()))
+    # negative control: pairs across organoids cannot respond; they show the false-positive rate
+    false_pos = sum(bool(p["shapes"]) for p in cross)
+    expected = round(len(cross) * len(ROLES) * SCOUT_MAX_P, 1)
+    verdict = "CANDIDATES_FOUND" if best else "NO_CANDIDATE"
+    if cross and false_pos > max(3, 3 * expected):
+        verdict = "CONTROLS_FAILED"
+    return dict(step="screen", mode="trains", verdict=verdict, levels=levels, best=best, curve_stims=curve_stims,
+                controls=dict(cross_organoid_pairs=len(cross), cross_organoid_passing=false_pos,
+                              expected_by_chance=expected, sham_trials=int(sham.train_id.nunique())),
+                pairs=[_clean(p) for p in same], thresholds_uV=_clean(thr),
+                n_trials=int(stim.train_id.nunique()), _D=D, _cross=cross)
