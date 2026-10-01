@@ -200,6 +200,7 @@ Timing alone says *where* each pulse is, not *which train* it belongs to; the al
 - Codes are read straight from the recording, independently of the alignment, and compared with it. A contradiction excludes that train (`note = code mismatch`) and is reported; a code lost in a dropped row just leaves that train unconfirmed (`code = missing`).
 - Every coded run checks that code triggers leave no artifact (< 50 µV; real stimulation leaves thousands). If they ever do, the run stops with an error.
 - Before first use on the platform, run `./orgchar.sh codetest --fsname <fs>` (about 1.5 min). It uploads the curve electrodes' real parameters, sends 60 codes (each followed by a sham marker), then 5 real pulses as a positive control, and prints PASS or FAIL with the evidence.
+- Once codetest has passed on a machine, screen and curve use codes by default there (`--no-codes` to switch off). It tests the trigger system, not the organoid: run it once per machine/controller, and again after FinalSpark changes their setup. Passed on np14, 1 Oct 2026 (130/130 code triggers recorded, 60/60 codes read back, 3.3 µV after codes vs 6259 µV after real pulses).
 
 ## What is and is not verified
 

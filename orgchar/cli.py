@@ -323,7 +323,7 @@ def cmd_census(a):
     if a.dry_run or not _confirm(a):
         return
     step_dir, segs = _execute(a, plan)
-    analyse(step_dir, dict(plan, fsname=a.fsname, backend="simulated" if a.simulate else "hardware"), segs)
+    analyse(step_dir, json.loads((step_dir / "plan.json").read_text()), segs)
 
 
 def cmd_screen(a):
@@ -347,13 +347,13 @@ def cmd_screen(a):
     plan = P.plan_screen(blocks=blocks, electrodes=electrodes, amplitude_uA=a.amplitude, phase_us=a.phase,
                          polarity=a.polarity, reps=a.reps, sham_reps=a.reps, seed=int(time.time()))
     plan["window_ms"] = a.window
-    if a.codes:
+    if _use_codes(a):
         plan = P.add_train_codes(plan)
     _describe(plan)
     if a.dry_run or not _confirm(a):
         return
     step_dir, segs = _execute(a, plan)
-    analyse(step_dir, dict(plan, fsname=a.fsname, backend="simulated" if a.simulate else "hardware"), segs)
+    analyse(step_dir, json.loads((step_dir / "plan.json").read_text()), segs)
 
 
 def cmd_curve(a):
@@ -384,13 +384,29 @@ def cmd_curve(a):
         plan = P.plan_curve_amplitude(stims, levels=levels, phase_us=a.phase, polarity=a.polarity,
                                       reps_per_pass=max(10, -(-a.reps // 3)), passes=3, seed=int(time.time()))
     plan["pairs"] = pairs
-    if a.codes:
+    if _use_codes(a):
         plan = P.add_train_codes(plan)
     _describe(plan)
     if a.dry_run or not _confirm(a):
         return
     step_dir, segs = _execute(a, plan)
-    analyse(step_dir, dict(plan, fsname=a.fsname, backend="simulated" if a.simulate else "hardware"), segs)
+    analyse(step_dir, json.loads((step_dir / "plan.json").read_text()), segs)
+
+
+def _use_codes(a) -> bool:
+    """Train codes are on by default once codetest has passed on this machine's platform setup
+    (any organoid: it tests the trigger system, not the tissue). --codes / --no-codes override."""
+    if a.codes is not None:
+        return a.codes
+    if a.simulate:
+        return True
+    passed = [r for r in sorted(HOME.glob("*/*_codetest/result.json"))
+              if not r.parts[-3].startswith("SIMULATED_") and json.loads(r.read_text()).get("pass")]
+    if passed:
+        print(f"Train codes on (codetest passed: {passed[-1].parent.parent.name}/{passed[-1].parent.name}).")
+        return True
+    print("Train codes off: codetest has not passed on this machine yet (./orgchar.sh codetest --fsname ...).")
+    return False
 
 
 def cmd_codetest(a):
@@ -410,7 +426,7 @@ def cmd_codetest(a):
         return
     step_dir, segs = _execute(a, plan)
     r = _codetest_result(plan, segs)
-    r["verdict_text"] = ("PASS: train codes are safe and readable; use --codes on screen and curve"
+    r["verdict_text"] = ("PASS: train codes are safe and readable; screen and curve now use them by default on this machine"
                          if r["pass"] else "FAIL: do not use --codes. " + "; ".join(r["failures"]))
     (step_dir / "result.json").write_text(R.to_json(r))
     print("\n" + r["verdict_text"])
@@ -535,7 +551,9 @@ def main(argv=None):
     p.add_argument("--polarity", default="negative-first", choices=["negative-first", "positive-first"])
     p.add_argument("--reps", type=int, default=30)
     p.add_argument("--window", type=float, default=30.0, help="ms after each pulse in which spikes count")
-    p.add_argument("--codes", action="store_true", help="send train codes (keys 8-14) so the recording identifies each train")
+    p.add_argument("--codes", action=argparse.BooleanOptionalAction, default=None,
+                   help="train codes (keys 8-14) so the recording identifies each train "
+                        "(default: on once codetest has passed on this machine)")
     p.set_defaults(func=cmd_screen)
 
     p = sub.add_parser("curve", help="input-output curve for responsive pairs")
@@ -549,7 +567,9 @@ def main(argv=None):
     p.add_argument("--phase", type=float, default=100.0)
     p.add_argument("--polarity", default="negative-first", choices=["negative-first", "positive-first"])
     p.add_argument("--reps", type=int, default=20)
-    p.add_argument("--codes", action="store_true", help="send train codes (keys 8-14) so the recording identifies each train")
+    p.add_argument("--codes", action=argparse.BooleanOptionalAction, default=None,
+                   help="train codes (keys 8-14) so the recording identifies each train "
+                        "(default: on once codetest has passed on this machine)")
     p.set_defaults(func=cmd_curve)
 
     p = sub.add_parser("codetest", help="1 min: check that train codes are safe and readable")
