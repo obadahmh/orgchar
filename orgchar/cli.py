@@ -5,6 +5,7 @@
     orgchar curve  --fsname fs652          # ~10-20 min: input-output curves -> card.json
     orgchar analyze <step dir>             # re-run the analysis of a finished step, offline
     orgchar status --fsname fs652          # what has been done for this organoid
+    orgchar codetest --fsname fs652        # 1 min: check that train codes (--codes) are safe and readable
 
 Add --dry-run to see the plan and its duration without touching hardware, --simulate to run the
 whole step on a synthetic organoid.
@@ -22,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import h5py
+import numpy as np
 import pandas as pd
 
 from . import analysis as A
@@ -78,8 +80,10 @@ def _lock():
 def _describe(plan):
     n_stim = sum(e["kind"] == "stim" for s in plan["segments"] for e in s["events"])
     n_sham = sum(e["kind"] == "sham" for s in plan["segments"] for e in s["events"])
+    n_code = sum(e["kind"] == "code" for s in plan["segments"] for e in s["events"])
     print(f"Plan: {plan['step']}, {len(plan['segments'])} segment(s), {n_stim} stimulation pulses, "
-          f"{n_sham} sham markers, about {P.plan_duration_s(plan) / 60:.1f} min.")
+          f"{n_sham} sham markers, " + (f"{n_code} code triggers (keys 8-14, no current), " if n_code else "")
+          + f"about {P.plan_duration_s(plan) / 60:.1f} min.")
     for s in plan["segments"]:
         el = s["electrodes"]
         desc = ", ".join(f"e{e}:{v['amplitude_uA']}µA×{v['phase_us']:g}µs" for e, v in list(el.items())[:8])
@@ -343,6 +347,8 @@ def cmd_screen(a):
     plan = P.plan_screen(blocks=blocks, electrodes=electrodes, amplitude_uA=a.amplitude, phase_us=a.phase,
                          polarity=a.polarity, reps=a.reps, sham_reps=a.reps, seed=int(time.time()))
     plan["window_ms"] = a.window
+    if a.codes:
+        plan = P.add_train_codes(plan)
     _describe(plan)
     if a.dry_run or not _confirm(a):
         return
@@ -378,11 +384,79 @@ def cmd_curve(a):
         plan = P.plan_curve_amplitude(stims, levels=levels, phase_us=a.phase, polarity=a.polarity,
                                       reps_per_pass=max(10, -(-a.reps // 3)), passes=3, seed=int(time.time()))
     plan["pairs"] = pairs
+    if a.codes:
+        plan = P.add_train_codes(plan)
     _describe(plan)
     if a.dry_run or not _confirm(a):
         return
     step_dir, segs = _execute(a, plan)
     analyse(step_dir, dict(plan, fsname=a.fsname, backend="simulated" if a.simulate else "hardware"), segs)
+
+
+def cmd_codetest(a):
+    if a.electrodes:
+        stims = [int(x) for x in a.electrodes.split(",")]
+    else:
+        d, s = _latest(a.fsname, a.simulate, "screen")
+        rec = (s or {}).get("recommended_pairs") or []
+        stims = list(dict.fromkeys(e for e, _ in rec))[:4]
+        if not stims:
+            sys.exit("No recommended pairs from a screen of this organoid; pass --electrodes e.g. 2,10,20,29")
+        print(f"Uploading the parameters of e{', e'.join(map(str, stims))} (as a curve would), triggering none of them "
+              "except 5 positive-control pulses on the first at the end.")
+    plan = P.plan_codetest(stims, amplitude_uA=a.amplitude, phase_us=a.phase, seed=int(time.time()))
+    _describe(plan)
+    if a.dry_run or not _confirm(a):
+        return
+    step_dir, segs = _execute(a, plan)
+    r = _codetest_result(plan, segs)
+    r["verdict_text"] = ("PASS: train codes are safe and readable; use --codes on screen and curve"
+                         if r["pass"] else "FAIL: do not use --codes. " + "; ".join(r["failures"]))
+    (step_dir / "result.json").write_text(R.to_json(r))
+    print("\n" + r["verdict_text"])
+    for line in r["lines"]:
+        print("  " + line)
+
+
+def _codetest_result(plan, segs):
+    """Judge the codetest recording: every code trigger recorded on its key, codes readable, no
+    artifact after code triggers, and a clear artifact after the positive-control pulses."""
+    from . import signals as S
+    from .backends import code_artifact_uV
+    seg, (raw, trials) = plan["segments"][0], segs[0]
+    X, T = S.load_raw(raw)
+    edges = S.trigger_edges(T)
+    sent_codes = [e for e in seg["events"] if e["kind"] == "code"]
+    rec_codes = [(s, k) for s, k in edges if k in P.CODE_KEYS]
+    per_key_sent = pd.Series([e["key"] for e in sent_codes]).value_counts().sort_index()
+    per_key_rec = pd.Series([k for _, k in rec_codes], dtype=int).value_counts().reindex(per_key_sent.index, fill_value=0)
+    gaps_ms = [(b[0] - a[0]) / S.FS * 1000 for a, b in zip(rec_codes, rec_codes[1:]) if (b[0] - a[0]) / S.FS < 0.05]
+    sham = trials[trials.kind == "sham"]
+    n_ok = int((sham.code == "ok").sum())
+    n_bad = int((sham.code == "mismatch").sum())
+    art_code = code_artifact_uV(X, [s for s, _ in rec_codes])
+    art_pos = code_artifact_uV(X, trials[trials.kind == "stim"].onset.tolist())
+    failures = []
+    if per_key_rec.sum() < len(sent_codes) - 4:      # a lost row can take a code or two
+        failures.append(f"only {per_key_rec.sum()} of {len(sent_codes)} code triggers recorded")
+    if n_bad:
+        failures.append(f"{n_bad} codes read back wrong")
+    if n_ok < 0.9 * len(sham):
+        failures.append(f"only {n_ok} of {len(sham)} codes readable")
+    if not art_code < 50:
+        failures.append(f"{art_code:.0f} µV after code triggers (must be < 50)")
+    if not art_pos > 500:
+        failures.append(f"positive control artifact only {art_pos:.0f} µV: the artifact check could not be validated")
+    lines = [f"code triggers recorded: {per_key_rec.sum()} of {len(sent_codes)} "
+             f"(per key {', '.join(f'{k}: {per_key_rec[k]}/{per_key_sent[k]}' for k in per_key_sent.index)})",
+             f"codes read back: {n_ok} correct, {n_bad} wrong, {len(sham) - n_ok - n_bad} unreadable, of {len(sham)}",
+             "recorded spacing of the two code triggers: " + (f"{np.median(gaps_ms):.1f} ms median "
+                                                              f"({min(gaps_ms):.1f}-{max(gaps_ms):.1f}); sent 10 ms" if gaps_ms else "n/a"),
+             f"largest signal change after code triggers: {art_code:.1f} µV (noise level; limit 50)",
+             f"after the {int((trials.kind == 'stim').sum())} positive-control pulses: {art_pos:.0f} µV"]
+    return dict(step="codetest", **{"pass": not failures}, failures=failures, lines=lines,
+                code_artifact_uV=art_code, positive_control_uV=art_pos, codes_ok=n_ok, codes_wrong=n_bad,
+                codes_total=len(sham), code_edges_recorded=int(per_key_rec.sum()), code_edges_sent=len(sent_codes))
 
 
 def cmd_analyze(a):
@@ -461,6 +535,7 @@ def main(argv=None):
     p.add_argument("--polarity", default="negative-first", choices=["negative-first", "positive-first"])
     p.add_argument("--reps", type=int, default=30)
     p.add_argument("--window", type=float, default=30.0, help="ms after each pulse in which spikes count")
+    p.add_argument("--codes", action="store_true", help="send train codes (keys 8-14) so the recording identifies each train")
     p.set_defaults(func=cmd_screen)
 
     p = sub.add_parser("curve", help="input-output curve for responsive pairs")
@@ -474,7 +549,15 @@ def main(argv=None):
     p.add_argument("--phase", type=float, default=100.0)
     p.add_argument("--polarity", default="negative-first", choices=["negative-first", "positive-first"])
     p.add_argument("--reps", type=int, default=20)
+    p.add_argument("--codes", action="store_true", help="send train codes (keys 8-14) so the recording identifies each train")
     p.set_defaults(func=cmd_curve)
+
+    p = sub.add_parser("codetest", help="1 min: check that train codes are safe and readable")
+    common(p)
+    p.add_argument("--electrodes", help="electrodes whose parameters to upload (default: curve stims from latest screen)")
+    p.add_argument("--amplitude", type=float, default=2.0)
+    p.add_argument("--phase", type=float, default=100.0)
+    p.set_defaults(func=cmd_codetest)
 
     p = sub.add_parser("analyze", help="re-run analysis + report of a step directory")
     p.add_argument("step_dir")

@@ -198,3 +198,73 @@ def test_late_bursts_and_clock_drift_align(tmp_path):
     simulate.record(simulate.Organoid(seed=3), seg["duration_s"], pulses, trig, raw)
     t = match_triggers(seg, raw)
     assert list(t.train_id) == [e["train_id"] for e in seg["events"]] and not t.exclude.any()
+
+
+# ------------------------------------------------------------------------------ train codes
+
+def _coded_curve(reps=6):
+    plan = P.add_train_codes(P.plan_curve_pulses([21], levels=(1, 4), ipi_ms=30, reps=reps, sham_reps=4, seed=2))
+    return plan["segments"][0]
+
+
+def _record(seg, path, edit=lambda ev, s: (s, ev["key"]), code_pulse=False):
+    trig, pulses = [], []
+    for ev in seg["events"]:
+        s, key = edit(ev, int(ev["t_s"] * S.FS))
+        trig.append((s, key))
+        if ev["kind"] == "stim" or (code_pulse and ev["kind"] == "code"):
+            pulses.append((s + 6, 21, 2.0, 100.0))
+    simulate.record(simulate.Organoid(seed=3), seg["duration_s"], pulses, trig, path)
+    return path
+
+
+def test_train_codes_plan():
+    seg = _coded_curve()
+    codes = [e for e in seg["events"] if e["kind"] == "code"]
+    trains = list(dict.fromkeys(e["train_id"] for e in seg["events"] if e["kind"] != "code"))
+    assert len(codes) == 2 * len(trains) and all(e["key"] in P.CODE_KEYS for e in codes)
+    for n, tid in enumerate(trains):
+        k1, k2 = [e["key"] for e in codes if e["train_id"] == tid]
+        assert P.decode_keys(k1, k2) == n % P.N_CODES
+    assert [e["t_s"] for e in seg["events"]] == sorted(e["t_s"] for e in seg["events"])
+    with pytest.raises(ValueError):          # 10 electrodes would bind keys 8 and 9
+        P.add_train_codes(P.plan_curve_pulses(list(range(10)), levels=(1,), reps=1, sham_reps=1))
+
+
+def test_codes_confirm_alignment_despite_lost_row_and_late_pulse(tmp_path):
+    import h5py
+    seg = _coded_curve()
+    late = next(e["train_id"] for e in seg["events"] if e["kind"] == "stim" and e["level"] == 4)
+    raw = _record(seg, tmp_path / "raw.h5", lambda ev, s: (s + (int(0.009 * S.FS) if ev["train_id"] == late
+                                                                    and ev["pulse_index"] == 2 else 0), ev["key"]))
+    with h5py.File(raw, "r+") as f:                       # drop one row in the middle
+        keep = [r for r in range(f["triggers"].shape[0]) if r != f["triggers"].shape[0] // 2]
+        for name in list(f):
+            data = f[name][keep]
+            del f[name]
+            f.create_dataset(name, data=data, chunks=(1, 1280)).attrs["sampling_rate"] = np.uint32(S.FS)
+    t = match_triggers(seg, raw)
+    assert (t.note == "code mismatch").sum() == 0 and set(t.kind) <= {"stim", "sham"}
+    assert (t.code == "ok").groupby(t.train_id).all().mean() > 0.95
+    assert not t[t.train_id == late].exclude.any()
+
+
+def test_contradicting_code_excludes_train(tmp_path):
+    seg = _coded_curve()
+    swapped = [e for e in seg["events"] if e["kind"] == "code"][4:6]     # train 2's code, read as train 3's
+    k1, k2 = P.train_code_keys(3)
+    def edit(ev, s):
+        if ev is swapped[0]:
+            return s, k1
+        if ev is swapped[1]:
+            return s, k2
+        return s, ev["key"]
+    t = match_triggers(seg, _record(seg, tmp_path / "raw.h5", edit))
+    bad = t[t.note == "code mismatch"]
+    assert set(bad.train_id) == {swapped[0]["train_id"]} and bad.exclude.all()
+
+
+def test_code_trigger_that_stimulates_stops_the_run(tmp_path):
+    seg = _coded_curve(reps=3)
+    with pytest.raises(RuntimeError, match="Code triggers"):
+        match_triggers(seg, _record(seg, tmp_path / "raw.h5", code_pulse=True))

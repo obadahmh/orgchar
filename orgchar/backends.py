@@ -125,19 +125,56 @@ def _align_pass(rec, tm, ek, kk, off, early_tol):
     return pairs, gaps, rows
 
 
+CODE_ARTIFACT_LIMIT_UV = 50.0   # a code trigger must leave no stimulation artifact (real ones: ~4000 µV)
+
+
+def _decode_train_codes(edges, code_keys):
+    """Read train codes straight from the recording, independently of the alignment: two code
+    edges 5-20 ms apart, then the train's first trigger 60-140 ms after the first code edge.
+    Returns {edge index of the train's first trigger: code}."""
+    from .protocol import CODE_LEAD_S, decode_keys
+    out = {}
+    for a in range(len(edges) - 2):
+        (s1, k1), (s2, k2) = edges[a], edges[a + 1]
+        if k1 not in code_keys or k2 not in code_keys or not 0.005 <= (s2 - s1) / S.FS <= 0.020:
+            continue
+        nxt = next((b for b in range(a + 2, len(edges)) if edges[b][1] not in code_keys), None)
+        if nxt is not None and abs((edges[nxt][0] - s1) / S.FS - CODE_LEAD_S) < 0.040:
+            out[nxt] = decode_keys(k1, k2)
+    return out
+
+
+def code_artifact_uV(X, onsets) -> float:
+    """Largest change of the median raw signal, on any channel, in the 5 ms after these triggers
+    (relative to the 1 ms before). Stimulation leaves thousands of µV; nothing leaves ~noise/sqrt(n)."""
+    on = [s for s in onsets if S.samples(1) <= s < X.shape[1] - S.samples(5)][:200]
+    if not on:
+        return float("nan")
+    seg = np.stack([X[:, s - S.samples(1):s + S.samples(5)] for s in on])
+    med = np.median(seg, axis=0)
+    base = med[:, :S.samples(1)].mean(axis=1, keepdims=True)
+    return float(np.abs(med[:, S.samples(1):] - base).max())
+
+
 def match_triggers(seg: dict, raw_path, sent: pd.DataFrame | None = None, min_fraction=0.9) -> pd.DataFrame:
-    """One row per recorded trigger edge, with its planned event.
+    """One row per recorded stim/sham trigger edge, with its planned event.
 
     Every recorded stimulation edge is kept (its artifact must be blanked even if it cannot be
     used); rows with exclude=True are blanked but not counted:
       * edges not matched to the plan;
       * the pulse just before a lost row (its response window may straddle the missing data);
-      * every pulse of a multi-pulse train that lost any pulse (the train's total would be wrong)."""
-    _, T = S.load_raw(raw_path)
+      * every pulse of a multi-pulse train that lost any pulse (the train's total would be wrong);
+      * in coded segments, every pulse of a train whose recorded code contradicts the alignment.
+    Code triggers (coded segments only) are used for the check and then dropped: no current flows.
+    Column `code`: 'ok' | 'missing' (code not readable, e.g. in a lost row) | 'mismatch' | ''."""
+    from .protocol import CODE_KEYS
+    X, T = S.load_raw(raw_path)
     edges = S.trigger_edges(T)
     evs = seg["events"]
+    coded = bool(seg.get("train_codes"))
     els = {int(k): v for k, v in seg["electrodes"].items()}
     by_key = {v["key"]: e for e, v in els.items()}
+    code_keys = set(CODE_KEYS) - set(by_key) if coded else set()
     # always align by timing, even when the key sequence matches: lost rows must still be found
     times = [e["t_s"] for e in evs]
     if sent is not None and len(sent) == len(evs) and "utc" in sent:
@@ -145,33 +182,65 @@ def match_triggers(seg: dict, raw_path, sent: pd.DataFrame | None = None, min_fr
         times = list((t - t.iloc[0]).dt.total_seconds() + evs[0]["t_s"])
     pairs, gaps = _align(edges, times, [e["key"] for e in evs]) if evs else ([], [])
     matched = dict(pairs)
-    got = {evs[j]["train_id"] for j in matched.values()}
-    per_train = pd.Series([e["train_id"] for e in evs]).value_counts()
-    seen = pd.Series([evs[j]["train_id"] for j in matched.values()]).value_counts() if matched else pd.Series(dtype=int)
-    gap_trains = {evs[matched[i]]["train_id"] for i in gaps}
-    broken = {t for t in got if seen.get(t, 0) < per_train[t] and per_train[t] > 1} | \
+    is_code = [k in code_keys for _, k in edges]
+    # a lost row is attributed to the last stim/sham pulse before it (codes carry no response)
+    gap_edges = set()
+    for g in gaps:
+        prev = [i for i, _ in pairs if i <= g and not is_code[i]]
+        if prev:
+            gap_edges.add(prev[-1])
+    train_evs = [e for e in evs if e["kind"] != "code"]
+    per_train = pd.Series([e["train_id"] for e in train_evs]).value_counts()
+    got = [evs[j]["train_id"] for i, j in matched.items() if not is_code[i]]
+    seen = pd.Series(got).value_counts() if got else pd.Series(dtype=int)
+    gap_trains = {evs[matched[i]]["train_id"] for i in gap_edges}
+    broken = {t for t in set(got) if seen.get(t, 0) < per_train[t] and per_train[t] > 1} | \
              {t for t in gap_trains if per_train[t] > 1}
+    # train codes: read from the recording, compared with what the alignment says
+    code_of = {e["train_id"]: e["code"] for e in evs if e["kind"] == "code"}
+    check = {}
+    if coded:
+        for i, c in _decode_train_codes(edges, code_keys).items():
+            if i in matched:
+                tid = evs[matched[i]]["train_id"]
+                check[tid] = "ok" if code_of.get(tid) == c else "mismatch"
+        art = code_artifact_uV(X, [s for (s, _), c in zip(edges, is_code) if c])
+        if art > CODE_ARTIFACT_LIMIT_UV:
+            raise RuntimeError(f"Code triggers (keys 8-14) left a {art:.0f} µV artifact in {raw_path}: something "
+                               "may be stimulating on those keys. Stop and investigate before any further run.")
+    mismatched = {t for t, v in check.items() if v == "mismatch"}
     rows = []
     for i, (s, key) in enumerate(edges):
+        if is_code[i]:
+            continue
         ev = evs[matched[i]] if i in matched else None
         e = ev["stim_electrode"] if ev else by_key.get(key, -1)
         kind = ev["kind"] if ev else ("stim" if key in by_key else "sham")
         el = els.get(e, {}) if kind == "stim" else {}
-        note = ("unmatched" if ev is None else "before recording gap" if i in gaps
-                else "incomplete train" if ev["train_id"] in broken else "")
+        tid = ev["train_id"] if ev else None
+        note = ("unmatched" if ev is None else "code mismatch" if tid in mismatched
+                else "before recording gap" if i in gap_edges else "incomplete train" if tid in broken else "")
         rows.append(dict(segment=seg["id"], onset=s, key=key, kind=kind, stim_electrode=e,
                          amplitude_uA=el.get("amplitude_uA", 0.0), phase_us=el.get("phase_us", 0.0),
                          polarity=el.get("polarity", ""), n_pulses=1, ipi_ms=0.0,
                          level=ev["level"] if ev else float("nan"),
-                         train_id=ev["train_id"] if ev else f"unmatched{i}",
+                         train_id=tid if ev else f"unmatched{i}",
                          pulse_index=ev["pulse_index"] if ev else 0, planned_t_s=ev["t_s"] if ev else float("nan"),
+                         code=(check.get(tid, "missing") if coded and ev else ""),
                          exclude=bool(note), note=note))
     df = pd.DataFrame(rows)
     usable_trials = df[~df.exclude].train_id.nunique() if len(df) else 0
     planned_trials = len(per_train)
-    if len(pairs) != len(evs) or gaps:
-        print(f"  NOTE {seg['id']}: {len(evs)} triggers sent, {len(edges)} in the recording, {len(pairs)} matched; "
-              f"{len(gaps)} lost row(s) in the platform's recording; {usable_trials} of {planned_trials} trials usable.")
+    n_matched = sum(not is_code[i] for i in matched)
+    if n_matched != len(train_evs) or gap_edges:
+        print(f"  NOTE {seg['id']}: {len(train_evs)} triggers sent, {len(edges) - sum(is_code)} in the recording, "
+              f"{n_matched} matched; {len(gaps)} lost row(s) in the platform's recording; "
+              f"{usable_trials} of {planned_trials} trials usable.")
+    if coded:
+        n_ok, n_bad = sum(v == "ok" for v in check.values()), len(mismatched)
+        print(f"  CODES {seg['id']}: {n_ok} of {planned_trials} trains confirmed by their recorded code"
+              + (f"; {n_bad} CONTRADICT the alignment (excluded)" if n_bad else "")
+              + (f"; {planned_trials - n_ok - n_bad} code(s) unreadable" if planned_trials - n_ok - n_bad else "") + ".")
     if usable_trials < min_fraction * planned_trials:
         raise RuntimeError(f"Only {usable_trials}/{planned_trials} trials usable in {raw_path}; segment not analysed. "
                            "Raw file kept.")

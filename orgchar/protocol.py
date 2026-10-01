@@ -7,12 +7,20 @@ changes the waveform (e.g. amplitude) needs a new segment; anything that only ch
 
 Trigger key map inside a segment: stim electrodes get keys 0..14 in the order given; key 15 is the
 SHAM key: a marker is recorded but no electrode is bound to it, so no current flows.
+
+Train codes (optional, add_train_codes): ~100 ms before each train, two triggers on keys 8..14
+(also bound to no electrode) spell the train's number in the segment, base 7 (49 codes). The
+recording then says which train each pulse belongs to, instead of us inferring it from timing.
 """
 from __future__ import annotations
 
 import random
 
 SHAM_KEY = 15
+CODE_KEYS = tuple(range(8, 15))   # 7 keys, never bound to an electrode in a coded segment
+CODE_LEAD_S = 0.100               # first code trigger this long before the train's first trigger
+CODE_GAP_S = 0.010                # between the two code triggers
+N_CODES = len(CODE_KEYS) ** 2
 MAX_SEGMENT_S = 360.0          # keep raw files ~1.4 GB; larger files made stop_raw_recording time out
 
 # Hard limits, checked before any upload. Defaults: the envelope used on this platform so far
@@ -157,3 +165,59 @@ def plan_curve_amplitude(stims, levels=(0.5, 1.0, 1.5, 2.0, 3.0), phase_us=100.0
 
 def plan_duration_s(plan, overhead_s=25.0):
     return sum(s["duration_s"] + (overhead_s if s["electrodes"] else 5.0) for s in plan["segments"])
+
+
+def train_code_keys(n: int) -> tuple[int, int]:
+    """Keys spelling train number n (mod 49): two base-7 digits."""
+    n %= N_CODES
+    return CODE_KEYS[n // len(CODE_KEYS)], CODE_KEYS[n % len(CODE_KEYS)]
+
+
+def decode_keys(k1: int, k2: int) -> int:
+    return CODE_KEYS.index(k1) * len(CODE_KEYS) + CODE_KEYS.index(k2)
+
+
+def add_train_codes(plan: dict) -> dict:
+    """Precede every train (stim or sham) with its two code triggers. Train n of a segment gets
+    code n mod 49; trains are >= 1 s apart, so neighbouring codes are never confused."""
+    for seg in plan["segments"]:
+        used = {v["key"] for v in seg["electrodes"].values()}
+        if used & set(CODE_KEYS):
+            raise ValueError(f"Segment {seg['id']} binds keys {sorted(used & set(CODE_KEYS))} to electrodes; "
+                             "train codes need keys 8-14 free (at most 8 stimulating electrodes per segment)")
+        starts = {}
+        for ev in seg["events"]:
+            starts.setdefault(ev["train_id"], ev["t_s"])
+        prev_end, codes = 0.0, []
+        for n, (tid, t0) in enumerate(starts.items()):
+            t_code = round(t0 - CODE_LEAD_S, 4)
+            if t_code - prev_end < 0.5:
+                raise ValueError(f"No room for the code of train {tid}: previous trigger {t_code - prev_end:.3f} s before")
+            for i, key in enumerate(train_code_keys(n)):
+                codes.append(dict(key=key, kind="code", stim_electrode=-1, level=None, pulse_index=i - 2,
+                                  train_id=tid, code=n % N_CODES, t_s=round(t_code + i * CODE_GAP_S, 4)))
+            prev_end = max(e["t_s"] for e in seg["events"] if e["train_id"] == tid)
+        seg["events"] = sorted(seg["events"] + codes, key=lambda e: e["t_s"])
+        seg["train_codes"] = True
+    plan["train_codes"] = True
+    return plan
+
+
+def plan_codetest(stims, amplitude_uA=2.0, phase_us=100.0, polarity="negative-first", n_codes=60,
+                  n_positive=5, seed=0):
+    """One-minute check that train codes are safe and readable. The stimulating electrodes' real
+    parameters are uploaded exactly as in a curve (keys 0..), but no electrode is triggered: every
+    ~1 s a code (keys 8-14) is sent, followed by a sham marker (key 15), cycling through all 49 codes. At the end, n_positive single pulses on the first
+    electrode show what a real stimulation artifact looks like in this recording (positive control)."""
+    check_setting(amplitude_uA, phase_us)
+    rng = random.Random(seed)
+    el = _electrodes(stims, amplitude_uA, phase_us, polarity)
+    trials = [[dict(key=SHAM_KEY, kind="sham", stim_electrode=-1, level=0.0, pulse_index=0)] for _ in range(n_codes)]
+    trials += [[dict(key=el[stims[0]]["key"], kind="stim", stim_electrode=stims[0], level=amplitude_uA, pulse_index=0)]
+               for _ in range(n_positive)]
+    for i, tr in enumerate(trials):
+        tr[0]["train_id"] = f"c{i:03d}"
+    evs = _timeline(trials, (1.0, 1.2), rng)
+    plan = dict(step="codetest", amplitude_uA=amplitude_uA, phase_us=phase_us, polarity=polarity,
+                segments=_split(evs, el, "seg"))
+    return add_train_codes(plan)

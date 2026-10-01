@@ -193,6 +193,14 @@ Figures are vector graphics and stay sharp when zoomed.
 
 Every recorded pulse is blanked, even one that is left out of the counts, so its artifact can't reach the spontaneous-rate baseline.
 
+### Train codes (`--codes`)
+
+Timing alone says *where* each pulse is, not *which train* it belongs to; the alignment above infers that. With `--codes`, the recording carries the answer itself: ~100 ms before each train, two triggers on keys 8–14 spell the train's number (base 7, 49 codes; trains ≥ 1 s apart, so neighbours are never confused). Keys 8–14 are bound to no electrode, like the sham key 15, so no current flows.
+
+- Codes are read straight from the recording, independently of the alignment, and compared with it. A contradiction excludes that train (`note = code mismatch`) and is reported; a code lost in a dropped row just leaves that train unconfirmed (`code = missing`).
+- Every coded run checks that code triggers leave no artifact (< 50 µV; real stimulation leaves thousands). If they ever do, the run stops with an error.
+- Before first use on the platform, run `./orgchar.sh codetest --fsname <fs>` (about 1.5 min). It uploads the curve electrodes' real parameters, sends 60 codes (each followed by a sham marker), then 5 real pulses as a positive control, and prints PASS or FAIL with the evidence.
+
 ## What is and is not verified
 
 - **Verified on your data:**
