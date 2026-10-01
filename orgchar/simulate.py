@@ -24,7 +24,27 @@ class Organoid:
     evoked: dict = field(default_factory=lambda: {(21, 23): (1.0, 1.2, 0.25), (23, 21): (0.6, 1.5, 0.3),
                                                   (15, 13): (0.8, 1.0, 0.2)})
     depression: float = 0.15   # fractional drop of evoked probability per preceding pulse within 100 ms
+    # (stim, rec) -> (shape, a, b, c): mean extra spikes 10-210 ms after a train of n pulses;
+    # 'long': a / (1 + exp(-b (n - c))), 'short': a / (1 + exp(b (n - c))), 'band': a exp(-(n - b)^2 / 2c^2)
+    after_train: dict = field(default_factory=dict)
     seed: int = 1
+
+
+def demo_organoid() -> Organoid:
+    """The organoid `--simulate` runs on: the default one plus one falling, one peaked and one rising
+    after-train response (stim 5, 13, 21), so every step, including the FuncSolver curve, has
+    something to find."""
+    return Organoid(spont_hz={16: 2.0, 20: 4.0, 21: 2.0, 22: 3.0, 23: 2.5, 13: 1.0, 3: 3.0, 10: 3.0},
+                    after_train={(5, 3): ("band", 8, 10, 3.5), (13, 10): ("short", 8, 0.6, 9),
+                                 (21, 22): ("long", 10, 0.5, 10)})
+
+
+def after_train_mean(shape, a, b, c, n):
+    if shape == "long":
+        return a / (1 + np.exp(-b * (n - c)))
+    if shape == "short":
+        return a / (1 + np.exp(b * (n - c)))
+    return a * np.exp(-((n - b) ** 2) / (2 * c ** 2))
 
 
 def _spike_shape(amp):
@@ -74,6 +94,19 @@ def record(org: Organoid, duration_s: float, pulses: list[tuple[int, int, float,
             for _ in range(rng.poisson(lam)):
                 trains.setdefault(rc, []).append(s + samples(7.0 + rng.gamma(2.0, 2.5)))
         recent.setdefault(e, []).append(s)
+    if org.after_train:  # trains = runs of pulses on one electrode less than 20 ms apart
+        by_e = {}
+        for s, e, *_ in sorted(pulses):
+            runs = by_e.setdefault(e, [])
+            if runs and s - runs[-1][-1] < samples(20):
+                runs[-1].append(s)
+            else:
+                runs.append([s])
+        for (se, rc), (shape, a, b, c) in org.after_train.items():
+            for run in by_e.get(se, []):
+                lam = after_train_mean(shape, a, b, c, len(run))
+                for _ in range(rng.poisson(max(lam, 0.0))):
+                    trains.setdefault(rc, []).append(run[-1] + samples(rng.uniform(12.0, 205.0)))
     for c, tr in trains.items():
         for s in tr:
             if 30 <= s < n - 45:

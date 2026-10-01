@@ -1,0 +1,340 @@
+"""Characterisation for FuncSolver: which stim -> rec pairs give FuncSolver's three activation
+shapes, how well they predict single new trials, and the calibration file FuncSolver loads.
+
+FuncSolver (NeuralControlProgram/FuncSolver) uses one organoid pair per role:
+    short = falling curve   L / (1 + exp( k (n - x0))) + b
+    band  = peaked curve    A exp(-(n - mu)^2 / (2 sigma^2)) + b
+    long  = rising curve    L / (1 + exp(-k (n - x0))) + b
+where n = pulses in a hardware train and the output is readout.measure_trial minus the sham mean.
+FuncSolver uses ONE stimulation per evaluation, so single-trial scatter is what it gets.
+
+Rules (as in FuncSolver's own design): development data alone choose pairs and fit curves;
+confirmation data, recorded later in the session, only measure the error of those frozen fits.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import warnings
+
+import numpy as np
+import pandas as pd
+from scipy import optimize, stats
+
+from . import readout as RO
+from . import signals as S
+
+ROLES = ("short", "band", "long")
+ROLE_TEXT = dict(short="falling", band="peaked", long="rising")
+# Artifact check: the median across trials of the first ARTIFACT_CHECK_MS of the response window,
+# in units of the median's own noise floor (1.25 x noise / sqrt(trials)). Spikes are not
+# time-locked and barely move a median; an artifact tail is identical on every trial and does.
+ARTIFACT_CHECK_MS = 5.0
+ARTIFACT_LIMIT = 3.0
+MIN_EFFECT_P = 0.01         # development: responses must differ across pulse counts (Kruskal-Wallis)
+GOOD_R2, FAIR_R2 = 0.5, 0.2  # confirmation single-trial R² for the plain-language grade
+
+
+# ------------------------------------------------------------------------------ curve models
+
+def model(role, n, p):
+    n = np.asarray(n, dtype=float)
+    if role == "band":
+        A, mu, sig, b = p
+        return A * np.exp(-((n - mu) ** 2) / (2 * sig ** 2)) + b
+    L, k, x0, b = p
+    z = np.clip((k if role == "short" else -k) * (n - x0), -80, 80)
+    return L / (1 + np.exp(z)) + b
+
+
+def fit_role(role, n, y, levels):
+    """Least-squares fit to single trials, starting from several sensible guesses."""
+    n, y = np.asarray(n, float), np.asarray(y, float)
+    lo, hi = min(levels), max(levels)
+    span = max(np.ptp(y), 1e-3)
+    m = pd.Series(y).groupby(n).mean()
+    if role == "band":
+        starts = [[m.max() - m.min(), m.idxmax(), max((hi - lo) / 4, 1.0), m.min()]]
+        bounds = ([0, lo - (hi - lo), 0.5, -np.inf], [np.inf, hi + (hi - lo), 4 * (hi - lo), np.inf])
+    else:
+        starts = [[m.max() - m.min(), s, x0, m.min()] for s in (0.3, 1.0) for x0 in (lo + (hi - lo) * f for f in (0.3, 0.5, 0.7))]
+        bounds = ([0, 0.01, lo - (hi - lo), -np.inf], [np.inf, 10.0, hi + (hi - lo), np.inf])
+    best = None
+    for p0 in starts:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                p, _ = optimize.curve_fit(lambda x, *q: model(role, x, q), n, y, p0=p0, bounds=bounds, maxfev=20000)
+            sse = float(((y - model(role, n, p)) ** 2).sum())
+            if best is None or sse < best[1]:
+                best = (p, sse)
+        except Exception:  # noqa: BLE001 - a start that does not converge is skipped
+            continue
+    return None if best is None else [float(v) for v in best[0]]
+
+
+def r2(y, pred):
+    y, pred = np.asarray(y, float), np.asarray(pred, float)
+    ss = ((y - y.mean()) ** 2).sum()
+    return float(1 - ((y - pred) ** 2).sum() / ss) if ss > 0 else float("nan")
+
+
+def shape_of(levels, means):
+    """FuncSolver's shape rule (curve_fitting.classify_response): falling/rising need a clear
+    correlation with n, peaked needs its maximum away from both ends."""
+    x, y = np.asarray(levels, float), np.asarray(means, float)
+    shapes = []
+    if np.std(y) < 0.5:
+        return shapes
+    c = stats.pearsonr(x, y)[0]
+    if c < -0.3:
+        shapes.append("short")
+    if c > 0.3:
+        shapes.append("long")
+    if 1 < int(np.argmax(y)) < len(y) - 2:
+        shapes.append("band")
+    return shapes
+
+
+# ------------------------------------------------------------------------------ measurement
+
+def _plan_index(plan):
+    return {s["id"]: s for s in plan["segments"]}
+
+
+def measure(segments, plan, spec=RO.SPEC):
+    """Every trial on every electrode of its organoid (shams: every electrode), with the readout.
+    Thresholds come from development and first-reference segments only (pre-train baselines)."""
+    segs = _plan_index(plan)
+    nb = int(round(spec["baseline_duration_ms"] * spec["sample_rate_hz"] / 1000))
+    # 1) noise -> frozen thresholds, from pre-train baselines of development + ref0 segments
+    noise = {c: [] for c in range(S.N_CH)}
+    for raw, trials in segments:
+        seg = segs[trials.segment.iloc[0]]
+        if seg["partition"] == "confirmation" or (seg["partition"] == "reference" and seg["block"] > 0):
+            continue
+        X, _ = S.load_raw(raw)
+        on = trials[~trials.exclude].onset.values
+        on = on[on > nb]
+        for c in range(S.N_CH):
+            v = np.concatenate([X[c, o - nb:o - S.samples(20)] for o in on[:60]]) if len(on) else X[c, :S.FS * 10]
+            noise[c].append(RO.noise_uV(v, spec))
+    thr = {c: RO.threshold_from_noise(np.median(v), spec) for c, v in noise.items() if v}
+    # 2) every trial
+    rows, traces = [], {}
+    for si, (raw, trials) in enumerate(segments):
+        seg = segs[trials.segment.iloc[0]]
+        X, _ = S.load_raw(raw)
+        n, ipi = int(seg["n_pulses"]), float(plan["ipi_ms"])
+        need = RO.post_samples_needed(n, ipi, plan["phase_us"], spec)
+        for t in trials[~trials.exclude & trials.kind.isin(["stim", "sham"])].itertuples():
+            o = int(t.onset)
+            if o < nb or o + need > X.shape[1]:
+                continue
+            stim = int(t.stim_electrode)
+            recs = range(S.N_CH) if t.kind == "sham" else [c for c in range(8 * (stim // 8), 8 * (stim // 8) + 8) if c != stim]
+            for c in recs:
+                m = RO.measure_trial(X[c, o - nb:o], X[c, o:o + need], n, ipi, plan["phase_us"], thr[c], spec,
+                                     keep_trace=t.kind == "stim")
+                rows.append(dict(segment=seg["id"], seg_index=si, partition=seg["partition"], block=seg["block"],
+                                 kind=t.kind, stim=stim, rec=c, level=n, onset=o, train_id=t.train_id,
+                                 response=m["response_events"], baseline=m["baseline_events"], adjusted=m["adjusted"]))
+                if t.kind == "stim":   # start of the window, kept to check for time-locked artifact
+                    lst = traces.setdefault((stim, c, n), [])
+                    if len(lst) < 24:
+                        lst.append(m["trace"][:S.samples(ARTIFACT_CHECK_MS)])
+    D = pd.DataFrame(rows)
+    seg_order = {s["id"]: i for i, s in enumerate(plan["segments"])}
+    D["order"] = D.segment.map(seg_order) * 1e9 + D.onset
+    # artifact = what is common to every trial (median); spikes are not time-locked and drop out
+    noise_c = {c: abs(v) / spec["threshold_noise_multiple"] for c, v in thr.items()}
+    art = {k: float(np.sqrt((np.median(np.stack(v), axis=0) ** 2).mean()) / (1.2533 * noise_c[k[1]] / np.sqrt(len(v))))
+           for k, v in traces.items() if len(v) >= 3}
+    return D, thr, art
+
+
+# ------------------------------------------------------------------------------ per-pair analysis
+
+def _cv_r2(role, d, levels):
+    """Development-only score: fit on alternate trials, predict the others, both ways."""
+    d = d.sort_values("order").reset_index(drop=True)
+    half = d.groupby("level").cumcount() % 2
+    preds = np.full(len(d), np.nan)
+    for h in (0, 1):
+        tr, te = d[half != h], d[half == h]
+        p = fit_role(role, tr.level, tr.y, levels)
+        if p is None:
+            return float("nan")
+        preds[te.index] = model(role, te.level, p)
+    return r2(d.y, preds)
+
+
+def analyse_pairs(D, plan, art):
+    levels = list(plan["levels"])
+    ref_n = plan["reference_pulses"]
+    sham = D[D.kind == "sham"]
+    # sham correction: one value per electrode from all development shams (no current flows, so
+    # it cannot depend on the pulse count; pooling ~40 trials is far steadier than ~4 per count)
+    control = sham[sham.partition == "development"].groupby("rec").adjusted.mean().to_dict()
+    control_sd = sham[sham.partition == "development"].groupby("rec").adjusted.std().to_dict()
+    stim = D[D.kind == "stim"].copy()
+    stim["y"] = stim.adjusted - stim.rec.map(control)
+    out = []
+    for (e, c), g in stim.groupby(["stim", "rec"]):
+        dev = g[g.partition == "development"]
+        conf = g[g.partition == "confirmation"]
+        ref = g[g.partition == "reference"]
+        if dev.level.nunique() < len(levels) or len(dev) < 3 * len(levels):
+            continue
+        dm = dev.groupby("level").y.agg(["mean", "std", "count"])
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                kw_p = float(stats.kruskal(*[v.y.values for _, v in dev.groupby("level")]).pvalue)
+        except ValueError:
+            kw_p = 1.0
+        kw_p = kw_p if np.isfinite(kw_p) else 1.0
+        shapes = shape_of(dm.index.values, dm["mean"].values)
+        fits = {}
+        for role in ROLES:
+            p = fit_role(role, dev.level, dev.y, levels)
+            if p is None:
+                continue
+            f = dict(params=p, r2_means=r2(dm["mean"].values, model(role, dm.index.values, p)),
+                     cv_r2=_cv_r2(role, dev, levels))
+            if len(conf):   # frozen development fit vs new single trials
+                pred = model(role, conf.level, p)
+                cm = conf.groupby("level").y.mean()
+                f.update(conf_r2=r2(conf.y, pred), conf_rmse=float(np.sqrt(((conf.y - pred) ** 2).mean())),
+                         conf_means=cm.round(3).tolist(),
+                         conf_means_rmse=float(np.sqrt(((cm.values - model(role, cm.index.values, p)) ** 2).mean())))
+            if len(ref):
+                expected = float(model(role, ref_n, p))
+                rb = ref.groupby("block").y.mean()
+                f.update(reference_expected=expected, reference_blocks=rb.round(3).tolist(),
+                         drift=float(rb.iloc[-1] - rb.iloc[0]) if len(rb) > 1 else None,
+                         max_reference_deviation=float((rb - expected).abs().max()))
+            fits[role] = f
+        cand = [r for r in shapes if r in fits]
+        best = max(cand, key=lambda r: fits[r]["r2_means"]) if cand else None
+        art_max = max((art.get((e, c, n), 0.0) for n in levels), default=0.0)
+        row = dict(stim=int(e), rec=int(c), shape=best, shapes=cand, kw_p=kw_p,
+                   artifact=art_max, artifact_ok=art_max < ARTIFACT_LIMIT,
+                   control=float(control.get(c, 0.0)), control_sd=float(control_sd.get(c, 0.0)),
+                   levels=[int(v) for v in dm.index], dev_means=dm["mean"].round(3).tolist(),
+                   dev_sd=dm["std"].round(3).tolist(), dev_range=float(np.ptp(dm["mean"].values)),
+                   trial_sd=float(dm["std"].mean()), fits=fits, n_dev=int(len(dev)), n_conf=int(len(conf)),
+                   ref_raw=ref.groupby("block").y.mean().round(3).tolist() if len(ref) else [])
+        out.append(row)
+    return out, control
+
+
+def grade(p, role=None):
+    """Plain-language verdict for one pair as a FuncSolver activation of `role` (default: its best
+    shape), judged on confirmation data only."""
+    role = role or p.get("shape")
+    if not role:
+        return "none", "no clear falling, peaked or rising curve"
+    if not p["artifact_ok"]:
+        return "poor", "stimulation artifact reaches the response window"
+    if p["kw_p"] >= MIN_EFFECT_P:
+        return "poor", "responses do not differ reliably across pulse counts"
+    f = p["fits"][role]
+    c = f.get("conf_r2")
+    if c is None or not np.isfinite(c):
+        return "unknown", "no confirmation trials"
+    drift = f.get("drift")
+    drift_bad = drift is not None and p["dev_range"] > 0 and abs(drift) > 0.5 * p["dev_range"]
+    if c >= GOOD_R2 and not drift_bad:
+        return "good", "predicts new single trials well"
+    if c >= FAIR_R2:
+        return "fair", "follows the curve on new trials, but single trials scatter" + ("; drifts" if drift_bad else "")
+    return "poor", "does not predict new single trials" + ("; drifts" if drift_bad else "")
+
+
+def select_roles(pairs):
+    """Development data only: per role, the eligible pair with the best cross-validated
+    single-trial fit; each role on its own stimulating electrode (as FuncSolver requires).
+    Scarce roles are filled first."""
+    ok = [p for p in pairs if p.get("shape") and p["artifact_ok"] and p["kw_p"] < MIN_EFFECT_P]
+    by_role = {r: sorted([p for p in ok if r in p["shapes"] and r in p["fits"]],
+                         key=lambda p: -np.nan_to_num(p["fits"][r]["cv_r2"], nan=-9)) for r in ROLES}
+    chosen, used = {}, set()
+    for r in sorted(ROLES, key=lambda r: len(by_role[r])):
+        for p in by_role[r]:
+            if p["stim"] not in used and np.nan_to_num(p["fits"][r]["cv_r2"], nan=-9) > 0:
+                chosen[r] = p
+                used.add(p["stim"])
+                break
+    return chosen
+
+
+# ------------------------------------------------------------------------------ calibration file
+
+def digest(value):
+    """Identical to NeuralControlProgram/experiment_control/core.digest (FuncSolver checks it)."""
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+
+
+def _clean(v):
+    if isinstance(v, dict):
+        return {str(k): _clean(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_clean(x) for x in v]
+    if isinstance(v, (np.floating, float)):
+        return float(v) if math.isfinite(v) else None
+    if isinstance(v, np.integer):
+        return int(v)
+    return v
+
+
+def calibration(plan, fsname, session_id, thr, chosen, pairs, code_version, simulated, step_dir,
+                reference_deviation_events=None):
+    """FuncSolver's calibration.json (schema 1, nearest_validated_abs_v1), loadable by
+    FuncSolver/calibration.apply_calibration. The live gate (assessment.json) is not written here."""
+    counts = list(plan["levels"])
+    spec = dict(RO.SPEC, threshold_uV={str(c): round(float(v), 3) for c, v in thr.items()}, response_scale=1.0,
+                saturation_uV=6000.0, saturation_source="FinalSpark raw HDF5, clipped at about ±6.3 mV on fs647/fs666 artifacts")
+    sel = {}
+    for role, p in chosen.items():
+        f = p["fits"][role]
+        sel[role] = dict(stim_electrode=p["stim"], rec_electrode=p["rec"], type=role, params=f["params"],
+                         r2=f["r2_means"], development_cv_r2=f["cv_r2"],
+                         control_mean_by_pulses={str(n): p["control"] for n in counts},
+                         reference_mean=float(model(role, plan["reference_pulses"], f["params"])),
+                         confirmation_r2=f.get("conf_r2"), confirmation_rmse_events=f.get("conf_rmse"),
+                         grade=grade(p, role)[0])
+    if reference_deviation_events is None:   # default: half the smallest selected curve's range
+        ranges = [p["dev_range"] for p in chosen.values()]
+        reference_deviation_events = round(0.5 * min(ranges), 2) if ranges else 1.0
+    cfg = dict(mea_id=fsname, session_id=session_id, purpose="orgchar_characterisation",
+               condition=dict(amplitude_uA=plan["amplitude_uA"], phase_width_us=plan["phase_us"],
+                              polarity=plan["polarity"], ipi_ms=plan["ipi_ms"], isi_s=plan["organoid_isi_s"][0]),
+               measurement=spec, pulse_counts=counts, pulse_scale=1.0, inference_repetitions=1,
+               upload_wait_s=10.0, reference_pulses=plan["reference_pulses"], reference_repetitions=3,
+               reference_every_s=300.0, reference_every_samples=10,
+               acceptance=dict(max_reference_deviation_events=reference_deviation_events,
+                               justification="orgchar default: half the range of the smallest selected curve"),
+               stimulation_electrodes=sorted({p["stim"] for p in pairs}))
+    cfg = _clean(cfg)
+    out = dict(schema_version=1, encoding="nearest_validated_abs_v1", config=cfg, config_sha256=digest(cfg),
+               selected=_clean(sel), measured_pulse_counts=counts, simulated=bool(simulated),
+               source=dict(tool="orgchar", step=str(step_dir), code_version=code_version),
+               missing_roles=[r for r in ROLES if r not in chosen])
+    return _clean(out)
+
+
+def characterise(segments, plan):
+    D, thr, art = measure(segments, plan)
+    pairs, control = analyse_pairs(D, plan, art)
+    for p in pairs:
+        p["grade"], p["grade_reason"] = grade(p)
+    chosen = select_roles(pairs)
+    role_grade = {r: grade(p, r) for r, p in chosen.items()}
+    verdict = ("ALL_ROLES" if len(chosen) == 3 else "SOME_ROLES" if chosen else "NO_ROLES")
+    return dict(step="curve", readout="after_train", verdict=verdict, levels=plan["levels"],
+                roles={r: dict(stim=p["stim"], rec=p["rec"], grade=role_grade[r][0], reason=role_grade[r][1],
+                               **{k: v for k, v in p["fits"][r].items() if k != "conf_means"}) for r, p in chosen.items()},
+                pairs=[_clean({k: v for k, v in p.items()}) for p in pairs], thresholds_uV=_clean(thr),
+                n_trials=int(D[D.kind == "stim"].train_id.nunique()), _D=D, _chosen=chosen)

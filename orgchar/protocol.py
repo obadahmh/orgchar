@@ -46,11 +46,14 @@ def check_setting(amplitude_uA, phase_us, n_pulses=1, ipi_ms=0.0, limits=LIMITS)
         raise ValueError("Stimulation outside safety limits: " + "; ".join(problems))
 
 
-def _electrodes(stims, amplitude_uA, phase_us, polarity):
+def _electrodes(stims, amplitude_uA, phase_us, polarity, n_pulses=1, ipi_ms=0.0):
+    """n_pulses > 1: a hardware train (the board repeats the pulse every ipi_ms after one trigger),
+    as FuncSolver delivers it."""
     if len(stims) > 15:
         raise ValueError("At most 15 stimulation electrodes per segment (key 15 is the sham key)")
     return {int(e): dict(key=i, amplitude_uA=amplitude_uA, phase_us=phase_us, polarity=polarity,
-                         n_pulses=1, ipi_ms=0.0) for i, e in enumerate(stims)}
+                         n_pulses=int(n_pulses), ipi_ms=float(ipi_ms) if n_pulses > 1 else 0.0)
+            for i, e in enumerate(stims)}
 
 
 def _timeline(trials, isi_s, rng):
@@ -221,3 +224,72 @@ def plan_codetest(stims, amplitude_uA=2.0, phase_us=100.0, polarity="negative-fi
     plan = dict(step="codetest", amplitude_uA=amplitude_uA, phase_us=phase_us, polarity=polarity,
                 segments=_split(evs, el, "seg"))
     return add_train_codes(plan)
+
+
+FUNCSOLVER_COUNTS = tuple(range(2, 21, 2))
+
+
+def _spaced_timeline(trials, organoid_isi_s, spacing_s, rng, t0=1.0):
+    """Order and time trials so that any two trains are spacing_s apart and the same organoid is
+    stimulated at most every organoid_isi_s (shams deliver no current and only need spacing).
+    trials: list of event dicts (one trigger each) with stim_electrode (-1 for sham)."""
+    queue, ready, t, out = list(trials), {}, t0, []
+    while queue:
+        pick = next((i for i, ev in enumerate(queue)
+                     if ev["stim_electrode"] < 0 or t >= ready.get(ev["stim_electrode"] // 8, 0.0)), None)
+        if pick is None:
+            t = min(ready[e["stim_electrode"] // 8] for e in queue if e["stim_electrode"] >= 0)
+            continue
+        ev = queue.pop(pick)
+        out.append(dict(ev, t_s=round(t, 4)))
+        if ev["stim_electrode"] >= 0:
+            ready[ev["stim_electrode"] // 8] = t + rng.uniform(*organoid_isi_s)
+        t += rng.uniform(*spacing_s)
+    return out
+
+
+def plan_funcsolver(stims, counts=FUNCSOLVER_COUNTS, ipi_ms=10.0, amplitude_uA=2.0, phase_us=100.0,
+                    polarity="negative-first", reps=10, sham_reps=4, reference_pulses=10, reference_reps=5,
+                    organoid_isi_s=(4.0, 4.5), spacing_s=(1.0, 1.25), seed=0):
+    """Characterise stim->rec pairs exactly as FuncSolver will use them.
+
+    Input = pulse count of a hardware train (one trigger; the board spaces pulses ipi_ms apart),
+    output = events 10-210 ms after the train (readout.py). One segment (= one upload) per pulse
+    count, because a hardware train's length is part of the uploaded parameters.
+
+    Order: reference, development pass (every count once, shuffled), reference, confirmation pass
+    (every count once, reshuffled), reference. Development data alone select the pairs and fit
+    the curves; confirmation data only measure how well those predictions hold on new trials.
+    References (reference_pulses, same in every reference segment) measure drift over the run.
+    Each segment also holds sham trials (no current) with the same timing, for the sham correction.
+    """
+    counts = sorted(int(n) for n in counts)
+    for n in counts + [reference_pulses]:
+        check_setting(amplitude_uA, phase_us, n, ipi_ms)
+    rng = random.Random(seed)
+    segs = []
+
+    def segment(seg_id, n, partition, block, n_reps, n_sham):
+        el = _electrodes(stims, amplitude_uA, phase_us, polarity, n_pulses=n, ipi_ms=ipi_ms)
+        trials = [dict(key=el[e]["key"], kind="stim", stim_electrode=e, level=float(n), pulse_index=0)
+                  for e in stims for _ in range(n_reps)]
+        trials += [dict(key=SHAM_KEY, kind="sham", stim_electrode=-1, level=float(n), pulse_index=0)
+                   for _ in range(n_sham)]
+        rng.shuffle(trials)
+        evs = _spaced_timeline(trials, organoid_isi_s, spacing_s, rng)
+        for i, ev in enumerate(evs):
+            ev.update(train_id=f"{seg_id}t{i:03d}", partition=partition, block=block)
+        segs.append(dict(id=seg_id, electrodes=el, events=evs, partition=partition, block=block,
+                         n_pulses=n, duration_s=round(evs[-1]["t_s"] + 1.5, 1)))
+
+    segment("ref0", reference_pulses, "reference", 0, reference_reps, 2)
+    for p, partition in enumerate(("development", "confirmation")):
+        order = list(counts)
+        rng.shuffle(order)
+        for n in order:
+            segment(f"{partition[:3]}_n{n:02d}", n, partition, p, reps, sham_reps)
+        segment(f"ref{p + 1}", reference_pulses, "reference", p + 1, reference_reps, 2)
+    return dict(step="curve", vary="pulse_train", readout="after_train", levels=counts, ipi_ms=ipi_ms,
+                amplitude_uA=amplitude_uA, phase_us=phase_us, polarity=polarity, reps=reps, sham_reps=sham_reps,
+                reference_pulses=reference_pulses, reference_reps=reference_reps,
+                organoid_isi_s=list(organoid_isi_s), stims=list(stims), segments=segs)

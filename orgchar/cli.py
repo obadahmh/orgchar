@@ -2,7 +2,7 @@
 
     orgchar census --fsname fs652          # 5 min, no stimulation: which organoids fire?
     orgchar screen --fsname fs652          # ~6 min per live organoid: which electrode pairs respond?
-    orgchar curve  --fsname fs652          # ~10-20 min: input-output curves -> card.json
+    orgchar curve  --fsname fs652          # ~30 min: FuncSolver curves (2-20 pulse trains) -> calibration.json
     orgchar analyze <step dir>             # re-run the analysis of a finished step, offline
     orgchar status --fsname fs652          # what has been done for this organoid
     orgchar codetest --fsname fs652        # 1 min: check that train codes (--codes) are safe and readable
@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 
 from . import analysis as A
+from . import funcsolver as F
 from . import protocol as P
 from . import report as R
 
@@ -81,6 +82,18 @@ def _describe(plan):
     n_stim = sum(e["kind"] == "stim" for s in plan["segments"] for e in s["events"])
     n_sham = sum(e["kind"] == "sham" for s in plan["segments"] for e in s["events"])
     n_code = sum(e["kind"] == "code" for s in plan["segments"] for e in s["events"])
+    if plan.get("vary") == "pulse_train":
+        n_pulses = sum(int(s["n_pulses"]) for s in plan["segments"] for e in s["events"] if e["kind"] == "stim")
+        print(f"Plan: FuncSolver curve, {len(plan['segments'])} segments (one per pulse count), {n_stim} trains "
+              f"({n_pulses} pulses), {n_sham} sham trials, "
+              + (f"{n_code} code triggers (keys 8-14, no current), " if n_code else "")
+              + f"about {P.plan_duration_s(plan) / 60:.0f} min.")
+        print(f"  stimulating e{', e'.join(str(e) for e in plan['stims'])}; trains of {plan['levels'][0]}-{plan['levels'][-1]} "
+              f"pulses, {plan['ipi_ms']:g} ms apart, {plan['amplitude_uA']} µA × {plan['phase_us']:g} µs; "
+              f"each organoid ≥ {plan['organoid_isi_s'][0]:g} s between trains")
+        print(f"  order: reference, development ({len(plan['levels'])} segments), reference, "
+              f"confirmation ({len(plan['levels'])} segments), reference")
+        return
     print(f"Plan: {plan['step']}, {len(plan['segments'])} segment(s), {n_stim} stimulation pulses, "
           f"{n_sham} sham markers, " + (f"{n_code} code triggers (keys 8-14, no current), " if n_code else "")
           + f"about {P.plan_duration_s(plan) / 60:.1f} min.")
@@ -100,7 +113,8 @@ def _execute(args, plan):
     (step_dir / "plan.json").write_text(json.dumps(plan, indent=1))
     if args.simulate:
         from .backends import SimBackend
-        backend = SimBackend()
+        from .simulate import demo_organoid
+        backend = SimBackend(demo_organoid())
         locks = []
     else:
         from .backends import HardwareBackend
@@ -190,6 +204,24 @@ def analyse(step_dir: Path, plan: dict, segs) -> dict:
                          + "   (pairs " + ", ".join(f"e{a}→e{b}" for a, b in rec) + ")")
         verdict = r["verdict"]
         figs, table = [], None
+    elif step == "curve" and plan.get("vary") == "pulse_train":
+        r = F.characterise(segs, plan)   # "_" keys stay out of result.json (report.to_json drops them)
+        chosen = r["_chosen"]
+        lines = [f"Input: hardware trains of {', '.join(map(str, plan['levels']))} pulses, {plan['ipi_ms']:g} ms apart; "
+                 f"output: events 10-210 ms after the train, minus the 500 ms before it and the sham mean."]
+        for role in F.ROLES:
+            v = r["roles"].get(role)
+            lines.append(f"{role} ({F.ROLE_TEXT[role]}): " + (
+                f"e{v['stim']}→e{v['rec']}, {v['grade'].upper()} ({v['reason']}); new single trials: R² "
+                f"{v.get('conf_r2', float('nan')):.2f}, error ±{v.get('conf_rmse', float('nan')):.1f} events"
+                if v else "MISSING: no pair gives this curve"))
+        verdict = {"ALL_ROLES": "ALL THREE FUNCTIONS FOUND", "SOME_ROLES": "SOME FUNCTIONS MISSING",
+                   "NO_ROLES": "NO USABLE FUNCTION"}[r["verdict"]]
+        figs, table = [], None
+        cal = F.calibration(plan, plan["fsname"], f"{plan['fsname']}_{step_dir.name}", {int(k): v for k, v in r["thresholds_uV"].items()}, chosen, r["pairs"],
+                            code_version(), plan.get("backend") == "simulated", step_dir)
+        (step_dir / "calibration.json").write_text(json.dumps(cal, indent=1, allow_nan=False))
+        r["calibration"] = str(step_dir / "calibration.json")
     elif step == "curve":
         pairs = [tuple(p) for p in plan["pairs"]]
         unit = "pulse" if plan["vary"] == "amplitude" else "train"
@@ -222,6 +254,13 @@ def analyse(step_dir: Path, plan: dict, segs) -> dict:
     (step_dir / "result.json").write_text(R.to_json(r))
     if step == "screen":
         R.screen_page(step_dir / "report.html", r, Rt, _screen_context(step_dir, plan, segs, r, problems))
+    elif step == "curve" and plan.get("vary") == "pulse_train":
+        from . import report_funcsolver as RF
+        RF.page(step_dir / "report.html", plan, r, problems, _when(step_dir))
+        if not problems and plan.get("backend") != "simulated":
+            latest = step_dir.parent / "calibration_latest.json"
+            latest.write_text((step_dir / "calibration.json").read_text())
+            lines.append(f"FuncSolver calibration: {latest}")
     else:
         title = f"{plan['fsname']} · {step} · {_when(step_dir)}" + (" · SIMULATED" if plan.get("backend") == "simulated" else "")
         R.write_html(step_dir / "report.html", title, verdict, lines, figs, table)
@@ -356,34 +395,53 @@ def cmd_screen(a):
     analyse(step_dir, json.loads((step_dir / "plan.json").read_text()), segs)
 
 
+def _screen_pairs(a):
+    d, s = _latest(a.fsname, a.simulate, "screen")
+    if s is None:
+        sys.exit("No screen for this organoid yet. Run `orgchar screen` first, or pass --stims / --pairs.")
+    if s.get("incomplete"):
+        sys.exit(f"Latest screen ({d.name}) is INCOMPLETE. Re-run it, or pass --stims / --pairs explicitly.")
+    rec = s.get("recommended_pairs")
+    if rec is None:  # screens analysed before recommendations existed
+        rec = A.recommend(A.classify(s["pairs"]))
+    if not rec:
+        sys.exit(f"Latest screen ({d.name}) has no pair with status Use. Pass --stims / --pairs explicitly.")
+    return d, rec
+
+
 def cmd_curve(a):
-    if a.pairs:
-        pairs = [tuple(int(v) for v in p.split(":")) for p in a.pairs.split(",")]
+    if a.mode == "funcsolver":
+        if a.stims:
+            stims = [int(x) for x in a.stims.split(",")]
+        else:
+            d, rec = _screen_pairs(a)
+            stims = list(dict.fromkeys(e for e, _ in rec))[:a.max_stims]
+            print(f"Stimulating e{', e'.join(map(str, stims))} (the screen's recommended stimulating electrodes, "
+                  f"{d.name}); every other electrode of each organoid is measured.")
+        counts = [int(x) for x in (a.levels or ",".join(map(str, P.FUNCSOLVER_COUNTS))).split(",")]
+        plan = P.plan_funcsolver(stims, counts=counts, ipi_ms=a.ipi if a.ipi is not None else 10.0,
+                                 amplitude_uA=a.amplitude, phase_us=a.phase, polarity=a.polarity,
+                                 reps=a.reps if a.reps is not None else 10, seed=int(time.time()))
     else:
-        d, s = _latest(a.fsname, a.simulate, "screen")
-        if s is None:
-            sys.exit("No screen for this organoid yet. Run `orgchar screen` first, or pass --pairs stim:rec,...")
-        if s.get("incomplete"):
-            sys.exit(f"Latest screen ({d.name}) is INCOMPLETE. Re-run it, or pass --pairs explicitly.")
-        rec = s.get("recommended_pairs")
-        if rec is None:  # screens analysed before recommendations existed
-            rec = A.recommend(A.classify(s["pairs"]))
-        if not rec:
-            sys.exit(f"Latest screen ({d.name}) has no pair with status Use. Pass --pairs to choose Weak or Check "
-                     "pairs deliberately.")
-        keep = list(dict.fromkeys(e for e, _ in rec))[:a.max_stims]
-        pairs = [tuple(p) for p in rec if p[0] in keep]
-        print(f"Using the recommended pairs from screen {d.name}: " + ", ".join(f"e{e}→e{c}" for e, c in pairs))
-    stims = sorted({e for e, _ in pairs})
-    if a.vary == "pulses":
-        levels = [int(x) for x in (a.levels or "1,2,4,6,8,10").split(",")]
-        plan = P.plan_curve_pulses(stims, levels=levels, ipi_ms=a.ipi, amplitude_uA=a.amplitude, phase_us=a.phase,
-                                   polarity=a.polarity, reps=a.reps, sham_reps=a.reps, seed=int(time.time()))
-    else:
-        levels = [float(x) for x in (a.levels or "0.5,1,1.5,2,3").split(",")]
-        plan = P.plan_curve_amplitude(stims, levels=levels, phase_us=a.phase, polarity=a.polarity,
-                                      reps_per_pass=max(10, -(-a.reps // 3)), passes=3, seed=int(time.time()))
-    plan["pairs"] = pairs
+        if a.pairs:
+            pairs = [tuple(int(v) for v in p.split(":")) for p in a.pairs.split(",")]
+        else:
+            d, rec = _screen_pairs(a)
+            keep = list(dict.fromkeys(e for e, _ in rec))[:a.max_stims]
+            pairs = [tuple(p) for p in rec if p[0] in keep]
+            print(f"Using the recommended pairs from screen {d.name}: " + ", ".join(f"e{e}→e{c}" for e, c in pairs))
+        stims = sorted({e for e, _ in pairs})
+        reps = a.reps if a.reps is not None else 20
+        if a.mode == "pulses":
+            levels = [int(x) for x in (a.levels or "1,2,4,6,8,10").split(",")]
+            plan = P.plan_curve_pulses(stims, levels=levels, ipi_ms=a.ipi if a.ipi is not None else 30.0,
+                                       amplitude_uA=a.amplitude, phase_us=a.phase, polarity=a.polarity, reps=reps,
+                                       sham_reps=reps, seed=int(time.time()))
+        else:
+            levels = [float(x) for x in (a.levels or "0.5,1,1.5,2,3").split(",")]
+            plan = P.plan_curve_amplitude(stims, levels=levels, phase_us=a.phase, polarity=a.polarity,
+                                          reps_per_pass=max(10, -(-reps // 3)), passes=3, seed=int(time.time()))
+        plan["pairs"] = pairs
     if _use_codes(a):
         plan = P.add_train_codes(plan)
     _describe(plan)
@@ -556,17 +614,20 @@ def main(argv=None):
                         "(default: on once codetest has passed on this machine)")
     p.set_defaults(func=cmd_screen)
 
-    p = sub.add_parser("curve", help="input-output curve for responsive pairs")
+    p = sub.add_parser("curve", help="input-output curves; default: FuncSolver calibration (hardware trains 2-20 pulses)")
     common(p)
-    p.add_argument("--pairs", help="stim:rec,... (default: responsive pairs from latest screen)")
+    p.add_argument("--mode", default="funcsolver", choices=["funcsolver", "pulses", "amplitude"],
+                   help="funcsolver (default): hardware trains, after-train readout, calibration.json for FuncSolver; "
+                        "pulses/amplitude: the earlier during-train curves")
+    p.add_argument("--stims", help="funcsolver mode: stimulating electrodes, e.g. 2,10,20,29 (default: from latest screen)")
+    p.add_argument("--pairs", help="pulses/amplitude modes: stim:rec,... (default: from latest screen)")
     p.add_argument("--max-stims", type=int, default=4, help="at most this many stimulating electrodes")
-    p.add_argument("--vary", default="pulses", choices=["pulses", "amplitude"])
-    p.add_argument("--levels", help="pulses: 1,2,4,6,8,10  amplitude: 0.5,1,1.5,2,3")
-    p.add_argument("--ipi", type=float, default=30.0, help="ms between pulses of a train (pulses mode)")
+    p.add_argument("--levels", help="funcsolver: 2,4,...,20  pulses: 1,2,4,6,8,10  amplitude: 0.5,1,1.5,2,3")
+    p.add_argument("--ipi", type=float, default=None, help="ms between pulses of a train (funcsolver 10, pulses 30)")
     p.add_argument("--amplitude", type=float, default=2.0)
     p.add_argument("--phase", type=float, default=100.0)
     p.add_argument("--polarity", default="negative-first", choices=["negative-first", "positive-first"])
-    p.add_argument("--reps", type=int, default=20)
+    p.add_argument("--reps", type=int, default=None, help="trials per level (funcsolver: per pass, default 10; else 20)")
     p.add_argument("--codes", action=argparse.BooleanOptionalAction, default=None,
                    help="train codes (keys 8-14) so the recording identifies each train "
                         "(default: on once codetest has passed on this machine)")

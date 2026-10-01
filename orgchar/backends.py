@@ -23,6 +23,7 @@ from . import simulate
 
 RAW_ROOT = Path("/mnt/s3-intanraws")
 PRE_S, POST_S, UPLOAD_WAIT_S = 2.0, 2.0, 10.0
+STOP_ACK_S = 20.0
 
 
 def _utc():
@@ -222,7 +223,10 @@ def match_triggers(seg: dict, raw_path, sent: pd.DataFrame | None = None, min_fr
                 else "before recording gap" if i in gap_edges else "incomplete train" if tid in broken else "")
         rows.append(dict(segment=seg["id"], onset=s, key=key, kind=kind, stim_electrode=e,
                          amplitude_uA=el.get("amplitude_uA", 0.0), phase_us=el.get("phase_us", 0.0),
-                         polarity=el.get("polarity", ""), n_pulses=1, ipi_ms=0.0,
+                         polarity=el.get("polarity", ""), n_pulses=int(el.get("n_pulses", 1)),
+                         ipi_ms=float(el.get("ipi_ms", 0.0)),
+                         partition=(ev or {}).get("partition", seg.get("partition", "")),
+                         block=(ev or {}).get("block", seg.get("block", -1)),
                          level=ev["level"] if ev else float("nan"),
                          train_id=tid if ev else f"unmatched{i}",
                          pulse_index=ev["pulse_index"] if ev else 0, planned_t_s=ev["t_s"] if ev else float("nan"),
@@ -270,7 +274,9 @@ class SimBackend:
             trig.append((s, ev["key"]))
             if ev["kind"] == "stim":
                 el = seg["electrodes"][ev["stim_electrode"]]
-                pulses.append((s + 6, ev["stim_electrode"], el["amplitude_uA"], el["phase_us"]))
+                for i in range(int(el.get("n_pulses", 1))):
+                    pulses.append((s + 6 + S.samples(i * el.get("ipi_ms", 0.0)), ev["stim_electrode"],
+                                   el["amplitude_uA"], el["phase_us"]))
         raw = seg_dir / "raw.h5"
         simulate.record(self.organoid, seg["duration_s"], pulses, trig, raw)
         return raw
@@ -287,8 +293,12 @@ class HardwareBackend:
         from neuroplatformv2.utils.schemas import StimParam
         out = []
         for e, p in seg["electrodes"].items():
+            # a hardware train: nb_pulse pulses, pulse_train_period µs apart (as FuncSolver and the
+            # fs647 sweep of 8 Sep 2026 program it); a single pulse: nb_pulse 0
+            n = int(p.get("n_pulses", 1))
             out.append(StimParam(index=int(e), enable=True, trigger_key=int(p["key"]), trigger_delay=0,
-                                 nb_pulse=0, pulse_train_period=int(round(2 * p["phase_us"])),
+                                 nb_pulse=0 if n <= 1 else n,
+                                 pulse_train_period=int(round(p["ipi_ms"] * 1000)) if n > 1 else int(round(2 * p["phase_us"])),
                                  phase_duration1=p["phase_us"], phase_duration2=p["phase_us"],
                                  phase_amplitude1=p["amplitude_uA"], phase_amplitude2=p["amplitude_uA"],
                                  polarity=StimPolarity.PositiveFirst if p["polarity"] == "positive-first"
@@ -338,7 +348,10 @@ class HardwareBackend:
             if recording:
                 for attempt in range(3):
                     try:
-                        await self._ack("stop raw recording", intan._stop_raw_recording(), 90)
+                        # the platform usually stops at once but often never acknowledges; a short
+                        # wait keeps that from costing minutes per segment (completeness is checked
+                        # later from the recorded duration)
+                        await self._ack("stop raw recording", intan._stop_raw_recording(), STOP_ACK_S)
                         stop_ok = True
                         break
                     except Exception as e:  # noqa: BLE001 - keep trying, then report

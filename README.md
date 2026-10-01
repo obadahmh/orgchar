@@ -97,25 +97,22 @@ On fs647, 8 Sep, the strong pairs (21→23, 23→21, 8→15) raised no warning. 
 
 If any control comes out significant, the verdict is `PIPELINE_LEAK` and no pair should be trusted.
 
-### Step 3 — curve (input → output)
+### Step 3 — curve: FuncSolver's activation functions
 
-By default `curve` takes the pairs the screen report recommends: one stimulating electrode per organoid (up to 4), the one with the best **Use** pair (pairs reproduced in an earlier screen first), and its best **Use** pairs (up to 3). Pass `--pairs` to choose differently.
-- **Pulse count (default).**
-  - 1, 2, 4, 6, 8, 10 pulses, 30 ms apart. That is long enough to read the 8–20 ms response of every pulse.
-  - The pulses are timed in software, so all levels and electrodes are randomly interleaved in one recording.
-  - 20 trials per level, plus 20 shams as the zero-input level.
-- **Amplitude.**
-  - 0.5, 1, 1.5, 2, 3 µA.
-  - A new amplitude needs a new upload, so the order of levels is reshuffled in each of 3 passes, spreading slow drift over all levels.
+FuncSolver (NeuralControlProgram) needs three organoid pairs, one per function shape: **short** (falling: more pulses → fewer events), **band** (peaked) and **long** (rising). It sends **one** train per evaluation and reads **one** response, so a curve is only as good as single trials are close to it.
 
-**Output** = evoked spikes per trial (post-artifact windows of all pulses), minus the spontaneous expectation for the same duration. 0 means no effect.
+`curve` measures exactly what FuncSolver uses:
+- **Input:** a hardware train of 2, 4, …, 20 pulses, 10 ms apart, 2 µA × 100 µs. One trigger; the stimulator repeats the pulse, as FuncSolver delivers it. A train's length is part of the upload, so there is one recording per pulse count.
+- **Output** (`orgchar/readout.py`, one function for calibration and live use): 300–3000 Hz band-pass, events = crossings of −5× noise counted **10–210 ms after the train**, minus the 500 ms before it (scaled), minus the mean of no-current sham trials. The raw voltage swings by hundreds of µV on some electrodes; counting on it unfiltered would count those swings.
+- **Order:** reference (10 pulses) → **development** (every count, shuffled) → reference → **confirmation** (reshuffled) → reference. Each organoid ≥ 4 s between trains, trains ≥ 1 s apart. About 30 min for one stimulating electrode per organoid; every other electrode of that organoid is measured.
+- **Development data alone** choose the pairs (FuncSolver's shape rule, then the best cross-validated single-trial fit; each role on its own stimulating electrode) and fit FuncSolver's curve formulas. **Confirmation data** only score those frozen curves: R² and error on new single trials. The references show drift.
+- **Artifact check:** the median across trials of the window's first 5 ms, in units of its own noise floor. Spikes are not time-locked and drop out; an artifact tail does not. Pairs over 3× are excluded. On the fs647 hardware-train recordings of 8 Sep the largest value was 2.6×.
 
-A curve is **usable** if all of the following hold:
-- the top level beats sham (Mann-Whitney p < 0.01);
-- the odd-trial and even-trial curves agree (Spearman ρ ≥ 0.6);
-- the dynamic range exceeds the trial-to-trial SD.
+Verdict per function: **Good** (new-trial R² ≥ 0.5, no large drift), **Fair** (≥ 0.2), **Poor**, or **Missing**.
 
-Usable curves go to `sessions/<fsname>/card_latest.json`, together with each level's mean, SEM and SD, a sigmoid fit, and the readout settings.
+Outputs: `calibration.json` in FuncSolver's format (schema 1, `nearest_validated_abs_v1`; tested with `FuncSolver/calibration.apply_calibration`), copied to `sessions/<fsname>/calibration_latest.json` when the run is complete; `report.html` leads with the three functions, then single-trial evidence for each, then every pair measured.
+
+`--mode pulses` / `--mode amplitude` keep the earlier during-train curves (software-timed single pulses, 30 ms window); they do not feed FuncSolver.
 
 ## Running it
 
@@ -126,7 +123,7 @@ cd ~/Documents/orgchar
 ./orgchar.sh census --fsname fs652 --dry-run    # shows the plan, touches nothing
 ./orgchar.sh census --fsname fs652              # asks you to type the fsname to confirm
 ./orgchar.sh screen --fsname fs652              # uses the live blocks from the census
-./orgchar.sh curve  --fsname fs652              # uses the responsive pairs from the screen
+./orgchar.sh curve  --fsname fs652              # FuncSolver curves on the screen's stimulating electrodes
 ./orgchar.sh status --fsname fs652
 ./orgchar.sh analyze sessions/fs652/<step dir>  # re-analyse offline, e.g. after changing a setting
 ```
@@ -138,7 +135,8 @@ cd ~/Documents/orgchar
 Useful options:
 - `screen --blocks 1,2`: override the census choice.
 - `screen --electrodes 21,15 --reps 20`: quick re-check of known pairs before a session.
-- `curve --pairs 21:23,15:13`, `curve --vary amplitude --levels 0.5,1,2,3`.
+- `curve --stims 10,20`: choose the stimulating electrodes; `curve --levels 2,4,8,12,16,20 --reps 12`.
+- `curve --mode pulses --pairs 21:23` / `--mode amplitude`: the earlier during-train curves.
 - Stimulation limits are enforced before any upload: ≤ 3 µA, ≤ 200 µs, ≤ 0.4 nC/phase, ≤ 20 pulses. Change them in `orgchar/protocol.py` (`LIMITS`).
 
 Each step directory contains:
@@ -168,17 +166,16 @@ Figures are vector graphics and stay sharp when zoomed.
 | screen | `RESPONSES_FOUND` | run curve |
 | screen | `NO_RESPONSE` (controls clean) | tissue fires but does not follow this stimulus; try `--amplitude 3` or `--phase 150` once, then stop |
 | screen | `PIPELINE_LEAK` | artifact reaches the readout; look at the Controls section and the evidence traces before anything else |
-| curve | `USABLE_CURVES` | use `card_latest.json` |
-| curve | `NO_USABLE_CURVE` | the pair responds but not reliably enough to compute with |
+| curve | `ALL THREE FUNCTIONS FOUND` | train FuncSolver on `calibration_latest.json` (command in the report) |
+| curve | `SOME FUNCTIONS MISSING` | re-run with other `--stims` for the missing shape, or more current |
+| curve | `NO USABLE FUNCTION` | the organoid does not give FuncSolver's shapes with these trains |
 
 ## Using it for function approximation
 
-- Each usable pair is one "activation function": input (pulse count or amplitude) → expected evoked spikes, plus the trial-to-trial SD at every level.
-  - The SD is the noise the downstream model has to tolerate.
-  - Train the ANN readout on the card's curves (or on the raw per-trial table in `result.json`), not on assumed shapes.
-- For live use, send the inputs you need as a batch (a `curve`-like segment with your chosen levels). Read the outputs with the same pipeline (`orgchar.analysis.curve`), so the measurement matches the one that produced the card.
-- Before each session, run `screen --electrodes <stims> --reps 20`. If a pair's spikes per pulse have dropped by more than about half, re-run `curve`.
-- After any medium change or new week, start again from `census`.
+- Train FuncSolver offline on the calibration (no hardware):
+  `cd ~/NeuralControlProgram && python FuncSolver/main.py --train --fsname <fs> --calibration <path to calibration.json>`.
+- **Live inference is not connected yet.** FuncSolver's live path still uses its own readout (`experiment_control/measurement.py`, threshold crossings on the unfiltered voltage) and requires a ResponseSweep `assessment.json`. A calibration from orgchar declares `method: orgchar_bandpass_events_v1`, which FuncSolver's live readout refuses, so it cannot silently measure differently from the calibration. Connecting it means FuncSolver calling `orgchar.readout.measure_trial` and accepting orgchar's checks.
+- Responses change within days. Re-run `curve` at the start of each FuncSolver session; after a medium change or a new week, start again from `census`.
 - Do not read the vendor spike database for evoked responses. It counts artifacts and knows nothing about sham or cross-talk.
 
 ## Platform quirks (handled)

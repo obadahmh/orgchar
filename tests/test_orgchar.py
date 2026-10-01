@@ -268,3 +268,95 @@ def test_code_trigger_that_stimulates_stops_the_run(tmp_path):
     seg = _coded_curve(reps=3)
     with pytest.raises(RuntimeError, match="Code triggers"):
         match_triggers(seg, _record(seg, tmp_path / "raw.h5", code_pulse=True))
+
+
+# ------------------------------------------------------------------------------ FuncSolver curve
+
+NCP = Path.home() / "NeuralControlProgram"
+
+
+def test_funcsolver_plan_timing_and_structure():
+    plan = P.plan_funcsolver([2, 10, 20, 29], reps=4, sham_reps=2, seed=1)
+    parts = [s["partition"] for s in plan["segments"]]
+    assert parts[0] == parts[11] == parts[-1] == "reference" and parts.count("development") == 10
+    for s in plan["segments"]:
+        assert all(v["n_pulses"] == s["n_pulses"] for v in s["electrodes"].values())
+        t = np.array([e["t_s"] for e in s["events"]])
+        assert np.diff(t).min() >= 1.0 - 1e-9                     # trains >= 1 s apart
+        for o in range(4):                                         # each organoid >= 4 s
+            to = [e["t_s"] for e in s["events"] if e["stim_electrode"] >= 0 and e["stim_electrode"] // 8 == o]
+            assert len(to) < 2 or np.diff(to).min() >= 4.0 - 1e-9
+    with pytest.raises(ValueError):
+        P.plan_funcsolver([2], counts=(2, 30))                     # beyond the 20-pulse limit
+
+
+def test_readout_counts_events_after_the_train_only():
+    from orgchar import readout as RO
+    rng = np.random.default_rng(0)
+    base, post = rng.normal(0, 5, 15000), rng.normal(0, 5, 9000)
+    post[:200] += 3000                                             # artifact during the train: blanked
+    end = int(RO.train_end_ms(5, 10, 100) * 30)
+    for ms in (30, 80, 150):                                       # three spikes in the window
+        post[end + ms * 30:end + ms * 30 + 8] -= 80
+    m = RO.measure_trial(base, post, 5, 10, 100, -25.0)
+    assert m["response_events"] == 3 and m["baseline_events"] == 0
+
+
+def _sim_funcsolver(tmp_path, reps=6):
+    from orgchar import funcsolver as F
+    org = simulate.demo_organoid()
+    plan = P.plan_funcsolver([5, 13, 21], reps=reps, sham_reps=3, seed=1)
+    segs = []
+    for s in plan["segments"]:
+        d = tmp_path / s["id"]
+        d.mkdir()
+        raw = SimBackend(org).run_segment(s, d, "f")
+        segs.append((str(raw), match_triggers(s, raw)))
+    return plan, segs, F.characterise(segs, plan)
+
+
+def test_funcsolver_finds_the_three_planted_shapes_and_writes_a_loadable_calibration(tmp_path):
+    from orgchar import funcsolver as F
+    plan, segs, r = _sim_funcsolver(tmp_path)
+    assert {k: (v["stim"], v["rec"]) for k, v in r["roles"].items()} == {"short": (13, 10), "band": (5, 3), "long": (21, 22)}
+    assert all(not p["shape"] for p in r["pairs"] if (p["stim"], p["rec"]) not in {(13, 10), (5, 3), (21, 22)})
+    plan = dict(plan, fsname="fstest")
+    cal = F.calibration(plan, "fstest", "fstest_s1", {int(k): v for k, v in r["thresholds_uV"].items()},
+                        r["_chosen"], r["pairs"], "test", True, tmp_path)
+    path = tmp_path / "calibration.json"
+    path.write_text(__import__("json").dumps(cal, allow_nan=False))
+    if (NCP / "FuncSolver" / "calibration.py").exists():          # FuncSolver's own loader accepts it
+        import importlib
+        import sys
+        sys.path[:0] = [str(NCP), str(NCP / "FuncSolver")]
+        try:
+            C = importlib.import_module("calibration")
+            loaded = C.apply_calibration(path)
+            assert set(loaded["selected"]) == {"short", "band", "long"}
+        finally:
+            del sys.path[:2]
+
+
+def test_funcsolver_artifact_in_window_is_caught(tmp_path):
+    import h5py
+    from orgchar import funcsolver as F
+    from orgchar import readout as RO
+    plan = P.plan_funcsolver([21], counts=(2, 4, 6), reps=6, sham_reps=2, seed=3)
+    plan["segments"] = [s for s in plan["segments"] if s["partition"] == "development"]
+    segs = []
+    for s in plan["segments"]:
+        d = tmp_path / s["id"]
+        d.mkdir()
+        raw = SimBackend(simulate.Organoid(seed=2)).run_segment(s, d, "a")
+        t = match_triggers(s, raw)
+        end = RO.train_end_ms(s["n_pulses"], plan["ipi_ms"], plan["phase_us"])
+        with h5py.File(raw, "r+") as f:                            # a slow tail still there 10-13 ms after the train
+            x = f["electrode_22"][...].reshape(-1)
+            for o in t[t.kind == "stim"].onset:
+                a = int(o + (end + 10) * 30)
+                x[a:a + 90] += 60 * np.sin(np.arange(90) / 4.0)
+            f["electrode_22"][...] = x.reshape(f["electrode_22"].shape)
+        segs.append((str(raw), t))
+    D, thr, art = F.measure(segs, plan)
+    assert max(art[(21, 22, n)] for n in (2, 4, 6)) > F.ARTIFACT_LIMIT
+    assert max(art[(21, c, n)] for c in (16, 17, 18, 19, 20, 23) for n in (2, 4, 6)) < F.ARTIFACT_LIMIT
