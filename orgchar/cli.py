@@ -257,7 +257,7 @@ def analyse(step_dir: Path, plan: dict, segs) -> dict:
     elif step == "curve" and plan.get("vary") == "pulse_train":
         from . import report_funcsolver as RF
         RF.page(step_dir / "report.html", plan, r, problems, _when(step_dir))
-        if not problems and plan.get("backend") != "simulated":
+        if not problems and plan.get("backend") != "simulated" and r["verdict"] == "ALL_ROLES":
             latest = step_dir.parent / "calibration_latest.json"
             latest.write_text((step_dir / "calibration.json").read_text())
             lines.append(f"FuncSolver calibration: {latest}")

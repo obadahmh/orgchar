@@ -350,13 +350,17 @@ def test_funcsolver_artifact_in_window_is_caught(tmp_path):
         raw = SimBackend(simulate.Organoid(seed=2)).run_segment(s, d, "a")
         t = match_triggers(s, raw)
         end = RO.train_end_ms(s["n_pulses"], plan["ipi_ms"], plan["phase_us"])
-        with h5py.File(raw, "r+") as f:                            # a slow tail still there 10-13 ms after the train
-            x = f["electrode_22"][...].reshape(-1)
+        rng = np.random.default_rng(len(segs))
+        with h5py.File(raw, "r+") as f:
+            x = f["electrode_22"][...].reshape(-1)                 # a tail still there 10-13 ms after the train
+            y = f["electrode_20"][...].reshape(-1)                 # big bursts at random times (fs666 e10, 1 Oct)
             for o in t[t.kind == "stim"].onset:
                 a = int(o + (end + 10) * 30)
                 x[a:a + 90] += 60 * np.sin(np.arange(90) / 4.0)
+                y[a:a + 3000] += rng.normal(0, 40, 3000)
             f["electrode_22"][...] = x.reshape(f["electrode_22"].shape)
+            f["electrode_20"][...] = y.reshape(f["electrode_20"].shape)
         segs.append((str(raw), t))
     D, thr, art = F.measure(segs, plan)
     assert max(art[(21, 22, n)] for n in (2, 4, 6)) > F.ARTIFACT_LIMIT
-    assert max(art[(21, c, n)] for c in (16, 17, 18, 19, 20, 23) for n in (2, 4, 6)) < F.ARTIFACT_LIMIT
+    assert max(art[(21, c, n)] for c in (16, 17, 18, 19, 20, 23) for n in (2, 4, 6)) < F.ARTIFACT_LIMIT  # e20: bursts, no artifact

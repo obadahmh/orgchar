@@ -28,8 +28,10 @@ from . import signals as S
 ROLES = ("short", "band", "long")
 ROLE_TEXT = dict(short="falling", band="peaked", long="rising")
 # Artifact check: the median across trials of the first ARTIFACT_CHECK_MS of the response window,
-# in units of the median's own noise floor (1.25 x noise / sqrt(trials)). Spikes are not
-# time-locked and barely move a median; an artifact tail is identical on every trial and does.
+# in units of what a median of that many trials varies by anyway (1.25 x across-trial SD /
+# sqrt(trials), from the same samples). An artifact tail is identical on every trial: large median,
+# small spread. Spikes and bursts are not time-locked: they raise the spread as much as the median
+# (fs666 e10, 1 Oct 2026: 30-50 µV bursts were flagged when the quiet noise was the yardstick).
 ARTIFACT_CHECK_MS = 5.0
 ARTIFACT_LIMIT = 3.0
 MIN_EFFECT_P = 0.01         # development: responses must differ across pulse counts (Kruskal-Wallis)
@@ -148,9 +150,12 @@ def measure(segments, plan, spec=RO.SPEC):
     seg_order = {s["id"]: i for i, s in enumerate(plan["segments"])}
     D["order"] = D.segment.map(seg_order) * 1e9 + D.onset
     # artifact = what is common to every trial (median); spikes are not time-locked and drop out
-    noise_c = {c: abs(v) / spec["threshold_noise_multiple"] for c, v in thr.items()}
-    art = {k: float(np.sqrt((np.median(np.stack(v), axis=0) ** 2).mean()) / (1.2533 * noise_c[k[1]] / np.sqrt(len(v))))
-           for k, v in traces.items() if len(v) >= 3}
+    art = {}
+    for k, v in traces.items():
+        if len(v) >= 3:
+            A = np.stack(v)
+            spread = np.sqrt((A.std(axis=0) ** 2).mean())
+            art[k] = float(np.sqrt((np.median(A, axis=0) ** 2).mean()) / max(1.2533 * spread / np.sqrt(len(v)), 1e-9))
     return D, thr, art
 
 

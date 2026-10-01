@@ -251,16 +251,6 @@ def match_triggers(seg: dict, raw_path, sent: pd.DataFrame | None = None, min_fr
     return df
 
 
-def _remote_stopped(tag: str, wait_s: float = 10.0) -> bool:
-    """True if the platform's raw file for this tag exists and did not grow for wait_s."""
-    hits = list(RAW_ROOT.glob(f"*_{tag}.h5"))
-    if len(hits) != 1:
-        return False
-    a = hits[0].stat().st_size
-    time.sleep(wait_s)
-    return hits[0].stat().st_size == a and a > 0
-
-
 class SimBackend:
     """Writes a synthetic recording of what the plan would produce (see simulate.py)."""
 
@@ -342,36 +332,30 @@ class HardwareBackend:
                 sent.append(dict(key=ev["key"], train_id=ev["train_id"], pulse_index=ev["pulse_index"], utc=_utc()))
             await asyncio.sleep(max(0.0, start + seg["duration_s"] - time.monotonic()) if not seg["events"] else POST_S)
         finally:
-            errors, stop_ok, disable_ok = [], not recording, False
+            errors, notes, stop_ok, disable_ok = [], [], not recording, False
             if trig is not None:
                 trig.close()
             if recording:
-                for attempt in range(3):
-                    try:
-                        # the platform usually stops at once but often never acknowledges; a short
-                        # wait keeps that from costing minutes per segment (completeness is checked
-                        # later from the recorded duration)
-                        await self._ack("stop raw recording", intan._stop_raw_recording(), STOP_ACK_S)
-                        stop_ok = True
-                        break
-                    except Exception as e:  # noqa: BLE001 - keep trying, then report
-                        errors.append(f"stop recording attempt {attempt + 1}: {e!r}")
-                        # the platform often stops without acknowledging: check the file itself
-                        if await asyncio.to_thread(_remote_stopped, tag):
-                            errors.append("no acknowledgement, but the recording file stopped growing: stopped")
-                            stop_ok = True
-                            break
+                # One request, short wait. On this platform the recording stops at once but the
+                # request is often never acknowledged (every segment of the 30 Sep curves); retries
+                # cost minutes and never changed the outcome. Completeness is judged from the file:
+                # _fetch waits until it stops growing, analysis checks its duration. A recording that
+                # never stopped would never stop growing, and _fetch fails loudly.
+                try:
+                    await self._ack("stop raw recording", intan._stop_raw_recording(), STOP_ACK_S)
+                    stop_ok = True
+                except Exception as e:  # noqa: BLE001
+                    stop_ok = None
+                    notes.append(f"stop recording not acknowledged ({e!r}); the file is checked when copied")
             try:
                 await self._ack("disable all stimulation", intan._disable_all_stim())
                 disable_ok = True
             except Exception as e:  # noqa: BLE001
                 errors.append(f"final disable: {e!r}")
             await intan._close()
-            self.close_status = dict(stop_ok=stop_ok, disable_ok=disable_ok, messages=errors)
+            self.close_status = dict(stop_ok=stop_ok, disable_ok=disable_ok, messages=errors + notes)
             if errors:
-                recovered = stop_ok and disable_ok
-                self.log(("  Clean-up needed retries but succeeded: " if recovered else "  CLEAN-UP FAILED: ")
-                         + " | ".join(errors))
+                self.log("  CLEAN-UP FAILED: " + " | ".join(errors))
 
     def run_segment(self, seg: dict, seg_dir: Path, tag: str) -> Path:
         sent: list = []

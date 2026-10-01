@@ -160,6 +160,9 @@ def page(path, plan, r, problems, when):
     if problems:
         body.append(f"<li>{_icon(CHECK_BAD)}<span><b>Incomplete:</b> {html.escape('; '.join(problems))}. "
                     "No calibration_latest.json was written.</span></li>")
+    elif n < 3:
+        body.append(f"<li>{_icon(CHECK_WARN)}<span>calibration_latest.json not updated: FuncSolver needs all three "
+                    "functions (this run's calibration.json is kept in its folder for inspection).</span></li>")
     else:
         body.append(f"<li>{_icon(CHECK_OK)}<span>All {len(plan['segments'])} recordings complete.</span></li>")
     art = max((p["artifact"] for p in pairs), default=0.0)
