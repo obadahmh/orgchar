@@ -474,8 +474,10 @@ def cmd_codetest(a):
         d, s = _latest(a.fsname, a.simulate, "screen")
         rec = (s or {}).get("recommended_pairs") or []
         stims = list(dict.fromkeys(e for e, _ in rec))[:4]
-        if not stims:
-            sys.exit("No recommended pairs from a screen of this organoid; pass --electrodes e.g. 2,10,20,29")
+        if not stims:   # no screen yet (e.g. a new organoid): one electrode per organoid
+            stims = [2, 10, 18, 26]
+            print("No screen of this organoid yet; using e2, e10, e18, e26 (one per organoid). The codetest checks "
+                  "the trigger system, not the tissue, so the choice does not matter.")
         print(f"Uploading the parameters of e{', e'.join(map(str, stims))} (as a curve would), triggering none of them "
               "except 5 positive-control pulses on the first at the end.")
     plan = P.plan_codetest(stims, amplitude_uA=a.amplitude, phase_us=a.phase, seed=int(time.time()))
