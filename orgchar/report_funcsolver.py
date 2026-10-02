@@ -93,7 +93,8 @@ def _all_pairs_figure(pairs, D, chosen):
             ax.fill_between(lv, dm - sd, dm + sd, color=DEV, alpha=0.25, linewidth=0)
             ax.plot(lv, dm, color=DEV, lw=1.4)
             if p.get("shape") and p["fits"][p["shape"]].get("conf_means"):
-                ax.plot(lv, p["fits"][p["shape"]]["conf_means"], color=CONF, lw=1.4)
+                f = p["fits"][p["shape"]]
+                ax.plot(f.get("conf_levels", lv), f["conf_means"], color=CONF, lw=1.4, marker="o" if len(f["conf_means"]) < len(lv) else None, ms=2.5)
             ax.axhline(0, color=GREY, lw=0.5)
             ax.set_xticks([lv[0], lv[-1]])
             ax.tick_params(labelsize=6.5, length=2)

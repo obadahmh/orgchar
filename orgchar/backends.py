@@ -24,7 +24,8 @@ from . import simulate
 RAW_ROOT = Path("/mnt/s3-intanraws")
 PRE_S, POST_S, UPLOAD_WAIT_S = 2.0, 2.0, 10.0
 STOP_ACK_S = 20.0
-DISABLE_ATTEMPTS = 5   # x 60 s
+DISABLE_ACK_S = 180.0  # one final disable, never repeated while the platform may still be busy
+SAVE_WAIT_S = 600.0
 
 
 def _utc():
@@ -180,7 +181,7 @@ def match_triggers(seg: dict, raw_path, sent: pd.DataFrame | None = None, min_fr
     # always align by timing, even when the key sequence matches: lost rows must still be found
     times = [e["t_s"] for e in evs]
     if sent is not None and len(sent) == len(evs) and "utc" in sent:
-        t = pd.to_datetime(sent["utc"])
+        t = pd.to_datetime(sent["utc"], format="ISO8601")
         times = list((t - t.iloc[0]).dt.total_seconds() + evs[0]["t_s"])
     pairs, gaps = _align(edges, times, [e["key"] for e in evs]) if evs else ([], [])
     matched = dict(pairs)
@@ -348,20 +349,22 @@ class HardwareBackend:
                 except Exception as e:  # noqa: BLE001
                     stop_ok = None
                     notes.append(f"stop recording not acknowledged ({e!r}); the file is checked when copied")
-            # After a stop the platform can stay unresponsive for minutes while it saves the file
-            # (fs666 census, 1 Oct 2026: a 1.2 GB recording, no reply to a disable sent 15 s
-            # later). Disabling is safe to repeat and is the request that matters: keep asking.
-            failed = []
-            for attempt in range(DISABLE_ATTEMPTS):
+            # Wait until the platform has saved the file (it appears, complete, on the S3 mount)
+            # before the final disable, then send ONE disable with a long timeout. The platform
+            # handles one request at a time: a disable sent while it was still saving went
+            # unanswered (fs666 census, 1 Oct 2026), and repeating it then left the board in
+            # "Invalid run mode" (fs666 curve, 1 Oct 2026). No stimulation can happen meanwhile:
+            # the trigger connection is already closed.
+            if recording:
                 try:
-                    await self._ack("disable all stimulation", intan._disable_all_stim(), 60)
-                    disable_ok = True
-                    break
+                    await asyncio.to_thread(self._wait_saved, tag, SAVE_WAIT_S)
                 except Exception as e:  # noqa: BLE001
-                    failed.append(f"final disable attempt {attempt + 1}: {e!r}")
-            (notes if disable_ok else errors).extend(failed)
-            if failed and disable_ok:
-                self.log(f"  Final disable acknowledged after {len(failed)} unanswered attempt(s) (platform busy saving).")
+                    notes.append(f"file not seen saved before the final disable ({e!r})")
+            try:
+                await self._ack("disable all stimulation", intan._disable_all_stim(), DISABLE_ACK_S)
+                disable_ok = True
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"final disable: {e!r}")
             await intan._close()
             self.close_status = dict(stop_ok=stop_ok, disable_ok=disable_ok, messages=errors + notes)
             if errors:
@@ -377,8 +380,9 @@ class HardwareBackend:
             (seg_dir / "close_status.json").write_text(json.dumps(self.close_status, indent=1))
         return self._fetch(tag, seg_dir / "raw.h5")
 
-    def _fetch(self, tag, dest, timeout_s=900):
-        """Wait for the platform to finish writing /mnt/s3-intanraws/*_<tag>.h5, then copy it."""
+    @staticmethod
+    def _wait_saved(tag, timeout_s=900) -> Path:
+        """Wait until /mnt/s3-intanraws/*_<tag>.h5 exists and has stopped changing."""
         deadline, last, stable = time.monotonic() + timeout_s, None, 0
         while time.monotonic() < deadline:
             hits = list(RAW_ROOT.glob(f"*_{tag}.h5"))
@@ -388,10 +392,15 @@ class HardwareBackend:
                 stable = stable + 1 if sig == last and st.st_size > 0 else 0
                 last = sig
                 if stable >= 2:
-                    tmp = dest.with_suffix(".partial")
-                    shutil.copyfile(hits[0], tmp)
-                    tmp.replace(dest)
-                    (dest.parent / "remote_path.txt").write_text(str(hits[0]) + "\n")
-                    return dest
+                    return hits[0]
             time.sleep(5)
-        raise RuntimeError(f"Raw file for tag {tag} did not appear on {RAW_ROOT} within {timeout_s} s")
+        raise RuntimeError(f"Raw file for tag {tag} did not appear on {RAW_ROOT} within {timeout_s:.0f} s")
+
+    def _fetch(self, tag, dest, timeout_s=900):
+        """Copy the platform's saved raw file."""
+        src = self._wait_saved(tag, timeout_s)
+        tmp = dest.with_suffix(".partial")
+        shutil.copyfile(src, tmp)
+        tmp.replace(dest)
+        (dest.parent / "remote_path.txt").write_text(str(src) + "\n")
+        return dest

@@ -215,7 +215,7 @@ def analyse_pairs(D, plan, art):
                 pred = model(role, conf.level, p)
                 cm = conf.groupby("level").y.mean()
                 f.update(conf_r2=r2(conf.y, pred), conf_rmse=float(np.sqrt(((conf.y - pred) ** 2).mean())),
-                         conf_means=cm.round(3).tolist(),
+                         conf_means=cm.round(3).tolist(), conf_levels=[int(v) for v in cm.index],
                          conf_means_rmse=float(np.sqrt(((cm.values - model(role, cm.index.values, p)) ** 2).mean())))
             if len(ref):
                 expected = float(model(role, ref_n, p))
