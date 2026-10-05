@@ -1,4 +1,4 @@
-# orgchar — weekly organoid characterisation for FuncSolver
+# orgchar: weekly organoid characterisation for FuncSolver
 
 Three steps tell you, for this week's FinalSpark organoids:
 1. which organoids fire at all;
@@ -40,7 +40,7 @@ Re-analysing the raw HDF5 of earlier work (Aug–Sep 2026) showed four problems:
 
 ## The method
 
-### Step 1 — census (no stimulation)
+### Step 1: census (no stimulation)
 
 Record 5 min of spontaneous activity on all 32 electrodes. A channel is **active** if all of the following hold:
 - ≥ 20 spikes and ≥ 0.1 Hz;
@@ -51,7 +51,7 @@ An organoid (block of 8) with ≥ 1 active electrode is **LIVE**. LIVE covers a 
 (1 Oct) one organoid had 8 active electrodes at 180 Hz in total and another a single one at 0.2 Hz.
 `status` shows both numbers per organoid.
 
-### Step 2 — screen: which electrodes give which shape after a train
+### Step 2: screen (which electrodes give which shape after a train)
 
 Every electrode of each live organoid gets hardware trains of 2, 6, 12 and 20 pulses (6 trials each), measured exactly as FuncSolver will (events 10–210 ms after the train; see Step 3). For every stimulating → recording pair:
 - **falling** if 2-pulse trials beat 20-pulse trials, **rising** if the reverse, **peaked** if the best middle length beats both ends;
@@ -70,7 +70,7 @@ The best remaining pair per shape decides which electrodes the curve stimulates 
 
 Why not single pulses: on fs666 (1 Oct 2026) a single-pulse screen picked e2, e20, e29 and e10; only e10 responded after trains.
 
-### Step 3 — curve: FuncSolver's activation functions
+### Step 3: curve (FuncSolver's activation functions)
 
 FuncSolver (NeuralControlProgram) needs three organoid pairs, one per function shape: **short** (falling: more pulses → fewer events), **band** (peaked) and **long** (rising). It sends **one** train per evaluation and reads **one** response, so a curve is only as good as single trials are close to it. Each evaluation gives the three roles different pulse counts at once, so each role needs its own stimulating electrode.
 

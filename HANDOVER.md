@@ -1,4 +1,4 @@
-# Handover — orgchar (state as of 5 Oct 2026)
+# Handover: orgchar (state as of 5 Oct 2026)
 
 How the tool works (method, verdicts, platform quirks) is in `README.md`. This file only holds
 what the README doesn't: machines, the current state, open questions and working agreements.
@@ -41,7 +41,7 @@ Characterise this week's FinalSpark organoids so FuncSolver (`~/NeuralControlPro
 5. The 20 s wait for a stop acknowledgement that never comes may be droppable, saving ~8 min per curve. Test it on hardware before relying on it.
 
 ## Working agreements
-- The user runs all hardware steps. Claude only analyses and changes code, unless explicitly asked.
+- The user runs all hardware steps. A coding assistant only analyses and changes code, unless explicitly asked.
 - Don't call the SDK's unwrapped start/stop/debuginfo endpoints.
 - Before handing over a code change, run the full chain in simulation from an empty home:
   ```bash
@@ -50,4 +50,4 @@ Characterise this week's FinalSpark organoids so FuncSolver (`~/NeuralControlPro
   Also run `pytest`.
 - Never infer which electrode was stimulated from artifact size: neighbours clip at ±6 mV too. Use the plan's key mapping.
 - Keep the code lean: the user dislikes bloat and band-aids. Fix root causes, and say plainly when a fix is a heuristic.
-- Commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+- No AI attribution in commit messages or PR descriptions.
