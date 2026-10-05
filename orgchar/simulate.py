@@ -20,10 +20,6 @@ from .signals import FS, N_CH, block_of, samples
 class Organoid:
     noise_uV: float = 5.0
     spont_hz: dict = field(default_factory=lambda: {16: 2.0, 20: 4.0, 21: 2.0, 22: 3.0, 23: 2.5, 13: 1.0})
-    # (stim, rec) -> (max evoked spikes per pulse, amplitude at half max µA, slope µA)
-    evoked: dict = field(default_factory=lambda: {(21, 23): (1.0, 1.2, 0.25), (23, 21): (0.6, 1.5, 0.3),
-                                                  (15, 13): (0.8, 1.0, 0.2)})
-    depression: float = 0.15   # fractional drop of evoked probability per preceding pulse within 100 ms
     # (stim, rec) -> (shape, a, b, c): mean extra spikes 10-210 ms after a train of n pulses;
     # 'long': a / (1 + exp(-b (n - c))), 'short': a / (1 + exp(b (n - c))), 'band': a exp(-(n - b)^2 / 2c^2)
     after_train: dict = field(default_factory=dict)
@@ -31,9 +27,8 @@ class Organoid:
 
 
 def demo_organoid() -> Organoid:
-    """The organoid `--simulate` runs on: the default one plus one falling, one peaked and one rising
-    after-train response (stim 5, 13, 21), so every step, including the FuncSolver curve, has
-    something to find."""
+    """The organoid `--simulate` runs on: one falling, one peaked and one rising after-train response
+    (stim 5, 13, 21), so the screen and the curve have something to find."""
     return Organoid(spont_hz={16: 2.0, 20: 4.0, 21: 2.0, 22: 3.0, 23: 2.5, 13: 1.0, 3: 3.0, 10: 3.0},
                     after_train={(5, 3): ("band", 8, 10, 3.5), (13, 10): ("short", 8, 0.6, 9),
                                  (21, 22): ("long", 10, 0.5, 10)})
@@ -83,17 +78,6 @@ def record(org: Organoid, duration_s: float, pulses: list[tuple[int, int, float,
     for c, hz in org.spont_hz.items():  # bursty spontaneous firing (gamma-distributed intervals)
         t = np.cumsum(rng.gamma(0.5, 1.0 / (0.5 * hz), size=int(hz * duration_s * 3) + 10))
         trains[c] = list((t[t < duration_s - 0.01] * FS).astype(int))
-    recent = {}
-    for s, e, amp, ph in sorted(pulses):
-        for (se, rc), (pmax, a50, slope) in org.evoked.items():
-            if se != e:
-                continue
-            lam = pmax / (1 + np.exp(-(amp * ph / 100.0 - a50) / slope))
-            prev = [p for p in recent.get(e, []) if s - p < samples(100)]
-            lam *= (1 - org.depression) ** len(prev)
-            for _ in range(rng.poisson(lam)):
-                trains.setdefault(rc, []).append(s + samples(7.0 + rng.gamma(2.0, 2.5)))
-        recent.setdefault(e, []).append(s)
     if org.after_train:  # trains = runs of pulses on one electrode less than 20 ms apart
         by_e = {}
         for s, e, *_ in sorted(pulses):

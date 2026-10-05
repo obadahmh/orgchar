@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from . import funcsolver as F
+from . import protocol as P
 from .report import BLUE, CHECK_BAD, CHECK_OK, CHECK_WARN, GREY, INK, MUTED, ORANGE, _icon, _page, _svg
 
 GRADE = {"good": ("✓", "#0ca30c", "Good"), "fair": ("◐", "#d69300", "Fair"),
@@ -296,7 +297,7 @@ def _shape_maps(pairs, stims):
                            + (f"<text x='{x + cs / 2}' y='{y + cs / 2 + 5}' font-size='14' text-anchor='middle' "
                               f"fill='white' font-weight='700'>{F.SHAPE_SYMBOL[shp]}</text>" if shp else "") + "</g>")
         svg.append("</svg>")
-        out.append(f"<figure><figcaption>Organoid {o + 1} (e{8 * o}–e{8 * o + 7})</figcaption>{''.join(svg)}</figure>")
+        out.append(f"<figure><figcaption>Organoid {o} (e{8 * o}–e{8 * o + 7})</figcaption>{''.join(svg)}</figure>")
     legend = " ".join(f"<span style='display:inline-block;width:12px;height:12px;border-radius:3px;background:{SHAPE_COLOUR[k]};"
                       f"vertical-align:-1px'></span> {F.SHAPE_SYMBOL[k]} {SHAPE_NAME[k]}" for k in F.ROLES)
     return f"<p class=note>{legend} &nbsp;·&nbsp; white: tested, no shape &nbsp;·&nbsp; grey: not stimulated</p><div class=maps>{''.join(out)}</div>"
@@ -338,7 +339,7 @@ def screen_page(path, plan, r, problems, when):
     best, stims = r["best"], plan["stims"]
     body = [f"<h1>{html.escape(fs)} · after-train screen</h1>",
             f"<p class=meta>{html.escape(when)}{' · SIMULATED' if sim else ''} · every electrode of organoid(s) "
-            f"{', '.join(str(o + 1) for o in sorted({e // 8 for e in stims}))} · trains of {', '.join(map(str, levels))} "
+            f"{', '.join(str(o) for o in sorted({e // 8 for e in stims}))} · trains of {', '.join(map(str, levels))} "
             f"pulses, {plan['ipi_ms']:g} ms apart, {plan['amplitude_uA']} µA × {plan['phase_us']:g} µs · "
             f"{r['n_trials']} trains</p>"]
     if r["curve_stims"]:
@@ -371,7 +372,8 @@ def screen_page(path, plan, r, problems, when):
                 "useful if single trials differ. <b>Single trial wins</b>: how often one trial at the length that should "
                 "give more events (2 pulses for falling, 20 for rising, the middle for peaked) beats one at the length "
                 "that should give fewer. 50% = no difference, 100% = always. A pair counts as a candidate at p &lt; "
-                f"{F.SCOUT_MAX_P:g} (one-sided rank test) and ≥ {F.SCOUT_MIN_EVENTS:g} events apart. The curve step then "
+                f"{F.SCOUT_MAX_P:g} (one-sided rank test) and ≥ {F.SCOUT_MIN_EVENTS:g} events apart, unless a pair "
+                "from another organoid (which cannot respond) does as well on the same recording electrode. The curve step then "
                 "measures the full curve for the chosen electrodes and checks it on new trials.</p>")
     c = r["controls"]
     body.append("<h2>Checks</h2><ul class=checks>")
@@ -379,18 +381,24 @@ def screen_page(path, plan, r, problems, when):
                 + (f"<b>Incomplete:</b> {html.escape('; '.join(problems))}." if problems
                    else f"All {len(plan['segments'])} recordings complete.") + "</span></li>")
     ok = r["verdict"] != "CONTROLS_FAILED"
+    into = c.get("passing_into", [])
     body.append(f"<li>{_icon(CHECK_OK if ok else CHECK_BAD)}<span>Negative controls: {c['cross_organoid_passing']} of "
-                f"{c['cross_organoid_pairs']} other-organoid pairs pass (about {c['expected_by_chance']:g} expected by "
-                "chance; a train cannot reach another organoid).</span></li>")
+                f"{c['cross_organoid_pairs']} other-organoid pairs pass (a train cannot reach another organoid; "
+                f"p &lt; {F.SCOUT_MAX_P:g} alone would let up to about {c['nominal_ceiling']:g} through)"
+                + (f", into e{', e'.join(map(str, into))}" if into else "") + ".</span></li>")
+    for x in r.get("chance", []):
+        body.append(f"<li>{_icon(CHECK_WARN)}<span>Dropped: e{x['stim']}→e{x['rec']} {SHAPE_NAME[x['role']]}. "
+                    f"e{x['beaten_by']}→e{x['rec']}, from another organoid, did at least as well on e{x['rec']}, "
+                    "so chance explains it.</span></li>")
     bad = [p for p in r["pairs"] if not p["artifact_ok"]]
     body.append(f"<li>{_icon(CHECK_OK if not bad else CHECK_WARN)}<span>Stimulation artifact gone 10 ms after the train"
                 + (" on every pair." if not bad else f": not on {len(bad)} pair(s), which were excluded.") + "</span></li>")
     body.append(f"<li>{_icon(CHECK_OK)}<span>Sham correction from {c['sham_trials']} no-current trials.</span></li></ul>")
     body.append("<h2>Next step</h2>")
     if r["curve_stims"]:
+        mins = P.plan_duration_s(P.plan_funcsolver(r["curve_stims"])) / 60
         body.append(f"<pre class=cmd>./orgchar.sh curve --fsname {html.escape(fs)}</pre><p class=note>Same as "
-                    f"<code>--stims {','.join(map(str, r['curve_stims']))}</code>. About "
-                    f"{20 + 10 * len(r['curve_stims'])}–{30 + 15 * len(r['curve_stims'])} min.</p>")
+                    f"<code>--stims {','.join(map(str, r['curve_stims']))}</code>. About {mins:.0f} min.</p>")
     else:
         body.append("<p>Nothing for FuncSolver with these trains. Options: more current (<code>--amplitude 3</code>), "
                     "or re-check the census: the organoids may be quiet today.</p>")

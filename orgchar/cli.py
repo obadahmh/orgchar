@@ -1,11 +1,11 @@
 """orgchar: weekly characterisation of FinalSpark organoids.
 
-    orgchar census --fsname fs652          # 5 min, no stimulation: which organoids fire?
-    orgchar screen --fsname fs652          # 15-30 min: which electrodes give FuncSolver's shapes after trains?
-    orgchar curve  --fsname fs652          # ~30 min: FuncSolver curves (2-20 pulse trains) -> calibration.json
+    orgchar census --fsname fs652          # ~8 min, no stimulation: which organoids fire?
+    orgchar screen --fsname fs652          # ~40 min: which electrodes give FuncSolver's shapes after trains?
+    orgchar curve  --fsname fs652          # 40-65 min: FuncSolver curves (2-20 pulse trains) -> calibration.json
+    orgchar status [--fsname fs652]        # where each organoid stands (default: every organoid run this week)
     orgchar analyze <step dir>             # re-run the analysis of a finished step, offline
-    orgchar status --fsname fs652          # what has been done for this organoid
-    orgchar codetest --fsname fs652        # 1 min: check that train codes (--codes) are safe and readable
+    orgchar codetest --fsname fs652        # ~3 min: check that train codes (--codes) are safe and readable
 
 Add --dry-run to see the plan and its duration without touching hardware, --simulate to run the
 whole step on a synthetic organoid.
@@ -16,10 +16,11 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import sys
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import h5py
@@ -32,8 +33,14 @@ from . import protocol as P
 from . import report as R
 
 HOME = Path(os.environ.get("ORGCHAR_HOME", Path(__file__).resolve().parents[1] / "sessions"))
+RAW_ROOT = Path("/mnt/s3-intanraws")   # where the platform saves every recording
 LOCKS = [Path.home() / ".orgchar.lock",
          Path.home() / "NeuralControlProgram/ResponseSweep/overnight_hardware.lock"]  # skipped if absent
+SHAPE = dict(short="falling", band="peaked", long="rising")
+# Results older than this are flagged and warned about: responses change within a day (fs666 e10's
+# 10-pulse reference fell from 22 to 8.5 events within one hour, 2 Oct 2026). Each fsname is one
+# preparation; FinalSpark replaces all four organoids at once, under a new fsname.
+STALE_H = 24.0
 
 
 def code_version() -> str:
@@ -107,6 +114,7 @@ def _describe(plan):
 
 def _execute(args, plan):
     """Create the step directory, run every segment, return (step_dir, segments)."""
+    from .backends import match_triggers
     stamp = _now().strftime("%Y%m%dT%H%M%S")
     step_dir = _org_dir(args.fsname, args.simulate) / f"{stamp}_{plan['step']}"
     step_dir.mkdir(parents=True)
@@ -130,7 +138,6 @@ def _execute(args, plan):
             tag = f"orgchar_{args.fsname}_{stamp}_{plan['step']}_{s['id']}"
             print(f"[{_now():%H:%M:%S}] segment {s['id']}")
             raw = backend.run_segment(s, seg_dir, tag)
-            from .backends import match_triggers
             sent_csv = seg_dir / "sent.csv"
             sent = pd.read_csv(sent_csv) if sent_csv.exists() and sent_csv.stat().st_size > 1 else None
             trials = match_triggers(s, raw, sent)
@@ -147,6 +154,19 @@ def _execute(args, plan):
     return step_dir, segs
 
 
+def _raw(seg_dir: Path) -> Path | None:
+    """The segment's recording: raw.h5 in the folder (simulations; hardware runs before 5 Oct 2026
+    copied it), else the file the platform saved on the S3 mount (remote_path.txt)."""
+    if (seg_dir / "raw.h5").exists():
+        return seg_dir / "raw.h5"
+    if not (seg_dir / "remote_path.txt").exists():
+        return None
+    p = Path((seg_dir / "remote_path.txt").read_text().strip())
+    if not p.exists():
+        sys.exit(f"Recording {p} is not reachable. Is {RAW_ROOT} mounted?")
+    return p
+
+
 def _segments_from_dir(step_dir: Path, plan: dict):
     """Segments with a recording. Trigger matching is redone from the raw file when trials.csv is
     missing (e.g. the step stopped at matching) so salvageable data can still be analysed."""
@@ -154,18 +174,19 @@ def _segments_from_dir(step_dir: Path, plan: dict):
     segs = []
     for s in plan["segments"]:
         sd = step_dir / s["id"]
-        if not (sd / "raw.h5").exists():
+        raw = _raw(sd)
+        if raw is None:
             continue
         t = sd / "trials.csv"
         if t.exists() and t.stat().st_size > 1:
             trials = pd.read_csv(t)
         elif s["events"]:
             sent = pd.read_csv(sd / "sent.csv") if (sd / "sent.csv").exists() and (sd / "sent.csv").stat().st_size > 1 else None
-            trials = match_triggers(s, sd / "raw.h5", sent)
+            trials = match_triggers(s, raw, sent)
             trials.to_csv(t, index=False)
         else:
             trials = pd.DataFrame()
-        segs.append((str(sd / "raw.h5"), trials))
+        segs.append((str(raw), trials))
     return segs
 
 
@@ -183,50 +204,27 @@ def analyse(step_dir: Path, plan: dict, segs) -> dict:
                          + (": " + ", ".join(f"e{c['channel']} {c['rate_hz']:.2f} Hz" for c in act) if act else ""))
         verdict = "GO: screen blocks " + ",".join(map(str, r["live_blocks"])) if r["live_blocks"] else \
             "NO-GO: no organoid is firing. Stimulation results would be artifact only. Re-check later or contact FinalSpark."
-        figs = R.census_figures(r)
-        table = pd.DataFrame(r["channels"]).drop(columns=["waveform"])
     elif step == "screen" and plan.get("mode") == "trains":
         r = F.scout(segs, plan)
-        names = dict(short="falling", band="peaked", long="rising")
         lines = [f"Trains of {', '.join(map(str, plan['levels']))} pulses on e{', e'.join(map(str, plan['stims']))}; "
                  "FuncSolver's readout (events 10-210 ms after the train)."]
         for role in F.ROLES:
             v = r["best"].get(role)
-            lines.append(f"{names[role]}: " + (f"e{v['stim']}→e{v['rec']} (a single trial wins {v['win']:.0%} of the time, "
+            lines.append(f"{SHAPE[role]}: " + (f"e{v['stim']}→e{v['rec']} (a single trial wins {v['win']:.0%} of the time, "
                                                f"{v['diff']:.1f} events apart; {v['n_candidates']} candidate pair(s))"
                                                if v else "no candidate"))
+        for x in r["chance"]:
+            lines.append(f"Dropped e{x['stim']}→e{x['rec']} {SHAPE[x['role']]}: e{x['beaten_by']}→e{x['rec']}, from "
+                         "another organoid, did as well.")
         c = r["controls"]
         lines.append(f"Controls: {c['cross_organoid_passing']} of {c['cross_organoid_pairs']} other-organoid pairs pass "
-                     f"(about {c['expected_by_chance']:g} expected by chance).")
+                     f"(p < {F.SCOUT_MAX_P:g} alone would let up to about {c['nominal_ceiling']:g} through).")
         if r["curve_stims"]:
             lines.append(f"Next: ./orgchar.sh curve --fsname {plan['fsname']}   (stimulates "
                          f"e{', e'.join(map(str, r['curve_stims']))})")
         verdict = r["verdict"]
-        figs, table = [], None
-    elif step == "screen":
-        r = A.screen(segs, window_ms=plan.get("window_ms", 30.0))
-        earlier_dir, earlier = _earlier_screen(step_dir)
-        Rt = A.classify(r["pairs"], earlier["pairs"] if earlier else None)
-        rec = A.recommend(Rt)
-        r["pairs"] = Rt.to_dict("records")
-        r["recommended_pairs"] = rec
-        r["earlier_screen"] = earlier_dir.name if earlier_dir else None
-        resp = Rt[Rt.responsive]
-        c = r["controls"]
-        n = {k: int((Rt.status == k).sum()) for k in ("Use", "Weak", "Check")}
-        lines = [f"{len(resp)} responsive pairs: {n['Use']} Use, {n['Weak']} Weak, {n['Check']} Check.",
-                 f"Controls: {c['cross_organoid_control']['significant_bonferroni']} of "
-                 f"{c['cross_organoid_control']['tests']} other-organoid pairs and "
-                 f"{c['sham_control']['significant_bonferroni']} of {c['sham_control']['tests']} sham pairs respond "
-                 "(must be 0)."]
-        if rec:
-            lines.append("Next: ./orgchar.sh curve --fsname " + plan["fsname"]
-                         + "   (pairs " + ", ".join(f"e{a}→e{b}" for a, b in rec) + ")")
-        verdict = r["verdict"]
-        figs, table = [], None
     elif step == "curve" and plan.get("vary") == "pulse_train":
         r = F.characterise(segs, plan)   # "_" keys stay out of result.json (report.to_json drops them)
-        chosen = r["_chosen"]
         lines = [f"Input: hardware trains of {', '.join(map(str, plan['levels']))} pulses, {plan['ipi_ms']:g} ms apart; "
                  f"output: events 10-210 ms after the train, minus the 500 ms before it and the sham mean."]
         for role in F.ROLES:
@@ -237,31 +235,14 @@ def analyse(step_dir: Path, plan: dict, segs) -> dict:
                 if v else "MISSING: no pair gives this curve"))
         verdict = {"ALL_ROLES": "ALL THREE FUNCTIONS FOUND", "SOME_ROLES": "SOME FUNCTIONS MISSING",
                    "NO_ROLES": "NO USABLE FUNCTION"}[r["verdict"]]
-        figs, table = [], None
-        cal = F.calibration(plan, plan["fsname"], f"{plan['fsname']}_{step_dir.name}", {int(k): v for k, v in r["thresholds_uV"].items()}, chosen, r["pairs"],
+        cal = F.calibration(plan, plan["fsname"], f"{plan['fsname']}_{step_dir.name}",
+                            {int(k): v for k, v in r["thresholds_uV"].items()}, r["_chosen"], r["pairs"],
                             code_version(), plan.get("backend") == "simulated", step_dir)
         (step_dir / "calibration.json").write_text(json.dumps(cal, indent=1, allow_nan=False))
         r["calibration"] = str(step_dir / "calibration.json")
-    elif step == "curve":
-        pairs = [tuple(p) for p in plan["pairs"]]
-        unit = "pulse" if plan["vary"] == "amplitude" else "train"
-        r = A.curve(segs, pairs, unit=unit)
-        r["vary"] = plan["vary"]
-        lines = [f"Input: {plan['vary']} at levels {plan['levels']}; output: evoked spikes per "
-                 f"{'pulse' if unit == 'pulse' else 'trial'} minus spontaneous expectation."]
-        fmt = lambda v, f: "n/a" if v is None else format(v, f)  # noqa: E731
-        for p in r["pairs"]:
-            lines.append(f"e{p['stim']}→e{p['rec']}: {'USABLE' if p['usable'] else 'not usable'}; "
-                         f"dynamic range {p['dynamic_range']:.2f}, trial SD {p['mean_trial_sd']:.2f}, "
-                         f"split-half ρ {fmt(p['split_half_spearman'], '.2f')}, "
-                         f"top level vs sham p={fmt(p['top_vs_sham_p'], '.2g')}")
-        verdict = r["verdict"]
-        figs = R.curve_figures(r)
-        table = pd.DataFrame([dict(stim=p["stim"], rec=p["rec"], level=l["level"], mean=l["mean"], sem=l["sem"],
-                                   n=l["count"]) for p in r["pairs"] for l in p["levels"]])
-        _write_card(step_dir, plan, r)
     else:
-        raise ValueError(step)
+        sys.exit(f"{step_dir.name}: {step} mode '{plan.get('mode') or plan.get('vary')}' was removed on 5 Oct 2026; "
+                 "its report.html and result.json stay as they were.")
     problems = _completeness_problems(step_dir, plan, r)
     r["incomplete"] = bool(problems)
     if problems:
@@ -272,21 +253,20 @@ def analyse(step_dir: Path, plan: dict, segs) -> dict:
     lines.append(f"Acquired with orgchar {plan.get('code_version', 'unknown (before versioning)')}; "
                  f"analysed with {r['code_version']}.")
     (step_dir / "result.json").write_text(R.to_json(r))
-    if step == "screen" and plan.get("mode") == "trains":
-        from . import report_funcsolver as RF
-        RF.screen_page(step_dir / "report.html", plan, r, problems, _when(step_dir))
-    elif step == "screen":
-        R.screen_page(step_dir / "report.html", r, Rt, _screen_context(step_dir, plan, segs, r, problems))
-    elif step == "curve" and plan.get("vary") == "pulse_train":
-        from . import report_funcsolver as RF
-        RF.page(step_dir / "report.html", plan, r, problems, _when(step_dir))
-        if not problems and plan.get("backend") != "simulated" and r["verdict"] == "ALL_ROLES":
-            latest = step_dir.parent / "calibration_latest.json"
-            latest.write_text((step_dir / "calibration.json").read_text())
-            lines.append(f"FuncSolver calibration: {latest}")
+    if step == "census":
+        title = f"{plan['fsname']} · census · {_when(step_dir)}" + (" · SIMULATED" if plan.get("backend") == "simulated" else "")
+        R.write_html(step_dir / "report.html", title, verdict, lines, R.census_figures(r),
+                     pd.DataFrame(r["channels"]).drop(columns=["waveform"]))
     else:
-        title = f"{plan['fsname']} · {step} · {_when(step_dir)}" + (" · SIMULATED" if plan.get("backend") == "simulated" else "")
-        R.write_html(step_dir / "report.html", title, verdict, lines, figs, table)
+        from . import report_funcsolver as RF
+        if step == "screen":
+            RF.screen_page(step_dir / "report.html", plan, r, problems, _when(step_dir))
+        else:
+            RF.page(step_dir / "report.html", plan, r, problems, _when(step_dir))
+            if not problems and plan.get("backend") != "simulated" and r["verdict"] == "ALL_ROLES":
+                latest = step_dir.parent / "calibration_latest.json"
+                latest.write_text((step_dir / "calibration.json").read_text())
+                lines.append(f"FuncSolver calibration: {latest}")
     print("\n" + verdict)
     for s in lines:
         print("  " + s)
@@ -294,51 +274,22 @@ def analyse(step_dir: Path, plan: dict, segs) -> dict:
     return r
 
 
-def _when(step_dir: Path) -> str:
+def _stamp(name: str) -> datetime | None:
     try:
-        return datetime.strptime(step_dir.name[:15], "%Y%m%dT%H%M%S").strftime("%d %b %Y %H:%M UTC")
+        return datetime.strptime(name[:15], "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
     except ValueError:
-        return step_dir.name
+        return None
 
 
-def _earlier_screen(step_dir: Path):
-    """Most recent screen of the same organoid before this one (complete or not: its analysed
-    segments are still valid evidence for reproducibility)."""
-    earlier = sorted(p for p in step_dir.parent.glob("*_screen") if p.name < step_dir.name and (p / "result.json").exists()
-                     and json.loads((p / "result.json").read_text()).get("mode") != "trains")
-    if not earlier:
-        return None, None
-    return earlier[-1], json.loads((earlier[-1] / "result.json").read_text())
-
-
-def _screen_context(step_dir: Path, plan: dict, segs, r: dict, problems: list[str]) -> dict:
-    notes = pd.concat([t.get("note", pd.Series(dtype=str)) for _, t in segs if len(t)]) if segs else pd.Series(dtype=str)
-    excl = pd.concat([t.get("exclude", pd.Series(dtype=bool)) for _, t in segs if len(t)]) if segs else pd.Series(dtype=bool)
-    stims = sorted({int(e) for s in plan["segments"] for e in s["electrodes"]})
-    blocks = sorted({e // 8 for e in stims})
-    return dict(fsname=plan["fsname"], when=_when(step_dir), code=r.get("code_version", "unknown"),
-                simulated=plan.get("backend") == "simulated", problems=problems,
-                n_segments=len(plan["segments"]),
-                stimulus=(f"{plan.get('amplitude_uA')} µA × {plan.get('phase_us'):g} µs, {plan.get('polarity')}, "
-                          f"{plan.get('reps')} pulses per electrode, organoid{'s' if len(blocks) > 1 else ''} "
-                          + ", ".join(map(str, blocks))),
-                gaps=int((notes == "before recording gap").sum()), excluded=int(excl.fillna(False).astype(bool).sum()),
-                recommended=[tuple(p) for p in r.get("recommended_pairs", [])],
-                earlier=r.get("earlier_screen"))
+def _when(step_dir: Path) -> str:
+    t = _stamp(step_dir.name)
+    return t.strftime("%d %b %Y %H:%M UTC") if t else step_dir.name
 
 
 def _close_status(seg_dir: Path) -> dict | None:
-    """How the segment's recording was closed. Retries that ended in success are not a problem.
-    Segments recorded before close_status.json existed only have cleanup_errors.txt (3 failed stop
-    attempts = stop failed; a 'final disable' line = disable failed)."""
+    """How the segment's recording was closed (close_status.json, written by the hardware backend)."""
     f = seg_dir / "close_status.json"
-    if f.exists():
-        return json.loads(f.read_text())
-    old = seg_dir / "cleanup_errors.txt"
-    if old.exists():
-        t = old.read_text()
-        return dict(stop_ok="stop recording attempt 3" not in t, disable_ok="final disable" not in t)
-    return None
+    return json.loads(f.read_text()) if f.exists() else None
 
 
 def _completeness_problems(step_dir: Path, plan: dict, r: dict) -> list[str]:
@@ -346,12 +297,12 @@ def _completeness_problems(step_dir: Path, plan: dict, r: dict) -> list[str]:
     problems = []
     for s in plan["segments"]:
         st = _close_status(step_dir / s["id"])
-        raw = step_dir / s["id"] / "raw.h5"
+        raw = _raw(step_dir / s["id"])
         # a segment that uploaded no stimulation (census) has nothing to disable: an unanswered
         # final disable there is not a problem (it starts with an acknowledged disable)
         if st and not st["disable_ok"] and s["electrodes"]:
             problems.append(f"final 'disable all stimulation' failed for segment {s['id']}")
-        if not raw.exists():
+        if raw is None:
             problems.append(f"segment {s['id']} has no recording")
             continue
         # a stop without acknowledgement is fine if the file holds the whole segment
@@ -362,22 +313,117 @@ def _completeness_problems(step_dir: Path, plan: dict, r: dict) -> list[str]:
     return problems
 
 
-def _write_card(step_dir, plan, r):
-    """The dated operating card FuncSolver should read: only this week's usable curves."""
-    card = dict(fsname=plan["fsname"], created_utc=_now().isoformat(), source=str(step_dir),
-                backend=plan.get("backend"), vary=plan["vary"], levels=plan["levels"],
-                stimulation=dict(amplitude_uA=plan.get("amplitude_uA"), phase_us=plan.get("phase_us"),
-                                 polarity=plan.get("polarity"), ipi_ms=plan.get("ipi_ms")),
-                readout=dict(window_ms=r["window_ms"], threshold="-5 x robust noise, 300-3000 Hz",
-                             artifact="per-electrode median template subtraction + adaptive blank",
-                             output="evoked spikes per " + r["unit"] + " (spontaneous expectation subtracted)"),
-                usable_pairs=[{k: v for k, v in p.items()} for p in r["pairs"] if p["usable"]],
-                all_pairs=r["pairs"],
-                valid_until_note="Valid for this preparation and week only. Re-run screen on these electrodes "
-                                 "before each FuncSolver session; re-run the full workflow after any medium change.")
-    txt = R.to_json(card)
-    (step_dir / "card.json").write_text(txt)
-    (step_dir.parent / "card_latest.json").write_text(txt)
+# ------------------------------------------------------------------------------ status
+
+def _age_h(step_dir: Path) -> float:
+    """Hours since the step was recorded (from its folder name: re-analysing it does not reset this)."""
+    return (_now() - _stamp(step_dir.name)).total_seconds() / 3600
+
+
+def _ago(step_dir: Path) -> str:
+    h = _age_h(step_dir)
+    return (f"{h:.0f} h ago" if h < 48 else f"{h / 24:.0f} days ago") + (", STALE" if h > STALE_H else "")
+
+
+def _runs_on_platform() -> dict[str, set[str]]:
+    """{fsname: {'<stamp>_<step>', ...}} for every orgchar recording on the S3 mount, whichever
+    machine ran it."""
+    out = {}
+    try:
+        names = os.listdir(RAW_ROOT)
+    except OSError:
+        return out
+    for n in names:
+        m = re.match(r"\d{8}_\d{6}_orgchar_(.+?)_(\d{8}T\d{6})_(census|screen|curve|codetest)_", n)
+        if m:
+            out.setdefault(m[1], set()).add(f"{m[2]}_{m[3]}")
+    return out
+
+
+def _status(fs: str, simulate: bool, elsewhere: set[str]) -> list[str]:
+    """Where one organoid stands: the latest complete census, screen and curve, the best pair found
+    so far for each FuncSolver function, the calibration, and runs whose results are elsewhere."""
+    d = _org_dir(fs, simulate)
+    runs = sorted(p for p in d.glob("*_*") if p.is_dir() and _stamp(p.name)) if d.exists() else []
+    res = {p: json.loads((p / "result.json").read_text()) for p in runs if (p / "result.json").exists()}
+    done = [p for p in runs if p in res and not res[p].get("incomplete")]
+    out = [fs + (" (SIMULATED)" if simulate else "")]
+
+    def head(label, p, extra=""):
+        out.append(f"  {label:7s} {_when(p)} ({_ago(p)}){extra}")
+
+    census = [p for p in done if p.name.endswith("_census")]
+    if census:
+        c = res[census[-1]]
+        head("census", census[-1])
+        orgs = []
+        for b in c["blocks"]:
+            act = [x for x in c["channels"] if x["block"] == b["block"] and x["active"]]
+            orgs.append(f"e{8 * b['block']}-{8 * b['block'] + 7}: " + (
+                f"{len(act)} active, {sum(x['rate_hz'] for x in act):.1f} Hz" if act else "silent"))
+        out.append("          " + " · ".join(orgs))
+    screens = [p for p in done if p.name.endswith("_screen") and res[p].get("mode") == "trains"]
+    if screens:
+        s = res[screens[-1]]
+        head("screen", screens[-1])
+        parts = []
+        for role in F.ROLES:
+            v = s["best"].get(role)
+            dropped = ", ".join(f"e{x['stim']}→e{x['rec']}" for x in s.get("chance", []) if x["role"] == role)
+            n = v["n_candidates"] if v else 0
+            parts.append(f"{SHAPE[role]} " + (f"e{v['stim']}→e{v['rec']} ({n} pair{'s' * (n != 1)})" if v else "none")
+                         + (f" ({dropped} dropped as chance)" if dropped else ""))
+        out.append("          " + " · ".join(parts)
+                   + ("" if "chance" in s else f"  [analysed before the chance check: ./orgchar.sh analyze "
+                                               f"{os.path.relpath(screens[-1], Path(__file__).resolve().parents[1])}]"))
+    curves = [p for p in done if p.name.endswith("_curve") and res[p].get("readout") == "after_train"]
+    if curves:
+        head("curve", curves[-1], f": {res[curves[-1]]['verdict_text']}")
+        tried = sorted({e for p in curves for e in json.loads((p / "plan.json").read_text())["stims"]})
+        for role in F.ROLES:
+            found = [p for p in curves if role in res[p]["roles"]]
+            if found:
+                v = res[found[-1]]["roles"][role]
+                r2 = "–" if v.get("conf_r2") is None else f"{v['conf_r2']:.2f}"
+                out.append(f"          {SHAPE[role]:8s} e{v['stim']}→e{v['rec']} {v['grade'].capitalize()}, R² {r2} on new "
+                           "trials" + ("" if found[-1] == curves[-1] else f" (curve of {_when(found[-1])}, {_ago(found[-1])})"))
+            else:
+                out.append(f"          {SHAPE[role]:8s} missing (stimulated so far: e{', e'.join(map(str, tried))})")
+    if not (census or screens or curves):
+        out.append("  no complete census, screen or curve on this machine")
+    cal = d / "calibration_latest.json"
+    if cal.exists():
+        src = json.loads(cal.read_text())["source"]["step"]
+        out.append(f"  FuncSolver: {cal} (from {Path(src).name}, {_ago(Path(src))})")
+    elif curves:
+        out.append("  FuncSolver: no calibration_latest.json" + (" (simulated runs never write one)" if simulate else
+                                                               " yet (written when one complete curve finds all three functions)"))
+    if runs:
+        last = runs[-1]
+        v = res[last].get("verdict_text", "?") if last in res else (
+            "stopped before analysis, see error.txt" if (last / "error.txt").exists() else "no result")
+        out.append(f"  last run: {last.name}: {v[:110]}{'…' if len(v) > 110 else ''}")
+    other = sorted(elsewhere - {p.name for p in runs})
+    if other:
+        out.append(f"  {len(other)} run(s) recorded by another machine (results are there), last {other[-1]}")
+    return out
+
+
+def cmd_status(a):
+    remote = {} if a.simulate else _runs_on_platform()
+    if a.fsname:
+        names = [a.fsname]
+    else:
+        week = (_now() - timedelta(days=7)).strftime("%Y%m%dT%H%M%S")
+        prefix = "SIMULATED_" if a.simulate else ""
+        local = {d.name[len(prefix):] for d in HOME.glob(f"{prefix}*") if d.is_dir()
+                 and (a.simulate or not d.name.startswith("SIMULATED_"))
+                 and any(p.name >= week for p in d.glob("*_*") if p.is_dir())}
+        names = sorted(local | {fs for fs, runs in remote.items() if max(runs) >= week})
+        if not names:
+            print("No organoid was run in the last 7 days. Use --fsname for an older one.")
+    for fs in names:
+        print("\n".join(_status(fs, a.simulate, remote.get(fs, set()))) + "\n")
 
 
 # ------------------------------------------------------------------------------ commands
@@ -398,7 +444,7 @@ def cmd_screen(a):
         d, c = _latest(a.fsname, a.simulate, "census")
         if c is None:
             sys.exit("No census for this organoid yet. Run `orgchar census` first, or pass --blocks.")
-        age_h = (time.time() - (d / "result.json").stat().st_mtime) / 3600
+        age_h = _age_h(d)
         if c.get("incomplete"):
             sys.exit(f"Latest census ({d.name}) is INCOMPLETE ({c.get('verdict_text', '')[:120]}...). "
                      "Re-run the census, or pass --blocks explicitly.")
@@ -407,18 +453,12 @@ def cmd_screen(a):
                      "artifact. Re-run census later, or pass --blocks explicitly to override.")
         blocks = c["live_blocks"]
         print(f"Using live blocks {blocks} from census {d.name} ({age_h:.1f} h old).")
-        if age_h > 24:
-            print("  Warning: census is more than 24 h old; consider re-running it.")
-    if a.mode == "trains":
-        plan = P.plan_train_screen(blocks=blocks, electrodes=electrodes,
-                                   counts=[int(x) for x in a.levels.split(",")] if a.levels else P.SCREEN_COUNTS,
-                                   amplitude_uA=a.amplitude, phase_us=a.phase, polarity=a.polarity,
-                                   reps=a.reps if a.reps is not None else 6, seed=int(time.time()))
-    else:
-        reps = a.reps if a.reps is not None else 30
-        plan = P.plan_screen(blocks=blocks, electrodes=electrodes, amplitude_uA=a.amplitude, phase_us=a.phase,
-                             polarity=a.polarity, reps=reps, sham_reps=reps, seed=int(time.time()))
-        plan["window_ms"] = a.window
+        if age_h > STALE_H:
+            print(f"  Warning: census is more than {STALE_H:.0f} h old; consider re-running it.")
+    plan = P.plan_train_screen(blocks=blocks, electrodes=electrodes,
+                               counts=[int(x) for x in a.levels.split(",")] if a.levels else P.SCREEN_COUNTS,
+                               amplitude_uA=a.amplitude, phase_us=a.phase, polarity=a.polarity, reps=a.reps,
+                               seed=int(time.time()))
     if _use_codes(a):
         plan = P.add_train_codes(plan)
     _describe(plan)
@@ -428,69 +468,28 @@ def cmd_screen(a):
     analyse(step_dir, json.loads((step_dir / "plan.json").read_text()), segs)
 
 
-def _screen_pairs(a):
-    """Recommended pairs of the latest single-pulse screen (used by --mode pulses/amplitude)."""
-    org = _org_dir(a.fsname, a.simulate)
-    runs = [r for r in sorted(org.glob("*_screen/result.json"), reverse=True) if json.loads(r.read_text()).get("mode") != "trains"]
-    d, s = (runs[0].parent, json.loads(runs[0].read_text())) if runs else (None, None)
-    if s is None:
-        sys.exit("No screen for this organoid yet. Run `orgchar screen` first, or pass --stims / --pairs.")
-    if s.get("incomplete"):
-        sys.exit(f"Latest screen ({d.name}) is INCOMPLETE. Re-run it, or pass --stims / --pairs explicitly.")
-    rec = s.get("recommended_pairs")
-    if rec is None:  # screens analysed before recommendations existed
-        rec = A.recommend(A.classify(s["pairs"]))
-    if not rec:
-        sys.exit(f"Latest screen ({d.name}) has no pair with status Use. Pass --stims / --pairs explicitly.")
-    return d, rec
-
-
 def cmd_curve(a):
-    if a.mode == "funcsolver":
-        if a.stims:
-            stims = [int(x) for x in a.stims.split(",")]
-        else:
-            d, s = _latest(a.fsname, a.simulate, "screen")
-            if s is not None and s.get("mode") == "trains":
-                if s.get("incomplete"):
-                    sys.exit(f"Latest screen ({d.name}) is INCOMPLETE. Re-run it, or pass --stims.")
-                stims = s.get("curve_stims") or []
-                if not stims:
-                    sys.exit(f"Latest screen ({d.name}) found no electrode giving a falling, peaked or rising "
-                             "response after trains. Nothing for FuncSolver; pass --stims to try anyway.")
-                names = dict(short="falling", band="peaked", long="rising")
-                print(f"Stimulating e{', e'.join(map(str, stims))}, the screen's best candidates ("
-                      + ", ".join(f"{names[k]}: e{v['stim']}→e{v['rec']}" for k, v in s["best"].items())
-                      + f"; {d.name}). Every other electrode of each organoid is measured.")
-            else:   # a single-pulse screen: its recommended stimulating electrodes
-                d, rec = _screen_pairs(a)
-                stims = list(dict.fromkeys(e for e, _ in rec))[:a.max_stims]
-                print(f"Stimulating e{', e'.join(map(str, stims))} (single-pulse screen {d.name}; the after-train "
-                      "screen chooses better: ./orgchar.sh screen). Every other electrode of each organoid is measured.")
-        counts = [int(x) for x in (a.levels or ",".join(map(str, P.FUNCSOLVER_COUNTS))).split(",")]
-        plan = P.plan_funcsolver(stims, counts=counts, ipi_ms=a.ipi if a.ipi is not None else 10.0,
-                                 amplitude_uA=a.amplitude, phase_us=a.phase, polarity=a.polarity,
-                                 reps=a.reps if a.reps is not None else 10, seed=int(time.time()))
+    if a.stims:
+        stims = [int(x) for x in a.stims.split(",")]
     else:
-        if a.pairs:
-            pairs = [tuple(int(v) for v in p.split(":")) for p in a.pairs.split(",")]
-        else:
-            d, rec = _screen_pairs(a)
-            keep = list(dict.fromkeys(e for e, _ in rec))[:a.max_stims]
-            pairs = [tuple(p) for p in rec if p[0] in keep]
-            print(f"Using the recommended pairs from screen {d.name}: " + ", ".join(f"e{e}→e{c}" for e, c in pairs))
-        stims = sorted({e for e, _ in pairs})
-        reps = a.reps if a.reps is not None else 20
-        if a.mode == "pulses":
-            levels = [int(x) for x in (a.levels or "1,2,4,6,8,10").split(",")]
-            plan = P.plan_curve_pulses(stims, levels=levels, ipi_ms=a.ipi if a.ipi is not None else 30.0,
-                                       amplitude_uA=a.amplitude, phase_us=a.phase, polarity=a.polarity, reps=reps,
-                                       sham_reps=reps, seed=int(time.time()))
-        else:
-            levels = [float(x) for x in (a.levels or "0.5,1,1.5,2,3").split(",")]
-            plan = P.plan_curve_amplitude(stims, levels=levels, phase_us=a.phase, polarity=a.polarity,
-                                          reps_per_pass=max(10, -(-reps // 3)), passes=3, seed=int(time.time()))
-        plan["pairs"] = pairs
+        d, s = _latest(a.fsname, a.simulate, "screen")
+        if s is None or s.get("mode") != "trains":
+            sys.exit("No after-train screen for this organoid yet. Run `orgchar screen` first, or pass --stims.")
+        if s.get("incomplete"):
+            sys.exit(f"Latest screen ({d.name}) is INCOMPLETE. Re-run it, or pass --stims.")
+        stims = s.get("curve_stims") or []
+        if not stims:
+            sys.exit(f"Latest screen ({d.name}) found no electrode giving a falling, peaked or rising "
+                     "response after trains. Nothing for FuncSolver; pass --stims to try anyway.")
+        print(f"Stimulating e{', e'.join(map(str, stims))}, the screen's best candidates ("
+              + ", ".join(f"{SHAPE[k]}: e{v['stim']}→e{v['rec']}" for k, v in s["best"].items())
+              + f"; {d.name}). Every other electrode of each organoid is measured.")
+        if _age_h(d) > STALE_H:
+            print(f"  Warning: this screen is {_age_h(d):.0f} h old and responses change within a day; "
+                  "consider re-running it.")
+    counts = [int(x) for x in (a.levels or ",".join(map(str, P.FUNCSOLVER_COUNTS))).split(",")]
+    plan = P.plan_funcsolver(stims, counts=counts, ipi_ms=a.ipi, amplitude_uA=a.amplitude, phase_us=a.phase,
+                             polarity=a.polarity, reps=a.reps, seed=int(time.time()))
     if _use_codes(a):
         plan = P.add_train_codes(plan)
     _describe(plan)
@@ -521,8 +520,7 @@ def cmd_codetest(a):
         stims = [int(x) for x in a.electrodes.split(",")]
     else:
         d, s = _latest(a.fsname, a.simulate, "screen")
-        rec = (s or {}).get("recommended_pairs") or []
-        stims = list(dict.fromkeys(e for e, _ in rec))[:4]
+        stims = (s or {}).get("curve_stims") or []
         if not stims:   # no screen yet (e.g. a new organoid): one electrode per organoid
             stims = [2, 10, 18, 26]
             print("No screen of this organoid yet; using e2, e10, e18, e26 (one per organoid). The codetest checks "
@@ -590,20 +588,6 @@ def cmd_analyze(a):
     analyse(step_dir, plan, _segments_from_dir(step_dir, plan))
 
 
-def cmd_status(a):
-    for sim in (False, True):
-        d = _org_dir(a.fsname, sim)
-        if not d.exists():
-            continue
-        print(("SIMULATED " if sim else "") + str(d))
-        for r in sorted(d.glob("*/result.json")):
-            v = json.loads(r.read_text()).get("verdict_text", "?")
-            print(f"  {r.parent.name:32s} {v}")
-        if (d / "card_latest.json").exists():
-            c = json.loads((d / "card_latest.json").read_text())
-            print(f"  card_latest.json: {len(c['usable_pairs'])} usable pair(s), from {Path(c['source']).name}")
-
-
 def cmd_disable(a):
     """Send only 'disable all stimulation' (the platform uploads internally). Safe; also a quick test
     of whether the board currently accepts uploads."""
@@ -646,50 +630,38 @@ def main(argv=None):
         p.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
         p.add_argument("--operator", default="admin", help="booking e-mail for the trigger controller")
 
+    def stimulus(p):
+        p.add_argument("--amplitude", type=float, default=2.0)
+        p.add_argument("--phase", type=float, default=100.0)
+        p.add_argument("--polarity", default="negative-first", choices=["negative-first", "positive-first"])
+        p.add_argument("--codes", action=argparse.BooleanOptionalAction, default=None,
+                       help="train codes (keys 8-14) so the recording identifies each train "
+                            "(default: on once codetest has passed on this machine)")
+
     p = sub.add_parser("census", help="spontaneous activity, no stimulation")
     common(p)
     p.add_argument("--duration", type=float, default=300.0)
     p.set_defaults(func=cmd_census)
 
-    p = sub.add_parser("screen", help="which electrodes give FuncSolver's shapes after trains (default), or "
-                                      "which pairs respond to single pulses (--mode single)")
+    p = sub.add_parser("screen", help="which electrodes give FuncSolver's shapes after trains of 2, 6, 12, 20 pulses")
     common(p)
-    p.add_argument("--mode", default="trains", choices=["trains", "single"],
-                   help="trains (default): trains of 2,6,12,20 pulses on every electrode, FuncSolver's readout; "
-                        "single: the earlier single-pulse screen")
-    p.add_argument("--levels", help="trains mode: train lengths, default 2,6,12,20")
+    stimulus(p)
+    p.add_argument("--levels", help="train lengths, default 2,6,12,20")
     p.add_argument("--blocks", help="e.g. 1,2 (default: live blocks from latest census)")
     p.add_argument("--electrodes", help="subset, e.g. 21,15 (quick re-check before a session)")
-    p.add_argument("--amplitude", type=float, default=2.0)
-    p.add_argument("--phase", type=float, default=100.0)
-    p.add_argument("--polarity", default="negative-first", choices=["negative-first", "positive-first"])
-    p.add_argument("--reps", type=int, default=None, help="trials per electrode and length (trains: 6; single: 30)")
-    p.add_argument("--window", type=float, default=30.0, help="single mode: ms after each pulse in which spikes count")
-    p.add_argument("--codes", action=argparse.BooleanOptionalAction, default=None,
-                   help="train codes (keys 8-14) so the recording identifies each train "
-                        "(default: on once codetest has passed on this machine)")
+    p.add_argument("--reps", type=int, default=6, help="trials per electrode and length")
     p.set_defaults(func=cmd_screen)
 
-    p = sub.add_parser("curve", help="input-output curves; default: FuncSolver calibration (hardware trains 2-20 pulses)")
+    p = sub.add_parser("curve", help="FuncSolver calibration: hardware trains of 2-20 pulses -> calibration.json")
     common(p)
-    p.add_argument("--mode", default="funcsolver", choices=["funcsolver", "pulses", "amplitude"],
-                   help="funcsolver (default): hardware trains, after-train readout, calibration.json for FuncSolver; "
-                        "pulses/amplitude: the earlier during-train curves")
-    p.add_argument("--stims", help="funcsolver mode: stimulating electrodes, e.g. 2,10,20,29 (default: from latest screen)")
-    p.add_argument("--pairs", help="pulses/amplitude modes: stim:rec,... (default: from latest screen)")
-    p.add_argument("--max-stims", type=int, default=4, help="at most this many stimulating electrodes")
-    p.add_argument("--levels", help="funcsolver: 2,4,...,20  pulses: 1,2,4,6,8,10  amplitude: 0.5,1,1.5,2,3")
-    p.add_argument("--ipi", type=float, default=None, help="ms between pulses of a train (funcsolver 10, pulses 30)")
-    p.add_argument("--amplitude", type=float, default=2.0)
-    p.add_argument("--phase", type=float, default=100.0)
-    p.add_argument("--polarity", default="negative-first", choices=["negative-first", "positive-first"])
-    p.add_argument("--reps", type=int, default=None, help="trials per level (funcsolver: per pass, default 10; else 20)")
-    p.add_argument("--codes", action=argparse.BooleanOptionalAction, default=None,
-                   help="train codes (keys 8-14) so the recording identifies each train "
-                        "(default: on once codetest has passed on this machine)")
+    stimulus(p)
+    p.add_argument("--stims", help="stimulating electrodes, e.g. 0,10,30 (default: from latest screen)")
+    p.add_argument("--levels", help="pulse counts, default 2,4,...,20")
+    p.add_argument("--ipi", type=float, default=10.0, help="ms between the pulses of a train")
+    p.add_argument("--reps", type=int, default=10, help="trials per pulse count and pass")
     p.set_defaults(func=cmd_curve)
 
-    p = sub.add_parser("codetest", help="1 min: check that train codes are safe and readable")
+    p = sub.add_parser("codetest", help="~3 min: check that train codes are safe and readable")
     common(p)
     p.add_argument("--electrodes", help="electrodes whose parameters to upload (default: curve stims from latest screen)")
     p.add_argument("--amplitude", type=float, default=2.0)
@@ -703,8 +675,9 @@ def main(argv=None):
     p = sub.add_parser("disable", help="disable all stimulation now (also tests that uploads work)")
     p.set_defaults(func=cmd_disable)
 
-    p = sub.add_parser("status", help="list steps and verdicts for an organoid")
-    p.add_argument("--fsname", required=True)
+    p = sub.add_parser("status", help="where each organoid stands (default: every organoid run in the last 7 days)")
+    p.add_argument("--fsname")
+    p.add_argument("--simulate", action="store_true", help="the simulated organoids instead")
     p.set_defaults(func=cmd_status)
 
     a = ap.parse_args(argv)

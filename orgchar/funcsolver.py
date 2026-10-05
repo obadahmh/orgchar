@@ -54,7 +54,6 @@ def fit_role(role, n, y, levels):
     """Least-squares fit to single trials, starting from several sensible guesses."""
     n, y = np.asarray(n, float), np.asarray(y, float)
     lo, hi = min(levels), max(levels)
-    span = max(np.ptp(y), 1e-3)
     m = pd.Series(y).groupby(n).mean()
     if role == "band":
         starts = [[m.max() - m.min(), m.idxmax(), max((hi - lo) / 4, 1.0), m.min()]]
@@ -382,6 +381,30 @@ def shape_scores(g, levels):
     return out
 
 
+def drop_chance(same, cross):
+    """A pair from another organoid cannot respond, so on its recording electrode it shows what chance
+    reaches there; bursting electrodes reach a lot (fs666 1 Oct 2026: e19→e14 and e26→e14 passed,
+    and beat e13→e14, the only "peaked" candidate, which the curve did not confirm). A candidate is
+    dropped (removed from its pair's shapes, in place) if a pair from another organoid into the same
+    electrode did at least as well, in any shape: p as small and as many events apart.
+    Heuristic: the null is the ~24 pairs into each electrode from the other screened organoids
+    (none if only one organoid was screened). Returns the dropped candidates."""
+    null = {}
+    for p in cross:
+        for v in p["scores"].values():
+            if v["p"] < SCOUT_MAX_P:
+                null.setdefault(p["rec"], []).append((v["p"], v["diff"], p["stim"]))
+    dropped = []
+    for p in same:
+        for role in list(p["shapes"]):
+            v = p["scores"][role]
+            beaten_by = next((s for q, d, s in null.get(p["rec"], []) if q <= v["p"] and d >= v["diff"]), None)
+            if beaten_by is not None:
+                p["shapes"].remove(role)
+                dropped.append(dict(stim=p["stim"], rec=p["rec"], role=role, beaten_by=beaten_by))
+    return dropped
+
+
 def scout(segments, plan):
     """The after-train screen: for every electrode pair, the response to trains of each length,
     and which pairs look like FuncSolver's falling, peaked and rising functions."""
@@ -408,6 +431,7 @@ def scout(segments, plan):
         pairs.append(row)
     same = [p for p in pairs if p["same_organoid"]]
     cross = [p for p in pairs if not p["same_organoid"]]
+    chance = drop_chance(same, cross)
     # the best pair per shape: the one whose single trials separate most often, then by size;
     # one electrode may serve two shapes (on different recording electrodes)
     best = {}
@@ -419,14 +443,15 @@ def scout(segments, plan):
             best[role] = dict(stim=cands[0]["stim"], rec=cands[0]["rec"], win=sc["win"], diff=sc["diff"],
                               p=sc["p"], n_candidates=len(cands), others=[[p["stim"], p["rec"]] for p in cands[1:6]])
     curve_stims = list(dict.fromkeys(v["stim"] for v in best.values()))
-    # negative control: pairs across organoids cannot respond; they show the false-positive rate
+    # gross-leak alarm: far more other-organoid pairs pass than p < 0.01 alone would let through
     false_pos = sum(bool(p["shapes"]) for p in cross)
-    expected = round(len(cross) * len(ROLES) * SCOUT_MAX_P, 1)
+    ceiling = round(len(cross) * len(ROLES) * SCOUT_MAX_P, 1)
     verdict = "CANDIDATES_FOUND" if best else "NO_CANDIDATE"
-    if cross and false_pos > max(3, 3 * expected):
+    if cross and false_pos > max(3, 3 * ceiling):
         verdict = "CONTROLS_FAILED"
     return dict(step="screen", mode="trains", verdict=verdict, levels=levels, best=best, curve_stims=curve_stims,
-                controls=dict(cross_organoid_pairs=len(cross), cross_organoid_passing=false_pos,
-                              expected_by_chance=expected, sham_trials=int(sham.train_id.nunique())),
+                chance=chance, controls=dict(cross_organoid_pairs=len(cross), cross_organoid_passing=false_pos,
+                                             passing_into=sorted({p["rec"] for p in cross if p["shapes"]}),
+                                             nominal_ceiling=ceiling, sham_trials=int(sham.train_id.nunique())),
                 pairs=[_clean(p) for p in same], thresholds_uV=_clean(thr),
                 n_trials=int(stim.train_id.nunique()), _D=D, _cross=cross)
