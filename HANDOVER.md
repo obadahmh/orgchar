@@ -1,44 +1,42 @@
-# Handover: orgchar (state as of 5 Oct 2026)
+# Handover: orgchar (state as of 7 Oct 2026)
 
 How the tool works (method, verdicts, platform quirks) is in `README.md`. This file only holds
-what the README doesn't: machines, the current state, open questions and working agreements.
+what the README doesn't: machines, the current state, open questions, documents and working agreements.
 
 ## Goal
-Characterise this week's FinalSpark organoids so FuncSolver (`~/NeuralControlProgram/FuncSolver`) can use them as activation functions: three stim→rec pairs, **short** (falling), **band** (peaked) and **long** (rising), each on its own stimulating electrode.
+Use FinalSpark organoid channels as activation functions in FuncSolver (`~/NeuralControlProgram/FuncSolver`): three stim→rec pairs, **short-pass**, **band-pass** and **long-pass** (TUM's draft paper), each on its own stimulating electrode. The project is now heading into a proposed Phase 2: a live organoid in the loop, with calibration every session (see Documents).
 
 ## Machines
-- **np14** runs fs666; **neuroplatform10** runs fs667 (week of 30 Sep). FinalSpark replaces all four organoids at once, about weekly, always under a new fsXXX; the user requests it when organoids fatigue.
-- Keep both machines on the same commit (`git pull`). GitHub: `obadahmh/orgchar` (private).
-- `sessions/` (results) is local to each machine and stays out of git. Raw recordings of both machines are on the shared S3 mount, so `./orgchar.sh status` on one machine lists the other's runs, but not their results.
-- `codetest` has passed on np14 (1 Oct). neuroplatform10 ran one on 1 Oct 17:55; check its result there.
+- **np14** runs fs666 (MEA 6); **neuroplatform10** runs fs667 (MEA 7). FinalSpark replaces all four organoids at once, under a new fsXXX, when the user asks.
+- Keep both machines on the same commit. GitHub: `obadahmh/orgchar` (private). `sessions/` is local to each machine and stays out of git; raw recordings of both machines are on the shared S3 mount.
+- fs667 sessions were copied from neuroplatform10 to np14 (`sessions/fs667/`).
+- Tools on np14 without sudo: `~/.local/bin/tectonic` (LaTeX), `~/.local/bin/soffice` (LibreOffice AppImage, for pptx rendering).
 
-## Current state
-- **fs666 (np14): falling only.**
-  - Organoid 1 (e8–15) is the only lively one (8 electrodes, 180 Hz in total). Organoids 0 and 3 have one electrode each at ~0.2–0.3 Hz.
-  - Falling e10→e8 is Good: R² 0.62 on new trials on 2 Oct, and it reproduced on 1 Oct. It is one burst across the organoid; e9, e13 and e15 see it too.
-  - Peaked: none (the 1 Oct screen candidate e13→e14 is what the chance check now drops). Rising: none.
-- **fs667 (neuroplatform10): falling and peaked, no rising.** Rebuilt on np14 from the S3 recordings of the 1 Oct screen and curve:
-  - all four organoids active (38–53 Hz each);
-  - falling e10→e13 and peaked e1→e3 both reproduce between development and confirmation, on different stimulating electrodes in different organoids;
-  - rising: the screen's only candidate, e30→e25, was flat in the curve.
-  - Check this against neuroplatform10's own `report.html`.
-- **5 Oct code change** (not yet run on hardware):
-  - single-pulse screen and pulses/amplitude curves removed;
-  - `status` rewritten;
-  - screen chance check per recording electrode;
-  - raw files read from S3 instead of copied;
-  - alignment starting offset chosen by cost;
-  - results over 24 h old marked STALE in `status`; `curve` warns on a screen that old (as `screen` does for the census).
-- **FuncSolver integration:**
-  - Done: `calibration.json` loads, and offline `--train` works.
-  - Not done: live inference, which still uses FuncSolver's own raw readout and a ResponseSweep `assessment.json` gate. Changing that needs the user's go-ahead, because it is in NeuralControlProgram.
+## Current state (latest runs: 5 Oct, both MEAs; nothing newer on S3)
+- **No long-pass anywhere.** Five curve runs on MEA 6 and MEA 7 (1, 2 and 5 Oct), all re-analysed with the current code. Short-pass in every run, band-pass in three, both predictive within a session (held-out R² 0.53–0.88). The only long-pass screen candidate (fs667 e30→e25) failed its curve.
+- **Responses change between days.** For example, fs667 e10→e14 was short-pass on 1 Oct and band-pass on 5 Oct; fs666 e10→e15 fell from a peak of 72 to 17 spikes.
+- **MEA 6 is fading**: 30 → 15 → 5 active electrodes (30 Sep, 1 Oct, 5 Oct). MEA 7 had 24, 27 and 19.
+- **Correction:** the fs667 1 Oct curve stimulated e10, **e1**, e30, not e0. An earlier S3 rebuild assumed e0 and produced a fake long-pass on the stimulated electrode. Always take the stims from `plan.json`.
+- **Data gaps:** the raw files drop 42.7 ms rows, 96 in 209 recordings (~17 per hour), on both machines. The cause is on FinalSpark's side; the aligner handles it.
+
+## Uncommitted code (np14, not yet on neuroplatform10)
+- Curve partitions renamed: development/confirmation → **fit/test** (folders `fit_nXX`, `test_nXX`). Old sessions still load via `funcsolver.PARTITION`.
+- `report_funcsolver.py` rewritten for external readers: a terms list, short sentences, "short-pass/band-pass/long-pass", electrode panels on FinalSpark's map, p-values explained, no "FuncSolver" except in the operator command.
+- Tests pass (17) and the simulated chain passes. Commit and push once the user agrees.
 
 ## Open questions / next steps
-1. **fs667 rising:** `./orgchar.sh screen --fsname fs667 --amplitude 3 --yes` on neuroplatform10. A calibration holds one stimulus, so if a rising pair appears, the curve must also run at 3 µA, with all three electrodes: `curve --amplitude 3 --stims 10,1,<rising stim>`.
-2. **Does FuncSolver need all three shapes?** This is a design question for the user. fs666 has one, fs667 two.
-3. **Drift:** the fs666 e10 reference fell from 22 to 8.5 events within one hour. Recalibrate right before any FuncSolver session.
-4. **Live FuncSolver:** its measurement should call `orgchar.readout.measure_trial` and accept orgchar's checks. Its per-trial recording also treats an unacknowledged stop as an error.
-5. The 20 s wait for a stop acknowledgement that never comes may be droppable, saving ~8 min per curve. Test it on hardware before relying on it.
+1. **Detector difference with TUM** (most urgent). TUM used FinalSpark's 6 × SD spike detection and a 0–300 ms window; orgchar uses −5σ (MAD) fixed and 10–210 ms. Re-analysing the five curve runs with TUM's settings would show whether the missing long-pass is method or biology. Not done yet.
+2. **Long-pass search** with other settings (up to 3 µA, longer pulses, other spacing), on MEA 7 or a new set.
+3. **Does the network need all three types?** A design decision for the user; the decision slide lists the options.
+4. **Live FuncSolver** still uses its own raw readout and the ResponseSweep gate. Switching it to `orgchar.readout.measure_trial` needs the user's go-ahead (it is in NeuralControlProgram).
+5. **Earlier history** (May–Aug, NCP repo): the live hybrid runs on fs599/618/619/622/626 all failed (R² < 0). Those curves came from the stimulated electrode via the vendor spike database, so they were artefact-dominated.
+
+## Documents (in `~/Documents/FinalSpark_summary/`)
+- **Slide deck (live, 19 slides):** https://claude.ai/artifact/3n4rp5qmmQj6m9Q9P1fqcD. The user also edits it directly, so always read the live version before publishing. Build files and figure scripts are in the earlier session's scratchpad; the local PDF/HTML copies are here.
+- **MBZUAI PowerPoint:** `Organoid_filter_responses_MBZUAI.pptx`, built on `~/Documents/templates/template.pptx`.
+- **PI status report:** `Organoid_filter_responses_status_2026-10-05.pdf/.html` (LaTeX).
+- **Phase 2 proposal** for the chair and dean: `proposal/proposal.pdf`, plus a one-page `proposal/executive_summary.pdf` (ASD-STE100 style, ~80%). Both have red placeholders for the department, school, names, TUM collaborators and budget, which the user will supply. Decision thresholds D1–D4 are proposals.
+- **Naming in documents:** MEA 1–7 = fs635, fs636, fs647, fs660, fs662, fs666, fs667. The TUM draft paper is called "TUM", not "draft".
 
 ## Working agreements
 - The user runs all hardware steps. A coding assistant only analyses and changes code, unless explicitly asked.
@@ -47,7 +45,9 @@ Characterise this week's FinalSpark organoids so FuncSolver (`~/NeuralControlPro
   ```bash
   ORGCHAR_HOME=<tmp> ./orgchar.sh <step> --simulate --yes   # census, screen, curve, then status --simulate
   ```
-  Also run `pytest`.
+  Also run `pytest` (side venv; don't install into `ncp`).
 - Never infer which electrode was stimulated from artifact size: neighbours clip at ±6 mV too. Use the plan's key mapping.
+- Keep raw-data reads minimal (token cost).
 - Keep the code lean: the user dislikes bloat and band-aids. Fix root causes, and say plainly when a fix is a heuristic.
+- Slides and reports: short phrase titles, no footnotes except references, plain research terminology, legible when projected.
 - No AI attribution in commit messages or PR descriptions.

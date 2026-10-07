@@ -63,6 +63,10 @@ td.n,th.n{text-align:right;white-space:nowrap}
 .maps{display:flex;flex-wrap:wrap;gap:18px 22px;align-items:flex-start}
 .maps figure{margin:0}
 .maps figcaption{font-weight:600;font-size:13px;margin-bottom:4px}
+dl.terms{display:grid;grid-template-columns:minmax(120px,max-content) 1fr;gap:5px 16px;font-size:13px;margin:6px 0 4px}
+dl.terms dt{font-weight:600}
+dl.terms dd{margin:0;color:var(--muted)}
+@media (max-width:600px){dl.terms{grid-template-columns:1fr}dl.terms dd{margin-bottom:6px}}
 details{margin:10px 0}
 summary{cursor:pointer;color:var(--muted)}
 """

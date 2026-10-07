@@ -201,10 +201,10 @@ def plan_funcsolver(stims, counts=FUNCSOLVER_COUNTS, ipi_ms=10.0, amplitude_uA=2
     output = events 10-210 ms after the train (readout.py). One segment (= one upload) per pulse
     count, because a hardware train's length is part of the uploaded parameters.
 
-    Order: reference, development pass (every count once, shuffled), reference, confirmation pass
-    (every count once, reshuffled), reference. Development data alone select the pairs and fit
-    the curves; confirmation data only measure how well those predictions hold on new trials.
-    References (reference_pulses, same in every reference segment) measure drift over the run.
+    Order: reference, fit pass (every count once, shuffled), reference, test pass (every count
+    once, reshuffled), reference. Fit trials alone select the pairs and fit the curves. Test trials
+    only measure how well those frozen curves predict new trials. References (reference_pulses,
+    the same train in every reference segment) measure drift over the run.
     Each segment also holds sham trials (no current) with the same timing, for the sham correction.
     """
     counts = sorted(int(n) for n in counts)
@@ -218,11 +218,11 @@ def plan_funcsolver(stims, counts=FUNCSOLVER_COUNTS, ipi_ms=10.0, amplitude_uA=2
                                    phase_us, polarity, organoid_isi_s, spacing_s, rng))
 
     segment("ref0", reference_pulses, "reference", 0, reference_reps, 2)
-    for p, partition in enumerate(("development", "confirmation")):
+    for p, partition in enumerate(("fit", "test")):
         order = list(counts)
         rng.shuffle(order)
         for n in order:
-            segment(f"{partition[:3]}_n{n:02d}", n, partition, p, reps, sham_reps)
+            segment(f"{partition}_n{n:02d}", n, partition, p, reps, sham_reps)
         segment(f"ref{p + 1}", reference_pulses, "reference", p + 1, reference_reps, 2)
     return dict(step="curve", vary="pulse_train", readout="after_train", levels=counts, ipi_ms=ipi_ms,
                 amplitude_uA=amplitude_uA, phase_us=phase_us, polarity=polarity, reps=reps, sham_reps=sham_reps,

@@ -43,12 +43,12 @@ def test_census_separates_live_and_silent_blocks(tmp_path):
 # ------------------------------------------------------------------------------ trigger matching
 
 def _train_segment(reps=12, coded=False):
-    """A development segment of a FuncSolver curve: one trigger per train (the board times the
+    """A fit segment of a FuncSolver curve: one trigger per train (the board times the
     pulses), trains >= 1 s apart, shams interleaved."""
     plan = P.plan_funcsolver([21], counts=(2, 4), reps=reps, sham_reps=4, seed=2)
     if coded:
         plan = P.add_train_codes(plan)
-    return next(s for s in plan["segments"] if s["partition"] == "development")
+    return next(s for s in plan["segments"] if s["partition"] == "fit")
 
 
 def _record(seg, path, edit=lambda ev, s: (s, ev["key"]), code_pulse=False, clock=1.0):
@@ -161,7 +161,7 @@ NCP = Path.home() / "NeuralControlProgram"
 def test_funcsolver_plan_timing_and_structure():
     plan = P.plan_funcsolver([2, 10, 20, 29], reps=4, sham_reps=2, seed=1)
     parts = [s["partition"] for s in plan["segments"]]
-    assert parts[0] == parts[11] == parts[-1] == "reference" and parts.count("development") == 10
+    assert parts[0] == parts[11] == parts[-1] == "reference" and parts.count("fit") == 10
     for s in plan["segments"]:
         assert all(v["n_pulses"] == s["n_pulses"] for v in s["electrodes"].values())
         t = np.array([e["t_s"] for e in s["events"]])
@@ -222,7 +222,7 @@ def test_funcsolver_artifact_in_window_is_caught(tmp_path):
     import h5py
     from orgchar import readout as RO
     plan = P.plan_funcsolver([21], counts=(2, 4, 6), reps=6, sham_reps=2, seed=3)
-    plan["segments"] = [s for s in plan["segments"] if s["partition"] == "development"]
+    plan["segments"] = [s for s in plan["segments"] if s["partition"] == "fit"]
     segs = []
     for s in plan["segments"]:
         d = tmp_path / s["id"]

@@ -100,8 +100,8 @@ def _describe(plan):
               f"pulses, {plan['ipi_ms']:g} ms apart, {plan['amplitude_uA']} µA × {plan['phase_us']:g} µs; "
               f"each organoid ≥ {plan['organoid_isi_s'][0]:g} s between trains")
         if plan["step"] == "curve":
-            print(f"  order: reference, development ({len(plan['levels'])} segments), reference, "
-                  f"confirmation ({len(plan['levels'])} segments), reference")
+            print(f"  order: reference, fit ({len(plan['levels'])} segments), reference, "
+                  f"test ({len(plan['levels'])} segments), reference")
         return
     print(f"Plan: {plan['step']}, {len(plan['segments'])} segment(s), {n_stim} stimulation pulses, "
           f"{n_sham} sham markers, " + (f"{n_code} code triggers (keys 8-14, no current), " if n_code else "")

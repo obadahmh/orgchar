@@ -8,8 +8,8 @@ FuncSolver (NeuralControlProgram/FuncSolver) uses one organoid pair per role:
 where n = pulses in a hardware train and the output is readout.measure_trial minus the sham mean.
 FuncSolver uses ONE stimulation per evaluation, so single-trial scatter is what it gets.
 
-Rules (as in FuncSolver's own design): development data alone choose pairs and fit curves;
-confirmation data, recorded later in the session, only measure the error of those frozen fits.
+Rules (as in FuncSolver's own design): fit trials alone choose pairs and fit curves. Test trials,
+recorded later in the session, only measure the error of those frozen fits.
 """
 from __future__ import annotations
 
@@ -34,8 +34,10 @@ ROLE_TEXT = dict(short="falling", band="peaked", long="rising")
 # (fs666 e10, 1 Oct 2026: 30-50 µV bursts were flagged when the quiet noise was the yardstick).
 ARTIFACT_CHECK_MS = 5.0
 ARTIFACT_LIMIT = 3.0
-MIN_EFFECT_P = 0.01         # development: responses must differ across pulse counts (Kruskal-Wallis)
-GOOD_R2, FAIR_R2 = 0.5, 0.2  # confirmation single-trial R² for the plain-language grade
+MIN_EFFECT_P = 0.01         # fit trials: responses must differ across pulse counts (Kruskal-Wallis)
+GOOD_R2, FAIR_R2 = 0.5, 0.2  # test-trial single-trial R² for the plain-language grade
+# Sessions before 6 Oct 2026 named the partitions "development" and "confirmation".
+PARTITION = {"development": "fit", "confirmation": "test"}
 
 
 # ------------------------------------------------------------------------------ curve models
@@ -107,15 +109,16 @@ def _plan_index(plan):
 def measure(segments, plan, spec=RO.SPEC, all_channels=False):
     """Every trial on every electrode of its organoid (shams: every electrode), with the readout.
     all_channels: stimulation trials on every electrode, so other-organoid pairs can serve as
-    negative controls. Thresholds come from development and first-reference segments only
+    negative controls. Thresholds come from fit and first-reference segments only
     (pre-train baselines)."""
     segs = _plan_index(plan)
     nb = int(round(spec["baseline_duration_ms"] * spec["sample_rate_hz"] / 1000))
-    # 1) noise -> frozen thresholds, from pre-train baselines of development + ref0 segments
+    # 1) noise -> frozen thresholds, from pre-train baselines of fit + ref0 segments
     noise = {c: [] for c in range(S.N_CH)}
     for raw, trials in segments:
         seg = segs[trials.segment.iloc[0]]
-        if seg["partition"] == "confirmation" or (seg["partition"] == "reference" and seg["block"] > 0):
+        part = PARTITION.get(seg["partition"], seg["partition"])
+        if part == "test" or (part == "reference" and seg["block"] > 0):
             continue
         X, _ = S.load_raw(raw)
         on = trials[~trials.exclude].onset.values
@@ -141,7 +144,8 @@ def measure(segments, plan, spec=RO.SPEC, all_channels=False):
             for c in recs:
                 m = RO.measure_trial(X[c, o - nb:o], X[c, o:o + need], n, ipi, plan["phase_us"], thr[c], spec,
                                      keep_trace=t.kind == "stim")
-                rows.append(dict(segment=seg["id"], seg_index=si, partition=seg["partition"], block=seg["block"],
+                rows.append(dict(segment=seg["id"], seg_index=si, partition=PARTITION.get(seg["partition"], seg["partition"]),
+                                 block=seg["block"],
                                  kind=t.kind, stim=stim, rec=c, level=n, onset=o, train_id=t.train_id,
                                  response=m["response_events"], baseline=m["baseline_events"], adjusted=m["adjusted"]))
                 if t.kind == "stim" and c // 8 == stim // 8:   # window start, to check for time-locked artifact
@@ -164,7 +168,7 @@ def measure(segments, plan, spec=RO.SPEC, all_channels=False):
 # ------------------------------------------------------------------------------ per-pair analysis
 
 def _cv_r2(role, d, levels):
-    """Development-only score: fit on alternate trials, predict the others, both ways."""
+    """Fit-trials-only score: fit on alternate trials, predict the others, both ways."""
     d = d.sort_values("order").reset_index(drop=True)
     half = d.groupby("level").cumcount() % 2
     preds = np.full(len(d), np.nan)
@@ -181,16 +185,16 @@ def analyse_pairs(D, plan, art):
     levels = list(plan["levels"])
     ref_n = plan["reference_pulses"]
     sham = D[D.kind == "sham"]
-    # sham correction: one value per electrode from all development shams (no current flows, so
+    # sham correction: one value per electrode from all fit-pass shams (no current flows, so
     # it cannot depend on the pulse count; pooling ~40 trials is far steadier than ~4 per count)
-    control = sham[sham.partition == "development"].groupby("rec").adjusted.mean().to_dict()
-    control_sd = sham[sham.partition == "development"].groupby("rec").adjusted.std().to_dict()
+    control = sham[sham.partition == "fit"].groupby("rec").adjusted.mean().to_dict()
+    control_sd = sham[sham.partition == "fit"].groupby("rec").adjusted.std().to_dict()
     stim = D[D.kind == "stim"].copy()
     stim["y"] = stim.adjusted - stim.rec.map(control)
     out = []
     for (e, c), g in stim.groupby(["stim", "rec"]):
-        dev = g[g.partition == "development"]
-        conf = g[g.partition == "confirmation"]
+        dev = g[g.partition == "fit"]
+        conf = g[g.partition == "test"]
         ref = g[g.partition == "reference"]
         if dev.level.nunique() < len(levels) or len(dev) < 3 * len(levels):
             continue
@@ -210,7 +214,7 @@ def analyse_pairs(D, plan, art):
                 continue
             f = dict(params=p, r2_means=r2(dm["mean"].values, model(role, dm.index.values, p)),
                      cv_r2=_cv_r2(role, dev, levels))
-            if len(conf):   # frozen development fit vs new single trials
+            if len(conf):   # frozen fit vs new single trials
                 pred = model(role, conf.level, p)
                 cm = conf.groupby("level").y.mean()
                 f.update(conf_r2=r2(conf.y, pred), conf_rmse=float(np.sqrt(((conf.y - pred) ** 2).mean())),
@@ -239,7 +243,7 @@ def analyse_pairs(D, plan, art):
 
 def grade(p, role=None):
     """Plain-language verdict for one pair as a FuncSolver activation of `role` (default: its best
-    shape), judged on confirmation data only."""
+    shape), judged on test trials only."""
     role = role or p.get("shape")
     if not role:
         return "none", "no clear falling, peaked or rising curve"
@@ -250,14 +254,14 @@ def grade(p, role=None):
     f = p["fits"][role]
     c = f.get("conf_r2")
     if c is None or not np.isfinite(c):
-        return "unknown", "no confirmation trials"
+        return "unknown", "no test trials"
     drift = f.get("drift")
     drift_bad = drift is not None and p["dev_range"] > 0 and abs(drift) > 0.5 * p["dev_range"]
     if c >= GOOD_R2 and not drift_bad:
         return "good", "predicts new single trials well"
     if c >= FAIR_R2:
-        return "fair", "follows the curve on new trials, but single trials scatter" + ("; drifts" if drift_bad else "")
-    return "poor", "does not predict new single trials" + ("; drifts" if drift_bad else "")
+        return "fair", "follows the curve on new trials, but single trials scatter" + (", and drifts" if drift_bad else "")
+    return "poor", "does not predict new single trials" + (", and drifts" if drift_bad else "")
 
 
 def select_roles(pairs):
