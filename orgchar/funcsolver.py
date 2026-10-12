@@ -1,7 +1,7 @@
-"""Characterisation for FuncSolver: which stim -> rec pairs give FuncSolver's three activation
-shapes, how well they predict single new trials, and the calibration file FuncSolver loads.
+"""Characterisation for FuncSolver: which stim -> rec pairs give FuncSolver's activation shapes,
+how well they predict single new trials, and the calibration file FuncSolver loads.
 
-FuncSolver (NeuralControlProgram/FuncSolver) uses one organoid pair per role:
+FuncSolver (NeuralControlProgram/FuncSolver) uses one organoid pair per role it gets (any subset):
     short = falling curve   L / (1 + exp( k (n - x0))) + b
     band  = peaked curve    A exp(-(n - mu)^2 / (2 sigma^2)) + b
     long  = rising curve    L / (1 + exp(-k (n - x0))) + b

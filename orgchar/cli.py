@@ -72,7 +72,8 @@ def _latest(fsname, simulate, step):
     return (runs[-1].parent, json.loads(runs[-1].read_text())) if runs else (None, None)
 
 
-def _lock():
+def hardware_lock():
+    """Hold every hardware lock (exits if another job holds one); FuncSolver live inference uses it too."""
     handles = []
     for p in LOCKS:
         if p.parent.exists():
@@ -129,20 +130,34 @@ def _execute(args, plan):
     else:
         from .backends import HardwareBackend
         backend = HardwareBackend(args.operator)
-        locks = _lock()
+        locks = hardware_lock()
+    from .backends import clear_status, status
+    n = len(plan["segments"])
+    planned = [P.plan_duration_s(dict(segments=[s])) for s in plan["segments"]]
+    t0 = time.monotonic()
+    print(f"\n{plan['step']} · {args.fsname}{' · SIMULATED' if args.simulate else ''} · {n} segment{'s' * (n != 1)} · "
+          f"about {sum(planned) / 60:.0f} min · started {_local():%H:%M %Z}")
     try:
         segs = []
-        for s in plan["segments"]:
+        for i, s in enumerate(plan["segments"]):
             seg_dir = step_dir / s["id"]
             seg_dir.mkdir()
             tag = f"orgchar_{args.fsname}_{stamp}_{plan['step']}_{s['id']}"
-            print(f"[{_now():%H:%M:%S}] segment {s['id']}")
+            t_seg = time.monotonic()
+            print(f"[{i + 1:>{len(str(n))}}/{n}] {s['id']} · {_seg_text(plan, s)} · {_local():%H:%M:%S}", flush=True)
             raw = backend.run_segment(s, seg_dir, tag)
+            status("checking the recording…", live=True)
             sent_csv = seg_dir / "sent.csv"
             sent = pd.read_csv(sent_csv) if sent_csv.exists() and sent_csv.stat().st_size > 1 else None
             trials = match_triggers(s, raw, sent)
             trials.to_csv(seg_dir / "trials.csv", index=False)
             segs.append((str(raw), trials))
+            clear_status()
+            done = time.monotonic() - t0
+            left = sum(planned[i + 1:]) * done / sum(planned[:i + 1])   # the plan, scaled by the pace so far
+            print(f"        {_seg_result(s, trials)} · took {_mmss(time.monotonic() - t_seg)}"
+                  + (f" · {i + 1}/{n} done, about {left / 60:.0f} min left (until ~{_local(left):%H:%M})" if i + 1 < n
+                     else f" · {'all ' if n > 1 else ''}done in {_mmss(done)}"), flush=True)
     except BaseException:
         # keep the failure with the data, so an aborted step is never a silent empty folder
         (step_dir / "error.txt").write_text(f"{_now().isoformat()}\n{traceback.format_exc()}")
@@ -152,6 +167,42 @@ def _execute(args, plan):
         for h in locks:
             h.close()
     return step_dir, segs
+
+
+def _local(after_s=0.0):
+    """Wall-clock time for the operator (the machine's own time zone)."""
+    return datetime.now().astimezone() + timedelta(seconds=after_s)
+
+
+def _mmss(sec):
+    return f"{int(sec // 60)}:{int(sec % 60):02d}"
+
+
+def _seg_text(plan, s):
+    """What a segment does, in a few words."""
+    el = sorted(int(e) for e in s["electrodes"])
+    if not el:
+        return "spontaneous activity, no stimulation"
+    if plan["step"] == "codetest":
+        return f"train codes on keys 8-14, then 5 control pulses on e{el[0]}"
+    n = int(s.get("n_pulses", 1))
+    what = f"{n}-pulse trains" if n > 1 else "single pulses"
+    part = s.get("partition", "")
+    return (f"{part}, " if part not in ("", "screen", "live") else "") + f"{what} on e{', e'.join(map(str, el))}"
+
+
+def _seg_result(s, trials):
+    """What the recording delivered: trains usable, lost rows, codes; ✓ if everything is there."""
+    m = trials.attrs.get("summary", {})
+    if not s["events"]:
+        return f"✓ {m.get('recorded_s', 0):.0f} of {s['duration_s']:.0f} s recorded"
+    parts = [f"{m['usable']}/{m['planned']} trains usable", f"{m['lost_rows']} lost row{'s' * (m['lost_rows'] != 1)}"]
+    if m.get("unmatched"):
+        parts.append(f"{m['unmatched']} unmatched")
+    if m.get("codes_ok") is not None:
+        parts.append(f"codes {m['codes_ok']}/{m['planned']}" + (f", {m['codes_bad']} CONTRADICT" if m["codes_bad"] else ""))
+    ok = m["usable"] == m["planned"] and not m.get("codes_bad")
+    return ("✓ " if ok else "! ") + " · ".join(parts)
 
 
 def _raw(seg_dir: Path) -> Path | None:
@@ -194,6 +245,9 @@ def _segments_from_dir(step_dir: Path, plan: dict):
 
 def analyse(step_dir: Path, plan: dict, segs) -> dict:
     step = plan["step"]
+    # reading from the S3 mount dominates: ~13 s per recording (fs666 curve, 23 recordings: 303 s)
+    print(f"\nAnalysing {len(segs)} recording{'s' * (len(segs) != 1)}, about {max(1, round(len(segs) * 13 / 60))} min "
+          f"(until ~{_local(len(segs) * 13):%H:%M})…", flush=True)
     if step == "census":
         r = A.census(segs[0][0])
         lines = [f"Recorded {r['duration_s']:.0f} s without stimulation; spike threshold -{r['threshold_k']:g} × noise.",
@@ -263,7 +317,7 @@ def analyse(step_dir: Path, plan: dict, segs) -> dict:
             RF.screen_page(step_dir / "report.html", plan, r, problems, _when(step_dir))
         else:
             RF.page(step_dir / "report.html", plan, r, problems, _when(step_dir))
-            if not problems and plan.get("backend") != "simulated" and r["verdict"] == "ALL_ROLES":
+            if not problems and plan.get("backend") != "simulated" and r["verdict"] != "NO_ROLES":
                 latest = step_dir.parent / "calibration_latest.json"
                 latest.write_text((step_dir / "calibration.json").read_text())
                 lines.append(f"FuncSolver calibration: {latest}")
@@ -397,7 +451,7 @@ def _status(fs: str, simulate: bool, elsewhere: set[str]) -> list[str]:
         out.append(f"  FuncSolver: {cal} (from {Path(src).name}, {_ago(Path(src))})")
     elif curves:
         out.append("  FuncSolver: no calibration_latest.json" + (" (simulated runs never write one)" if simulate else
-                                                               " yet (written when one complete curve finds all three functions)"))
+                                                               " yet (written when one complete curve finds at least one function)"))
     if runs:
         last = runs[-1]
         v = res[last].get("verdict_text", "?") if last in res else (
@@ -601,7 +655,7 @@ def cmd_disable(a):
             print(f"disable all stimulation: status={r.status} message={r.message!r}")
         finally:
             await intan._close()
-    locks = _lock()
+    locks = hardware_lock()
     try:
         asyncio.run(run())
     finally:

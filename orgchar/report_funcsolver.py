@@ -325,14 +325,11 @@ def page(path, plan, r, problems, when):
     body.append("<h2>For the operator</h2>")
     if chosen:
         cal = r.get("calibration", "calibration.json")
-        body.append("<p>Train the network offline on these curves (no hardware needed):</p>"
-                    f"<pre class=cmd>cd ~/NeuralControlProgram\npython FuncSolver/main.py --train --fsname {html.escape(fs)} "
-                    f"--calibration {html.escape(cal)}</pre>")
+        body.append("<p>Train the network offline on these curves (no hardware needed); it uses the types found:</p>"
+                    f"<pre class=cmd>cd ~/NeuralControlProgram/FuncSolver\npython main.py train {html.escape(cal)}</pre>")
         if n < 3:
-            body.append("<p class=note>The network needs all three types, so calibration_latest.json was not "
-                        "updated. This run's calibration.json stays in its folder. To look for the missing type, re-run "
-                        "this step with other stimulating electrodes (<code>--stims</code>) or more current "
-                        "(<code>--amplitude</code>).</p>")
+            body.append("<p class=note>To look for the missing type, re-run this step with other stimulating "
+                        "electrodes (<code>--stims</code>) or more current (<code>--amplitude</code>).</p>")
     else:
         body.append("<p>Nothing to hand to the network. Try other stimulating electrodes (<code>--stims</code>) or "
                     "stronger trains, after re-checking the screen.</p>")

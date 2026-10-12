@@ -228,3 +228,40 @@ def plan_funcsolver(stims, counts=FUNCSOLVER_COUNTS, ipi_ms=10.0, amplitude_uA=2
                 amplitude_uA=amplitude_uA, phase_us=phase_us, polarity=polarity, reps=reps, sham_reps=sham_reps,
                 reference_pulses=reference_pulses, reference_reps=reference_reps,
                 organoid_isi_s=list(organoid_isi_s), stims=list(stims), segments=segs)
+
+
+def plan_trials(trials, ipi_ms=10.0, amplitude_uA=2.0, phase_us=100.0, polarity="negative-first",
+                organoid_isi_s=(4.0, 4.5), spacing_s=(1.0, 1.25), seed=0):
+    """Segments that deliver an arbitrary list of trials, as FuncSolver's live inference needs them.
+
+    trials: (stim_electrode, n_pulses) pairs, one hardware train each. A train's length is part of
+    the upload, so each segment binds every electrode to one length; segments repeat until every
+    trial is placed. Event i of the input list carries request=i. No sham trials: the caller applies
+    the sham correction from its calibration."""
+    trials = [(int(e), int(n)) for e, n in trials]
+    for n in {n for _, n in trials}:
+        check_setting(amplitude_uA, phase_us, n, ipi_ms)
+    rng = random.Random(seed)
+    pending, segs = list(enumerate(trials)), []
+    while pending:
+        counts = {}
+        for _, (e, n) in pending:
+            counts.setdefault(e, {}).setdefault(n, 0)
+            counts[e][n] += 1
+        # per electrode, the length with most trials still waiting; at most MAX_UPLOAD_STIMS electrodes
+        length = {e: max(c, key=c.get) for e, c in sorted(counts.items())[:MAX_UPLOAD_STIMS]}
+        el = {e: dict(key=i, amplitude_uA=amplitude_uA, phase_us=phase_us, polarity=polarity,
+                      n_pulses=n, ipi_ms=float(ipi_ms) if n > 1 else 0.0) for i, (e, n) in enumerate(length.items())}
+        now = [(i, e, n) for i, (e, n) in pending if length.get(e) == n]
+        pending = [(i, t) for i, t in pending if length.get(t[0]) != t[1]]
+        evs = [dict(key=el[e]["key"], kind="stim", stim_electrode=e, level=float(n), pulse_index=0, request=i)
+               for i, e, n in now]
+        rng.shuffle(evs)
+        evs = _spaced_timeline(evs, organoid_isi_s, spacing_s, rng)
+        sid = f"seg{len(segs):02d}"
+        for k, ev in enumerate(evs):
+            ev.update(train_id=f"{sid}t{k:03d}", partition="live", block=0)
+        segs.append(dict(id=sid, electrodes=el, events=evs, partition="live", block=0,
+                         duration_s=round(evs[-1]["t_s"] + 1.5, 1)))
+    return dict(step="live", vary="pulse_train", readout="after_train", ipi_ms=ipi_ms, amplitude_uA=amplitude_uA,
+                phase_us=phase_us, polarity=polarity, organoid_isi_s=list(organoid_isi_s), segments=segs)

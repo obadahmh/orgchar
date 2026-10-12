@@ -19,16 +19,17 @@ Use FinalSpark organoid channels as activation functions in FuncSolver (`~/Neura
 - **Correction:** the fs667 1 Oct curve stimulated e10, **e1**, e30, not e0. An earlier S3 rebuild assumed e0 and produced a fake long-pass on the stimulated electrode. Always take the stims from `plan.json`.
 - **Data gaps:** the raw files drop 42.7 ms rows, 96 in 209 recordings (~17 per hour), on both machines. The cause is on FinalSpark's side; the aligner handles it.
 
-## Uncommitted code (np14, not yet on neuroplatform10)
-- Curve partitions renamed: development/confirmation → **fit/test** (folders `fit_nXX`, `test_nXX`). Old sessions still load via `funcsolver.PARTITION`.
-- `report_funcsolver.py` rewritten for external readers: a terms list, short sentences, "short-pass/band-pass/long-pass", electrode panels on FinalSpark's map, p-values explained, no "FuncSolver" except in the operator command.
-- Tests pass (17) and the simulated chain passes. Commit and push once the user agrees.
+## Uncommitted code (np14, 9 Oct 2026)
+- `protocol.plan_trials`: segments for an arbitrary list of (electrode, pulse count) trains, one length per electrode per segment. FuncSolver's live inference uses it.
+- `cli.hardware_lock` (was `_lock`), so FuncSolver's live inference takes the same locks.
+- FuncSolver now accepts any subset of the three types: `calibration_latest.json` is written whenever a complete curve finds at least one function; report and README updated; the test uses FuncSolver's new `calibration.load`.
+- Tests pass (18) and the simulated chain passes. Commit and push once the user agrees.
 
 ## Open questions / next steps
 1. **Detector difference with TUM** (most urgent). TUM used FinalSpark's 6 × SD spike detection and a 0–300 ms window; orgchar uses −5σ (MAD) fixed and 10–210 ms. Re-analysing the five curve runs with TUM's settings would show whether the missing long-pass is method or biology. Not done yet.
 2. **Long-pass search** with other settings (up to 3 µA, longer pulses, other spacing), on MEA 7 or a new set.
-3. **Does the network need all three types?** A design decision for the user; the decision slide lists the options.
-4. **Live FuncSolver** still uses its own raw readout and the ResponseSweep gate. Switching it to `orgchar.readout.measure_trial` needs the user's go-ahead (it is in NeuralControlProgram).
+3. **Does the network need all three types?** No, in principle: either type alone is sufficient (`~/Documents/FinalSpark_summary/sufficiency/sufficiency.pdf`). FuncSolver now uses whatever types orgchar finds.
+4. **Live FuncSolver** was rewritten on 9 Oct (NeuralControlProgram commit after 88cb31d): it runs through orgchar (`plan_trials`, `HardwareBackend`, `readout.measure_trial`, the calibration's thresholds). Tested on simulated recordings only; not yet run on hardware. Offline it does not yet survive whole pulse counts and trial noise (see FuncSolver's README).
 5. **Earlier history** (May–Aug, NCP repo): the live hybrid runs on fs599/618/619/622/626 all failed (R² < 0). Those curves came from the stimulated electrode via the vendor spike database, so they were artefact-dominated.
 
 ## Documents (in `~/Documents/FinalSpark_summary/`)

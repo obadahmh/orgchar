@@ -72,7 +72,7 @@ Why not single pulses: on fs666 (1 Oct 2026) a single-pulse screen picked e2, e2
 
 ### Step 3: curve (FuncSolver's activation functions)
 
-FuncSolver (NeuralControlProgram) needs three organoid pairs, one per function shape: **short** (falling: more pulses → fewer events), **band** (peaked) and **long** (rising). It sends **one** train per evaluation and reads **one** response, so a curve is only as good as single trials are close to it. Each evaluation gives the three roles different pulse counts at once, so each role needs its own stimulating electrode.
+FuncSolver (NeuralControlProgram) uses one organoid pair per function shape it can get: **short** (falling: more pulses → fewer events), **band** (peaked) and **long** (rising); any subset works. It sends **one** train per evaluation and reads **one** response, so a curve is only as good as single trials are close to it. Each evaluation gives the three roles different pulse counts at once, so each role needs its own stimulating electrode.
 
 `curve` measures exactly what FuncSolver uses:
 - **Input:** a hardware train of 2, 4, …, 20 pulses, 10 ms apart, 2 µA × 100 µs. One trigger; the stimulator repeats the pulse, as FuncSolver delivers it. A train's length is part of the upload, so there is one recording per pulse count.
@@ -83,7 +83,7 @@ FuncSolver (NeuralControlProgram) needs three organoid pairs, one per function s
 
 Verdict per function: **Good** (new-trial R² ≥ 0.5, no large drift), **Fair** (≥ 0.2), **Poor**, or **Missing**.
 
-Outputs: `calibration.json` in FuncSolver's format (schema 1, `nearest_validated_abs_v1`; tested with `FuncSolver/calibration.apply_calibration`), copied to `sessions/<fsname>/calibration_latest.json` when one complete run finds all three functions; `report.html` leads with the three functions, then single-trial evidence for each, then every pair measured.
+Outputs: `calibration.json` in FuncSolver's format (schema 1; tested with `FuncSolver/calibration.load`), copied to `sessions/<fsname>/calibration_latest.json` when one complete run finds at least one function; `report.html` leads with the three functions, then single-trial evidence for each, then every pair measured.
 
 The window starts at the end of the train, so it starts later for longer trains. On fs666 e10, 2–4 pulses set off a burst across the whole organoid lasting ~400 ms; longer trains cut it short and leave the organoid quiet afterwards. Both effects make the curve fall. The four "pairs" e10→e8, e9, e13, e15 are that one burst seen on four electrodes.
 
@@ -137,7 +137,7 @@ responses change within a day (fs666 e10's reference fell from 22 to 8.5 events 
 | screen | `NO_CANDIDATE` | nothing for FuncSolver with these trains; try `--amplitude 3`, or re-check the census |
 | screen | `CONTROLS_FAILED` | far more other-organoid pairs pass than p < 0.01 allows: artifact reaches the readout; do not trust the candidates |
 | curve | `ALL THREE FUNCTIONS FOUND` | train FuncSolver on `calibration_latest.json` (command in the report) |
-| curve | `SOME FUNCTIONS MISSING` | re-run with other `--stims` for the missing shape, or more current |
+| curve | `SOME FUNCTIONS MISSING` | train FuncSolver on the functions found; to find the missing shape, re-run with other `--stims` or more current |
 | curve | `NO USABLE FUNCTION` | the organoid does not give FuncSolver's shapes with these trains |
 
 Any step can also end `INCOMPLETE: …` (a recording cut short or a failed final disable): inspect, then re-run it.
@@ -145,8 +145,8 @@ Any step can also end `INCOMPLETE: …` (a recording cut short or a failed final
 ## Using it for function approximation
 
 - Train FuncSolver offline on the calibration (no hardware):
-  `cd ~/NeuralControlProgram && python FuncSolver/main.py --train --fsname <fs> --calibration <path to calibration.json>`.
-- **Live inference is not connected yet.** FuncSolver's live path still uses its own readout (`experiment_control/measurement.py`, threshold crossings on the unfiltered voltage) and requires a ResponseSweep `assessment.json`. A calibration from orgchar declares `method: orgchar_bandpass_events_v1`, which FuncSolver's live readout refuses, so it cannot silently measure differently from the calibration. Connecting it means FuncSolver calling `orgchar.readout.measure_trial` and accepting orgchar's checks.
+  `cd ~/NeuralControlProgram/FuncSolver && python main.py train <curve session folder>`.
+- Live inference (`python main.py infer <run> --organoid`) runs through orgchar: `protocol.plan_trials` lays out each layer's trains, `HardwareBackend` delivers them under the same hardware lock, and `readout.measure_trial` counts the events with the calibration's frozen thresholds, minus its sham mean. `--simulate` runs the same path on simulated recordings. See FuncSolver's README.
 - Responses change within a day. Re-run `curve` at the start of each FuncSolver session; after a medium change, start again from `census`.
 - Each fsXXX is one preparation: FinalSpark replaces all four organoids at once, under a new fsXXX, so a new fsname starts from `census` with nothing carried over.
 - Do not read the vendor spike database for evoked responses. It counts artifacts and knows nothing about sham or cross-talk.

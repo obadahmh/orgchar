@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -179,7 +180,8 @@ def match_triggers(seg: dict, raw_path, sent: pd.DataFrame | None = None, min_fr
     Code triggers (coded segments only) are used for the check and then dropped: no current flows.
     Column `code`: 'ok' | 'missing' (code not readable, e.g. in a lost row) | 'mismatch' | ''."""
     from .protocol import CODE_KEYS
-    edges = S.trigger_edges(S.load_triggers(raw_path))
+    T = S.load_triggers(raw_path)
+    edges = S.trigger_edges(T)
     evs = seg["events"]
     coded = bool(seg.get("train_codes"))
     els = {int(k): v for k, v in seg["electrodes"].items()}
@@ -239,16 +241,11 @@ def match_triggers(seg: dict, raw_path, sent: pd.DataFrame | None = None, min_fr
     df = pd.DataFrame(rows)
     usable_trials = df[~df.exclude].train_id.nunique() if len(df) else 0
     planned_trials = len(train_evs)
-    n_matched = sum(not is_code[i] for i in matched)
-    if n_matched != len(train_evs) or gap_edges:
-        print(f"  NOTE {seg['id']}: {len(train_evs)} triggers sent, {len(edges) - sum(is_code)} in the recording, "
-              f"{n_matched} matched; {len(gaps)} lost row(s) in the platform's recording; "
-              f"{usable_trials} of {planned_trials} trials usable.")
-    if coded:
-        n_ok, n_bad = sum(v == "ok" for v in check.values()), len(mismatched)
-        print(f"  CODES {seg['id']}: {n_ok} of {planned_trials} trains confirmed by their recorded code"
-              + (f"; {n_bad} CONTRADICT the alignment (excluded)" if n_bad else "")
-              + (f"; {planned_trials - n_ok - n_bad} code(s) unreadable" if planned_trials - n_ok - n_bad else "") + ".")
+    # for the progress output (cli): what this recording delivered
+    df.attrs["summary"] = dict(planned=planned_trials, usable=int(usable_trials), lost_rows=len(gaps),
+                               unmatched=int((df.note == "unmatched").sum()) if len(df) else 0,
+                               recorded_s=len(T) / S.FS, codes_ok=sum(v == "ok" for v in check.values()) if coded else None,
+                               codes_bad=len(mismatched) if coded else None)
     if usable_trials < min_fraction * planned_trials:
         raise RuntimeError(f"Only {usable_trials}/{planned_trials} trials usable in {raw_path}; segment not analysed.")
     return df
@@ -273,6 +270,27 @@ class SimBackend:
         raw = seg_dir / "raw.h5"
         simulate.record(self.organoid, seg["duration_s"], pulses, trig, raw)
         return raw
+
+
+def _bar(fraction, width=20):
+    n = int(round(max(0.0, min(1.0, fraction)) * width))
+    return "▕" + "█" * n + "░" * (width - n) + "▏"
+
+
+def status(msg, live=False):
+    """The current segment's status line: rewritten in place on a terminal. In a log file only the
+    phase changes appear (live=True updates, e.g. the recording clock, are skipped there)."""
+    if sys.stdout.isatty():
+        sys.stdout.write("\r\033[K        " + msg)
+        sys.stdout.flush()
+    elif not live:
+        print("        " + msg, flush=True)
+
+
+def clear_status():
+    if sys.stdout.isatty():
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
 
 
 class HardwareBackend:
@@ -308,8 +326,10 @@ class HardwareBackend:
         from neuroplatformv2.core.trigger import TriggerController
         intan, trig, recording = IntanController(), None, False
         try:
+            status("disabling stimulation…")
             await self._ack("disable all stimulation", intan._disable_all_stim())
             if seg["electrodes"]:
+                status(f"uploading stimulation parameters, then {UPLOAD_WAIT_S:.0f} s for the board…")
                 # fresh StimParam objects: the SDK only transmits fields changed since creation
                 await self._ack("send stimulation parameters", intan._send_stimparam(self._params(seg)))
                 await self._ack("upload stimulation parameters",
@@ -317,13 +337,19 @@ class HardwareBackend:
                 await asyncio.sleep(UPLOAD_WAIT_S)
             await self._ack("start raw recording", intan._start_raw_recording(list(range(S.N_CH)), tag, True), 30)
             recording = True
-            self.log(f"  recording {tag} ({seg['duration_s']:.0f} s, {len(seg['events'])} triggers)")
+            dur, n_tr = seg["duration_s"], sum(e["kind"] != "code" for e in seg["events"])
+
+            def show_rec(k=None):
+                t = min(dur, time.monotonic() - start)
+                status(f"recording {_bar(t / dur)} {t:.0f}/{dur:.0f} s" + (f" · {k}/{n_tr} trains sent" if n_tr else ""),
+                       live=True)
+            status(f"recording {dur:.0f} s" + (f", {n_tr} trains" if n_tr else ", no stimulation"))
             if seg["events"]:
                 trig = TriggerController(self.operator)
                 # Send every 16-byte trigger at once. With TCP's default batching (Nagle), triggers
                 # 30 ms apart were held back and delivered in bursts (fs666 curve, 30 Sep 2026).
                 trig.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            start = time.monotonic() + PRE_S
+            start, n_sent = time.monotonic() + PRE_S, 0
             await asyncio.sleep(PRE_S)
             for ev in seg["events"]:
                 await asyncio.sleep(max(0.0, start + ev["t_s"] - time.monotonic()))
@@ -333,7 +359,14 @@ class HardwareBackend:
                 pattern[ev["key"]] = 1
                 trig.sock.sendall(pattern.tobytes())
                 sent.append(dict(key=ev["key"], train_id=ev["train_id"], pulse_index=ev["pulse_index"], utc=_utc()))
-            await asyncio.sleep(max(0.0, start + seg["duration_s"] - time.monotonic()) if not seg["events"] else POST_S)
+                if ev["kind"] != "code":
+                    n_sent += 1
+                    show_rec(n_sent)
+            if seg["events"]:
+                await asyncio.sleep(POST_S)
+            while time.monotonic() < start + dur and not seg["events"]:   # census: show the clock
+                show_rec()
+                await asyncio.sleep(min(1.0, max(0.0, start + dur - time.monotonic())))
         finally:
             errors, notes, stop_ok, disable_ok = [], [], not recording, False
             if trig is not None:
@@ -344,6 +377,7 @@ class HardwareBackend:
                 # cost minutes and never changed the outcome. Completeness is judged from the file:
                 # _wait_saved waits until it stops growing, analysis checks its duration. A recording
                 # that never stopped would never stop growing, and _wait_saved fails loudly.
+                status(f"stopping the recording (up to {STOP_ACK_S:.0f} s; usually unanswered, which is fine)…")
                 try:
                     await self._ack("stop raw recording", intan._stop_raw_recording(), STOP_ACK_S)
                     stop_ok = True
@@ -357,10 +391,12 @@ class HardwareBackend:
             # "Invalid run mode" (fs666 curve, 1 Oct 2026). No stimulation can happen meanwhile:
             # the trigger connection is already closed.
             if recording:
+                status("waiting for the platform to save the file…")
                 try:
                     self.saved = await asyncio.to_thread(self._wait_saved, tag, SAVE_WAIT_S)
                 except Exception as e:  # noqa: BLE001
                     notes.append(f"file not seen saved before the final disable ({e!r})")
+            status("final disable…")
             try:
                 await self._ack("disable all stimulation", intan._disable_all_stim(), DISABLE_ACK_S)
                 disable_ok = True
@@ -369,7 +405,8 @@ class HardwareBackend:
             await intan._close()
             self.close_status = dict(stop_ok=stop_ok, disable_ok=disable_ok, messages=errors + notes)
             if errors:
-                self.log("  CLEAN-UP FAILED: " + " | ".join(errors))
+                clear_status()
+                self.log("        CLEAN-UP FAILED: " + " | ".join(errors))
 
     def run_segment(self, seg: dict, seg_dir: Path, tag: str) -> Path:
         sent: list = []
@@ -378,6 +415,7 @@ class HardwareBackend:
         try:
             asyncio.run(self._segment(seg, tag, sent))
         finally:
+            clear_status()
             pd.DataFrame(sent).to_csv(seg_dir / "sent.csv", index=False)
             (seg_dir / "close_status.json").write_text(json.dumps(self.close_status, indent=1))
         src = self.saved or self._wait_saved(tag)

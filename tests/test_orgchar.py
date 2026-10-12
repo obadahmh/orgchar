@@ -173,6 +173,20 @@ def test_funcsolver_plan_timing_and_structure():
         P.plan_funcsolver([2], counts=(2, 30))                     # beyond the 20-pulse limit
 
 
+def test_plan_trials_places_every_requested_train_once():
+    trials = [(8, 4), (10, 12), (8, 4), (8, 6), (10, 12), (8, 20), (21, 2)]
+    plan = P.plan_trials(trials, seed=1)
+    placed = {}
+    for s in plan["segments"]:
+        for e in s["events"]:                                      # each train has its electrode's uploaded length
+            assert s["electrodes"][e["stim_electrode"]]["n_pulses"] == e["level"]
+            placed[e["request"]] = (e["stim_electrode"], int(e["level"]))
+    assert placed == dict(enumerate(trials))
+    assert len(plan["segments"]) == 3                              # e8 needs three different lengths
+    with pytest.raises(ValueError):
+        P.plan_trials([(8, 30)])                                   # beyond the 20-pulse limit
+
+
 def test_readout_counts_events_after_the_train_only():
     from orgchar import readout as RO
     rng = np.random.default_rng(0)
@@ -209,13 +223,12 @@ def test_funcsolver_finds_the_three_planted_shapes_and_writes_a_loadable_calibra
     if (NCP / "FuncSolver" / "calibration.py").exists():          # FuncSolver's own loader accepts it
         import importlib
         import sys
-        sys.path[:0] = [str(NCP), str(NCP / "FuncSolver")]
+        sys.path.insert(0, str(NCP / "FuncSolver"))
         try:
             C = importlib.import_module("calibration")
-            loaded = C.apply_calibration(path)
-            assert set(loaded["selected"]) == {"short", "band", "long"}
+            assert [ch.type for ch in C.load(path).channels] == ["short", "band", "long"]
         finally:
-            del sys.path[:2]
+            sys.path.remove(str(NCP / "FuncSolver"))
 
 
 def test_funcsolver_artifact_in_window_is_caught(tmp_path):
