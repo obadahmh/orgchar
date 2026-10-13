@@ -83,7 +83,7 @@ FuncSolver (NeuralControlProgram) uses one organoid pair per function shape it c
 
 Verdict per function: **Good** (new-trial R² ≥ 0.5, no large drift), **Fair** (≥ 0.2), **Poor**, or **Missing**.
 
-Outputs: `calibration.json` in FuncSolver's format (schema 1; tested with `FuncSolver/calibration.load`), copied to `sessions/<fsname>/calibration_latest.json` when one complete run finds at least one function; `report.html` leads with the three functions, then single-trial evidence for each, then every pair measured.
+Outputs: `calibration.json` in FuncSolver's format (schema 1; tested with `FuncSolver/calibration.load`), copied to `sessions/<fsname>/calibration_latest.json` when one complete run finds at least one Good or Fair function (Poor ones are left out: on fs674, 12 Oct, a falling curve at R² −1.18 on test trials had been passed on); `report.html` leads with the three functions, then single-trial evidence for each, then every pair measured.
 
 The window starts at the end of the train, so it starts later for longer trains. On fs666 e10, 2–4 pulses set off a burst across the whole organoid lasting ~400 ms; longer trains cut it short and leave the organoid quiet afterwards. Both effects make the curve fall. The four "pairs" e10→e8, e9, e13, e15 are that one burst seen on four electrodes.
 

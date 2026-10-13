@@ -289,11 +289,16 @@ def analyse(step_dir: Path, plan: dict, segs) -> dict:
                 if v else "MISSING: no pair gives this curve"))
         verdict = {"ALL_ROLES": "ALL THREE FUNCTIONS FOUND", "SOME_ROLES": "SOME FUNCTIONS MISSING",
                    "NO_ROLES": "NO USABLE FUNCTION"}[r["verdict"]]
-        cal = F.calibration(plan, plan["fsname"], f"{plan['fsname']}_{step_dir.name}",
-                            {int(k): v for k, v in r["thresholds_uV"].items()}, r["_chosen"], r["pairs"],
-                            code_version(), plan.get("backend") == "simulated", step_dir)
-        (step_dir / "calibration.json").write_text(json.dumps(cal, indent=1, allow_nan=False))
-        r["calibration"] = str(step_dir / "calibration.json")
+        if r["_usable"]:   # Good and Fair functions only
+            cal = F.calibration(plan, plan["fsname"], f"{plan['fsname']}_{step_dir.name}",
+                                {int(k): v for k, v in r["thresholds_uV"].items()}, r["_usable"], r["pairs"],
+                                code_version(), plan.get("backend") == "simulated", step_dir)
+            (step_dir / "calibration.json").write_text(json.dumps(cal, indent=1, allow_nan=False))
+            r["calibration"] = str(step_dir / "calibration.json")
+        else:
+            (step_dir / "calibration.json").unlink(missing_ok=True)
+            if r["_chosen"]:
+                lines.append("No Good or Fair function: nothing for FuncSolver, no calibration written.")
     else:
         sys.exit(f"{step_dir.name}: {step} mode '{plan.get('mode') or plan.get('vary')}' was removed on 5 Oct 2026; "
                  "its report.html and result.json stay as they were.")
@@ -317,10 +322,13 @@ def analyse(step_dir: Path, plan: dict, segs) -> dict:
             RF.screen_page(step_dir / "report.html", plan, r, problems, _when(step_dir))
         else:
             RF.page(step_dir / "report.html", plan, r, problems, _when(step_dir))
-            if not problems and plan.get("backend") != "simulated" and r["verdict"] != "NO_ROLES":
-                latest = step_dir.parent / "calibration_latest.json"
+            latest = step_dir.parent / "calibration_latest.json"
+            if not problems and plan.get("backend") != "simulated" and r["_usable"]:
                 latest.write_text((step_dir / "calibration.json").read_text())
                 lines.append(f"FuncSolver calibration: {latest}")
+            elif latest.exists() and json.loads(latest.read_text())["source"]["step"] == str(step_dir):
+                latest.unlink()   # re-analysed, and this curve no longer qualifies
+                lines.append(f"Removed {latest}: it came from this curve, which no longer qualifies.")
     print("\n" + verdict)
     for s in lines:
         print("  " + s)
@@ -451,7 +459,7 @@ def _status(fs: str, simulate: bool, elsewhere: set[str]) -> list[str]:
         out.append(f"  FuncSolver: {cal} (from {Path(src).name}, {_ago(Path(src))})")
     elif curves:
         out.append("  FuncSolver: no calibration_latest.json" + (" (simulated runs never write one)" if simulate else
-                                                               " yet (written when one complete curve finds at least one function)"))
+                                                               " yet (written when one complete curve finds a Good or Fair function)"))
     if runs:
         last = runs[-1]
         v = res[last].get("verdict_text", "?") if last in res else (

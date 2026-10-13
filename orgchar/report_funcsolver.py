@@ -323,15 +323,19 @@ def page(path, plan, r, problems, when):
 
     # ---- operator
     body.append("<h2>For the operator</h2>")
-    if chosen:
-        cal = r.get("calibration", "calibration.json")
+    if r.get("calibration"):
+        cal = r["calibration"]
         body.append("<p>Train the network offline on these curves (no hardware needed); it uses the types found:</p>"
                     f"<pre class=cmd>cd ~/NeuralControlProgram/FuncSolver\npython main.py train {html.escape(cal)}</pre>")
         if n < 3:
             body.append("<p class=note>To look for the missing type, re-run this step with other stimulating "
                         "electrodes (<code>--stims</code>) or more current (<code>--amplitude</code>).</p>")
+        poor = [_type(k) for k in chosen if k not in r["_usable"]]
+        if poor:
+            body.append(f"<p class=note>Left out of the calibration as Poor on test trials: {', '.join(poor)}.</p>")
     else:
-        body.append("<p>Nothing to hand to the network. Try other stimulating electrodes (<code>--stims</code>) or "
+        body.append(("<p>The curves found are all Poor on test trials, so there is " if chosen else "<p>There is ")
+                    + "nothing to hand to the network. Try other stimulating electrodes (<code>--stims</code>) or "
                     "stronger trains, after re-checking the screen.</p>")
     with open(path, "w") as fh:
         fh.write(_page(title, body))

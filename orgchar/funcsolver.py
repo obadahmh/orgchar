@@ -36,6 +36,9 @@ ARTIFACT_CHECK_MS = 5.0
 ARTIFACT_LIMIT = 3.0
 MIN_EFFECT_P = 0.01         # fit trials: responses must differ across pulse counts (Kruskal-Wallis)
 GOOD_R2, FAIR_R2 = 0.5, 0.2  # test-trial single-trial R² for the plain-language grade
+# Only these go into calibration.json: a Poor curve predicts new trials worse than R² 0.2 (fs674,
+# 12 Oct 2026: a falling curve at R² -1.18 had been handed to FuncSolver)
+USABLE_GRADES = ("good", "fair")
 # Sessions before 6 Oct 2026 named the partitions "development" and "confirmation".
 PARTITION = {"development": "fit", "confirmation": "test"}
 
@@ -343,12 +346,13 @@ def characterise(segments, plan):
         p["grade"], p["grade_reason"] = grade(p)
     chosen = select_roles(pairs)
     role_grade = {r: grade(p, r) for r, p in chosen.items()}
+    usable = {r: p for r, p in chosen.items() if role_grade[r][0] in USABLE_GRADES}
     verdict = ("ALL_ROLES" if len(chosen) == 3 else "SOME_ROLES" if chosen else "NO_ROLES")
     return dict(step="curve", readout="after_train", verdict=verdict, levels=plan["levels"],
                 roles={r: dict(stim=p["stim"], rec=p["rec"], grade=role_grade[r][0], reason=role_grade[r][1],
                                **{k: v for k, v in p["fits"][r].items() if k != "conf_means"}) for r, p in chosen.items()},
                 pairs=[_clean({k: v for k, v in p.items()}) for p in pairs], thresholds_uV=_clean(thr),
-                n_trials=int(D[D.kind == "stim"].train_id.nunique()), _D=D, _chosen=chosen)
+                n_trials=int(D[D.kind == "stim"].train_id.nunique()), _D=D, _chosen=chosen, _usable=usable)
 
 
 # ------------------------------------------------------------------------------ screen: find candidates

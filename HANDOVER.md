@@ -22,7 +22,7 @@ Use FinalSpark organoid channels as activation functions in FuncSolver (`~/Neura
 ## Uncommitted code (np14, 9 Oct 2026)
 - `protocol.plan_trials`: segments for an arbitrary list of (electrode, pulse count) trains, one length per electrode per segment. FuncSolver's live inference uses it.
 - `cli.hardware_lock` (was `_lock`), so FuncSolver's live inference takes the same locks.
-- FuncSolver now accepts any subset of the three types: `calibration_latest.json` is written whenever a complete curve finds at least one function; report and README updated; the test uses FuncSolver's new `calibration.load`.
+- FuncSolver now accepts any subset of the three types: `calibration_latest.json` is written whenever a complete curve finds at least one Good or Fair function (Poor ones are left out since 13 Oct); report and README updated; the test uses FuncSolver's new `calibration.load`.
 - Tests pass (18) and the simulated chain passes. Commit and push once the user agrees.
 
 ## Open questions / next steps
