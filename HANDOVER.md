@@ -22,7 +22,8 @@ Use FinalSpark organoid pairs (stim→rec) as the activation functions of a hybr
 - New: `net.py` (the network, weak-form training, expected R²), `measure.py` (the one hardware primitive), `solve.py`, `orgchar solve`, its report.
 - Removed: the `curve` step, `calibration.json` / `calibration_latest.json`, the curve report. `funcsolver.py` → `screen.py`, `report_funcsolver.py` → `report_screen.py`.
 - 26 tests pass; the simulated chain census → screen → solve passes.
-- Next: port the screen onto `measure` (no shams there either); freeze NeuralControlProgram's FuncSolver; merge into `main` once the user agrees.
+- The screen runs on `measure` too (no shams; every other electrode read, for the cross-organoid controls). `plan_trials` deals electrodes across organoids and gives each its lengths in random order.
+- Next: merge into `main` once the user agrees; both machines then `git pull`.
 
 ## Open questions / next steps
 1. **The network does not oscillate yet.** A plain decay a × exp(−kt) + b scores R² 0.80 at the 25 evaluation times, and every network trained on one curve scores 0.72–0.82 there (16 Oct: the simulated sweep and three synthetic shapes, steep and shallow falling, peaked): it follows the first drop and misses the rebound. The 0.92 offline (14 Oct) used two fitted curves (fs675 short + band). solve reports this reference with every run. Since 16 Oct solve's gate 2 requires the expected R² to beat it, so every run currently stops before the evaluation. Candidates: two pairs, a wider layer, more sweep counts.

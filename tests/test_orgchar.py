@@ -42,9 +42,9 @@ def test_census_separates_live_and_silent_blocks(tmp_path):
 # ------------------------------------------------------------------------------ trigger matching
 
 def _train_segment(reps=12, coded=False):
-    """A screen segment on one electrode: one trigger per train (the board times the pulses), trains
-    >= 4 s apart, shams interleaved."""
-    plan = P.plan_train_screen(electrodes=[21], counts=(2,), reps=reps, sham_reps=4, seed=2)
+    """A recording of trains on one electrode: one trigger per train (the board times the pulses),
+    trains >= 4 s apart."""
+    plan = P.plan_trials([(21, 2)] * reps, seed=2)
     if coded:
         plan = P.add_train_codes(plan)
     return plan["segments"][0]
@@ -118,7 +118,7 @@ def test_train_codes_plan():
 
 def test_codes_confirm_alignment_despite_lost_row_and_late_trigger(tmp_path):
     import h5py
-    seg = _train_segment(reps=6, coded=True)
+    seg = _train_segment(reps=10, coded=True)
     late = next(e["train_id"] for e in seg["events"] if e["kind"] == "stim")
     raw = _record(seg, tmp_path / "raw.h5", lambda ev, s: (s + (int(0.009 * S.FS) if ev["train_id"] == late
                                                                     and ev["kind"] == "stim" else 0), ev["key"]))
@@ -132,7 +132,7 @@ def test_codes_confirm_alignment_despite_lost_row_and_late_trigger(tmp_path):
 
 
 def test_contradicting_code_excludes_train(tmp_path):
-    seg = _train_segment(reps=6, coded=True)
+    seg = _train_segment(reps=10, coded=True)
     swapped = [e for e in seg["events"] if e["kind"] == "code"][4:6]     # train 2's code, read as train 3's
     k1, k2 = P.train_code_keys(3)
     def edit(ev, s):
@@ -184,26 +184,22 @@ def test_readout_counts_events_after_the_train_only():
     assert m["response_events"] == 3 and m["baseline_events"] == 0
 
 
-def test_train_screen_deals_electrodes_two_per_organoid():
-    plan = P.plan_train_screen(blocks=[0, 1, 2, 3], reps=2, sham_reps=1, seed=0)
+def test_plan_trials_deals_electrodes_two_per_organoid():
+    """The screen: every electrode of four organoids. Each recording holds two of each organoid, so the
+    organoids rest in parallel, and the lengths come in a different order on different electrodes."""
+    plan = P.plan_trials([(e, n) for e in range(32) for n in P.SCREEN_COUNTS for _ in range(2)], seed=0)
     assert len(plan["segments"]) == 4 * len(P.SCREEN_COUNTS)
     for s in plan["segments"]:
         orgs = [e // 8 for e in s["electrodes"]]
         assert len(orgs) == P.MAX_UPLOAD_STIMS and all(orgs.count(o) == 2 for o in range(4))
-        assert P.SHAM_KEY not in {v["key"] for v in s["electrodes"].values()}
-        assert all(e["key"] == P.SHAM_KEY for e in s["events"] if e["kind"] == "sham")
+    first = {e: v["n_pulses"] for e, v in plan["segments"][0]["electrodes"].items()}
+    assert len(set(first.values())) > 1
     P.add_train_codes(plan)                                        # codes still fit
 
 
 def _sim_train_screen(tmp_path, org, blocks):
-    plan = P.plan_train_screen(blocks=blocks, seed=2)
-    segs = []
-    for s in plan["segments"]:
-        d = tmp_path / s["id"]
-        d.mkdir()
-        raw = SimBackend(org).run_segment(s, d, "s")
-        segs.append((str(raw), match_triggers(s, raw)))
-    return SC.scout(segs, plan)
+    stims = [e for b in blocks for e in range(8 * b, 8 * b + 8)]
+    return SC.run("fstest", stims, P.SCREEN_COUNTS, 6, SimBackend(org), tmp_path, False, seed=2)
 
 
 def test_train_screen_finds_the_planted_shapes(tmp_path):

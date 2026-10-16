@@ -12,8 +12,7 @@ Definition (method 'orgchar_bandpass_events_v1'), for one electrode and one stim
      `refractory_ms`;
   4. response = events in [train end + window[0], train end + window[1]]
               - baseline events scaled to the window's length.
-The screen also subtracts the mean of its no-current (sham) trials; solve does not, as they evoke
-nothing.
+No sham correction: a no-current trigger evokes nothing (tested many times).
 """
 from __future__ import annotations
 

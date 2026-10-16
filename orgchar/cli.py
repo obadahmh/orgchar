@@ -90,16 +90,6 @@ def _describe(plan):
     n_stim = sum(e["kind"] == "stim" for s in plan["segments"] for e in s["events"])
     n_sham = sum(e["kind"] == "sham" for s in plan["segments"] for e in s["events"])
     n_code = sum(e["kind"] == "code" for s in plan["segments"] for e in s["events"])
-    if plan.get("vary") == "pulse_train":
-        n_pulses = sum(int(s["n_pulses"]) for s in plan["segments"] for e in s["events"] if e["kind"] == "stim")
-        print(f"Plan: after-train screen, {len(plan['segments'])} segments, {n_stim} trains "
-              f"({n_pulses} pulses), {n_sham} sham trials, "
-              + (f"{n_code} code triggers (keys 8-14, no current), " if n_code else "")
-              + f"about {P.plan_duration_s(plan) / 60:.0f} min.")
-        print(f"  stimulating e{', e'.join(str(e) for e in plan['stims'])}; trains of {', '.join(map(str, plan['levels']))} "
-              f"pulses, {plan['ipi_ms']:g} ms apart, {plan['amplitude_uA']} µA × {plan['phase_us']:g} µs; "
-              f"each organoid ≥ {plan['organoid_isi_s'][0]:g} s between trains")
-        return
     print(f"Plan: {plan['step']}, {len(plan['segments'])} segment(s), {n_stim} stimulation pulses, "
           f"{n_sham} sham markers, " + (f"{n_code} code triggers (keys 8-14, no current), " if n_code else "")
           + f"about {P.plan_duration_s(plan) / 60:.1f} min.")
@@ -109,51 +99,24 @@ def _describe(plan):
         print(f"  {s['id']}: {s['duration_s']:.0f} s recording" + (f"; {desc}{' …' if len(el) > 8 else ''}" if el else ""))
 
 
-def _execute(args, plan):
-    """Create the step directory, run every segment, return (step_dir, segments)."""
-    from .backends import match_triggers
-    stamp = _now().strftime("%Y%m%dT%H%M%S")
-    step_dir = _org_dir(args.fsname, args.simulate) / f"{stamp}_{plan['step']}"
+def _run(a, plan: dict, fn):
+    """Create the step directory and its plan.json, take the platform (or the simulated organoid) and
+    return (step_dir, fn(backend, step_dir)). A failure is kept with the data as error.txt."""
+    step_dir = _org_dir(a.fsname, a.simulate) / f"{_now():%Y%m%dT%H%M%S}_{plan['step']}"
     step_dir.mkdir(parents=True)
-    plan = dict(plan, fsname=args.fsname, created_utc=_now().isoformat(), code_version=code_version(),
-                backend="simulated" if args.simulate else "hardware", limits=P.LIMITS)
+    plan = dict(plan, fsname=a.fsname, created_utc=_now().isoformat(), code_version=code_version(),
+                backend="simulated" if a.simulate else "hardware", limits=P.LIMITS)
     (step_dir / "plan.json").write_text(json.dumps(plan, indent=1))
-    if args.simulate:
+    if a.simulate:
         from .backends import SimBackend
         from .simulate import demo_organoid
-        backend = SimBackend(demo_organoid())
-        locks = []
+        backend, locks = SimBackend(demo_organoid()), []
     else:
         from .backends import HardwareBackend
-        backend = HardwareBackend(args.operator)
-        locks = hardware_lock()
-    from .backends import clear_status, status
-    n = len(plan["segments"])
-    planned = [P.plan_duration_s(dict(segments=[s])) for s in plan["segments"]]
-    t0 = time.monotonic()
-    print(f"\n{plan['step']}, {args.fsname}{' (SIMULATED)' if args.simulate else ''}: {n} segment{'s' * (n != 1)}, "
-          f"about {sum(planned) / 60:.0f} min, started {_local():%H:%M %Z}")
+        backend, locks = HardwareBackend(a.operator), hardware_lock()
+    print(f"\n{plan['step']}, {a.fsname}{' (SIMULATED)' if a.simulate else ''}, started {_local():%H:%M %Z}")
     try:
-        segs = []
-        for i, s in enumerate(plan["segments"]):
-            seg_dir = step_dir / s["id"]
-            seg_dir.mkdir()
-            tag = f"orgchar_{args.fsname}_{stamp}_{plan['step']}_{s['id']}"
-            t_seg = time.monotonic()
-            print(f"[{i + 1:>{len(str(n))}}/{n}] {s['id']}: {_seg_text(plan, s)} ({_local():%H:%M:%S})", flush=True)
-            raw = backend.run_segment(s, seg_dir, tag)
-            status("checking the recording…", live=True)
-            sent_csv = seg_dir / "sent.csv"
-            sent = pd.read_csv(sent_csv) if sent_csv.exists() and sent_csv.stat().st_size > 1 else None
-            trials = match_triggers(s, raw, sent)
-            trials.to_csv(seg_dir / "trials.csv", index=False)
-            segs.append((str(raw), trials))
-            clear_status()
-            done = time.monotonic() - t0
-            left = sum(planned[i + 1:]) * done / sum(planned[:i + 1])   # the plan, scaled by the pace so far
-            print(f"        {_seg_result(s, trials)}; took {_mmss(time.monotonic() - t_seg)}"
-                  + (f"; {i + 1}/{n} done, about {left / 60:.0f} min left (until ~{_local(left):%H:%M})" if i + 1 < n
-                     else f"; {'all ' if n > 1 else ''}done in {_mmss(done)}"), flush=True)
+        return step_dir, fn(backend, step_dir)
     except BaseException:
         # keep the failure with the data, so an aborted step is never a silent empty folder
         (step_dir / "error.txt").write_text(f"{_now().isoformat()}\n{traceback.format_exc()}")
@@ -162,7 +125,34 @@ def _execute(args, plan):
     finally:
         for h in locks:
             h.close()
-    return step_dir, segs
+
+
+def _segments(plan, backend, step_dir):
+    """Run every segment of a census or codetest plan; returns [(raw, trials)]."""
+    from .backends import clear_status, match_triggers, status
+    n = len(plan["segments"])
+    planned = [P.plan_duration_s(dict(segments=[s])) for s in plan["segments"]]
+    t0 = time.monotonic()
+    segs = []
+    for i, s in enumerate(plan["segments"]):
+        seg_dir = step_dir / s["id"]
+        seg_dir.mkdir()
+        t_seg = time.monotonic()
+        print(f"[{i + 1:>{len(str(n))}}/{n}] {s['id']}: {_seg_text(plan, s)} ({_local():%H:%M:%S})", flush=True)
+        raw = backend.run_segment(s, seg_dir, f"orgchar_{plan['fsname']}_{step_dir.name}_{s['id']}")
+        status("checking the recording…", live=True)
+        sent_csv = seg_dir / "sent.csv"
+        sent = pd.read_csv(sent_csv) if sent_csv.exists() and sent_csv.stat().st_size > 1 else None
+        trials = match_triggers(s, raw, sent)
+        trials.to_csv(seg_dir / "trials.csv", index=False)
+        segs.append((str(raw), trials))
+        clear_status()
+        done = time.monotonic() - t0
+        left = sum(planned[i + 1:]) * done / sum(planned[:i + 1])   # the plan, scaled by the pace so far
+        print(f"        {_seg_result(s, trials)}; took {_mmss(time.monotonic() - t_seg)}"
+              + (f"; {i + 1}/{n} done, about {left / 60:.0f} min left (until ~{_local(left):%H:%M})" if i + 1 < n
+                 else f"; {'all ' if n > 1 else ''}done in {_mmss(done)}"), flush=True)
+    return segs
 
 
 def _local(after_s=0.0):
@@ -181,10 +171,7 @@ def _seg_text(plan, s):
         return "spontaneous activity, no stimulation"
     if plan["step"] == "codetest":
         return f"train codes on keys 8-14, then 5 control pulses on e{el[0]}"
-    n = int(s.get("n_pulses", 1))
-    what = f"{n}-pulse trains" if n > 1 else "single pulses"
-    part = s.get("partition", "")
-    return (f"{part}, " if part not in ("", "screen", "live") else "") + f"{what} on e{', e'.join(map(str, el))}"
+    return f"single pulses on e{', e'.join(map(str, el))}"
 
 
 def _seg_result(s, trials):
@@ -201,27 +188,14 @@ def _seg_result(s, trials):
     return ("✓ " if ok else "! ") + ", ".join(parts)
 
 
-def _raw(seg_dir: Path) -> Path | None:
-    """The segment's recording: raw.h5 in the folder (simulations; hardware runs before 5 Oct 2026
-    copied it), else the file the platform saved on the S3 mount (remote_path.txt)."""
-    if (seg_dir / "raw.h5").exists():
-        return seg_dir / "raw.h5"
-    if not (seg_dir / "remote_path.txt").exists():
-        return None
-    p = Path((seg_dir / "remote_path.txt").read_text().strip())
-    if not p.exists():
-        sys.exit(f"Recording {p} is not reachable. Is {RAW_ROOT} mounted?")
-    return p
-
-
 def _segments_from_dir(step_dir: Path, plan: dict):
     """Segments with a recording. Trigger matching is redone from the raw file when trials.csv is
     missing (e.g. the step stopped at matching) so salvageable data can still be analysed."""
-    from .backends import match_triggers
+    from .backends import match_triggers, recording
     segs = []
     for s in plan["segments"]:
         sd = step_dir / s["id"]
-        raw = _raw(sd)
+        raw = recording(sd)
         if raw is None:
             continue
         t = sd / "trials.csv"
@@ -239,13 +213,15 @@ def _segments_from_dir(step_dir: Path, plan: dict):
 
 # ------------------------------------------------------------------------------ analysis + report
 
-def analyse(step_dir: Path, plan: dict, segs) -> dict:
-    step = plan["step"]
-    # reading from the S3 mount dominates: ~13 s per recording (fs666 curve, 23 recordings: 303 s)
-    print(f"\nAnalysing {len(segs)} recording{'s' * (len(segs) != 1)}, about {max(1, round(len(segs) * 13 / 60))} min "
-          f"(until ~{_local(len(segs) * 13):%H:%M})…", flush=True)
-    if step == "census":
-        r = A.census(segs[0][0])
+def _census(step_dir: Path, plan: dict, segs) -> dict:
+    # reading from the S3 mount dominates: ~13 s per recording
+    print(f"\nAnalysing the recording (until ~{_local(13):%H:%M})…", flush=True)
+    return A.census(segs[0][0])
+
+
+def _conclude(step_dir: Path, plan: dict, r: dict) -> dict:
+    """Verdict, result.json and report.html of a census or screen."""
+    if plan["step"] == "census":
         lines = [f"Recorded {r['duration_s']:.0f} s without stimulation; spike threshold -{r['threshold_k']:g} × noise.",
                  f"Live organoids (≥1 electrode with real spikes): blocks {r['live_blocks'] or 'none'}."]
         for b in r["blocks"]:
@@ -254,10 +230,10 @@ def analyse(step_dir: Path, plan: dict, segs) -> dict:
                          + (": " + ", ".join(f"e{c['channel']} {c['rate_hz']:.2f} Hz" for c in act) if act else ""))
         verdict = "GO: screen blocks " + ",".join(map(str, r["live_blocks"])) if r["live_blocks"] else \
             "NO-GO: no organoid is firing. Stimulation results would be artifact only. Re-check later or contact FinalSpark."
-    elif step == "screen" and plan.get("mode") == "trains":
-        r = SC.scout(segs, plan)
+        problems = _completeness_problems(step_dir, plan, r)
+    else:
         lines = [f"Trains of {', '.join(map(str, plan['levels']))} pulses on e{', e'.join(map(str, plan['stims']))}; "
-                 "evoked spikes 10-210 ms after the train."]
+                 f"{r['n_trials']} of {r['n_requests']} trains usable; evoked spikes 10-210 ms after the train."]
         for role in SC.ROLES:
             v = r["best"].get(role)
             lines.append(f"{SHAPE[role]}: " + (f"e{v['stim']}→e{v['rec']} (a single trial wins {v['win']:.0%} of the time, "
@@ -269,15 +245,11 @@ def analyse(step_dir: Path, plan: dict, segs) -> dict:
         c = r["controls"]
         lines.append(f"Controls: {c['cross_organoid_passing']} of {c['cross_organoid_pairs']} other-organoid pairs pass "
                      f"(p < {SC.SCOUT_MAX_P:g} alone would let up to about {c['nominal_ceiling']:g} through).")
+        lines += [f"WARNING: {w}" for w in r["warnings"]]
         if r["best"]:
             v = max(r["best"].values(), key=lambda v: (v["win"], v["diff"]))
             lines.append(f"Next: ./orgchar.sh solve --fsname {plan['fsname']}   (the clearest pair, e{v['stim']}→e{v['rec']})")
-        verdict = r["verdict"]
-    else:
-        sys.exit(f"{step_dir.name}: the {step} step (mode '{plan.get('mode') or plan.get('vary')}') was removed (curve on "
-                 "16 Oct 2026: solve measures its own curve; other screen modes on 5 Oct 2026). Its report.html and "
-                 "result.json stay as they were.")
-    problems = _completeness_problems(step_dir, plan, r)
+        verdict, problems = r["verdict"], []
     r["incomplete"] = bool(problems)
     if problems:
         verdict = ("INCOMPLETE: " + "; ".join(problems) + ". Results are for inspection only; re-run this step. "
@@ -287,13 +259,13 @@ def analyse(step_dir: Path, plan: dict, segs) -> dict:
     lines.append(f"Acquired with orgchar {plan.get('code_version', 'unknown (before versioning)')}; "
                  f"analysed with {r['code_version']}.")
     (step_dir / "result.json").write_text(R.to_json(r))
-    if step == "census":
+    if plan["step"] == "census":
         title = f"{plan['fsname']}: census, {_when(step_dir)}" + (" (SIMULATED)" if plan.get("backend") == "simulated" else "")
         R.write_html(step_dir / "report.html", title, verdict, lines, R.census_figures(r),
                      pd.DataFrame(r["channels"]).drop(columns=["waveform"]))
     else:
         from . import report_screen as RS
-        RS.screen_page(step_dir / "report.html", plan, r, problems, _when(step_dir))
+        RS.screen_page(step_dir / "report.html", plan, r, _when(step_dir))
     print("\n" + verdict)
     for s in lines:
         print("  " + s)
@@ -322,9 +294,10 @@ def _close_status(seg_dir: Path) -> dict | None:
 def _completeness_problems(step_dir: Path, plan: dict, r: dict) -> list[str]:
     """A step whose recording was cut short or hit platform errors must not produce a GO."""
     problems = []
+    from .backends import recording
     for s in plan["segments"]:
         st = _close_status(step_dir / s["id"])
-        raw = _raw(step_dir / s["id"])
+        raw = recording(step_dir / s["id"])
         # a segment that uploaded no stimulation (census) has nothing to disable: an unanswered
         # final disable there is not a problem (it starts with an acknowledged disable)
         if st and not st["disable_ok"] and s["electrodes"]:
@@ -443,8 +416,9 @@ def cmd_census(a):
     _describe(plan)
     if a.dry_run or not _confirm(a):
         return
-    step_dir, segs = _execute(a, plan)
-    analyse(step_dir, json.loads((step_dir / "plan.json").read_text()), segs)
+    step_dir, segs = _run(a, plan, lambda backend, step_dir: _segments(dict(plan, fsname=a.fsname), backend, step_dir))
+    plan = json.loads((step_dir / "plan.json").read_text())
+    _conclude(step_dir, plan, _census(step_dir, plan, segs))
 
 
 def cmd_screen(a):
@@ -467,17 +441,22 @@ def cmd_screen(a):
             print(f"  Warning: census is more than {STALE_H:.0f} h old; consider re-running it.")
     if a.reps < 5:
         sys.exit("--reps must be at least 5: with 4 trials against 4 the rank test cannot reach p < 0.01.")
-    plan = P.plan_train_screen(blocks=blocks, electrodes=electrodes,
-                               counts=[int(x) for x in a.levels.split(",")] if a.levels else P.SCREEN_COUNTS,
-                               amplitude_uA=a.amplitude, phase_us=a.phase, polarity=a.polarity, reps=a.reps,
-                               seed=int(time.time()))
-    if _use_codes(a):
-        plan = P.add_train_codes(plan)
-    _describe(plan)
+    stims = sorted(electrodes) if electrodes else [e for b in sorted(blocks) for e in range(8 * b, 8 * b + 8)]
+    counts = sorted(int(x) for x in a.levels.split(",")) if a.levels else list(P.SCREEN_COUNTS)
+    cond = dict(ipi_ms=10.0, amplitude_uA=a.amplitude, phase_us=a.phase, polarity=a.polarity)
+    requests = [(e, n) for e in stims for n in counts for _ in range(a.reps)]
+    est = P.plan_trials(requests, **cond)
+    print(f"Plan: screen, {len(requests)} trains ({sum(n for _, n in requests)} pulses) in about {len(est['segments'])} "
+          f"recordings, about {P.plan_duration_s(est) / 60:.0f} min.\n  stimulating e{', e'.join(map(str, stims))}; "
+          f"{a.reps} trains of {', '.join(map(str, counts))} pulses each, {cond['ipi_ms']:g} ms apart, "
+          f"{a.amplitude:g} µA × {a.phase:g} µs; each organoid ≥ 4 s between trains")
     if a.dry_run or not _confirm(a):
         return
-    step_dir, segs = _execute(a, plan)
-    analyse(step_dir, json.loads((step_dir / "plan.json").read_text()), segs)
+    codes = _use_codes(a)
+    step_dir, r = _run(a, dict(step="screen", mode="trains", levels=counts, stims=stims, reps=a.reps, codes=codes, **cond),
+                       lambda backend, step_dir: SC.run(a.fsname, stims, counts, a.reps, backend, step_dir, codes, cond,
+                                                        seed=int(time.time())))
+    _conclude(step_dir, json.loads((step_dir / "plan.json").read_text()), r)
 
 
 def _use_codes(a) -> bool:
@@ -512,7 +491,7 @@ def cmd_codetest(a):
     _describe(plan)
     if a.dry_run or not _confirm(a):
         return
-    step_dir, segs = _execute(a, plan)
+    step_dir, segs = _run(a, plan, lambda backend, step_dir: _segments(dict(plan, fsname=a.fsname), backend, step_dir))
     r = _codetest_result(plan, segs)
     r["verdict_text"] = ("PASS: train codes are safe and readable; screen and solve now use them by default on this machine"
                          if r["pass"] else "FAIL: do not use --codes. " + "; ".join(r["failures"]))
@@ -566,7 +545,15 @@ def _codetest_result(plan, segs):
 def cmd_analyze(a):
     step_dir = Path(a.step_dir).resolve()
     plan = json.loads((step_dir / "plan.json").read_text())
-    analyse(step_dir, plan, _segments_from_dir(step_dir, plan))
+    if plan["step"] == "census":
+        r = _census(step_dir, plan, _segments_from_dir(step_dir, plan))
+    elif plan["step"] == "screen" and (step_dir / "pass").is_dir():
+        r = SC.reanalyse(step_dir, plan)
+    else:
+        sys.exit(f"{step_dir.name}: only a census or a screen recorded since 16 Oct 2026 can be re-analysed "
+                 "(older screens had sham trials; the curve step was replaced by solve). Its report.html and "
+                 "result.json stay as they were.")
+    _conclude(step_dir, plan, r)
 
 
 def cmd_disable(a):
@@ -617,33 +604,16 @@ def cmd_solve(a):
           f"at most {mins:.0f} min. Each step stops the run if its check fails.")
     if a.dry_run or not _confirm(a):
         return
-    step_dir = _org_dir(a.fsname, a.simulate) / f"{_now():%Y%m%dT%H%M%S}_solve"
-    step_dir.mkdir(parents=True)
-    (step_dir / "plan.json").write_text(json.dumps(dict(
-        step="solve", fsname=a.fsname, pairs=pairs, sweep_reps=a.sweep_reps, reps=a.reps, width=a.width,
-        points=a.points, created_utc=_now().isoformat(), code_version=code_version(),
-        backend="simulated" if a.simulate else "hardware", limits=P.LIMITS), indent=1))
-    if a.simulate:
-        from .backends import SimBackend
-        from .simulate import demo_organoid
-        backend, locks = SimBackend(demo_organoid()), []
-    else:
-        from .backends import HardwareBackend
-        backend, locks = HardwareBackend(a.operator), hardware_lock()
-    try:
-        res = SV.run(a.fsname, pairs, backend, step_dir, _use_codes(a), sweep_reps=a.sweep_reps, eval_reps=a.reps,
-                     width=a.width, points=a.points)
-    except BaseException:
-        (step_dir / "error.txt").write_text(f"{_now().isoformat()}\n{traceback.format_exc()}")
-        print(f"\nStep failed; error saved to {step_dir / 'error.txt'}")
-        raise
-    finally:
-        for h in locks:
-            h.close()
+    codes = _use_codes(a)
+    step_dir, res = _run(a, dict(step="solve", pairs=pairs, sweep_reps=a.sweep_reps, reps=a.reps, width=a.width,
+                                 points=a.points, codes=codes),
+                         lambda backend, step_dir: SV.run(a.fsname, pairs, backend, step_dir, codes,
+                                                          sweep_reps=a.sweep_reps, eval_reps=a.reps, width=a.width,
+                                                          points=a.points))
     res.update(code_version=code_version(), simulated=bool(a.simulate))
     (step_dir / "result.json").write_text(json.dumps(res, indent=1, default=float))
     R.solve_page(step_dir / "report.html", res, _when(step_dir))
-    print(f"Report: {step_dir / 'report.html'}")
+    print(f"\n{res['verdict']}\nReport: {step_dir / 'report.html'}")
 
 
 def _confirm(a):

@@ -57,7 +57,7 @@ An organoid (block of 8) with ≥ 1 active electrode is **LIVE**. LIVE covers a 
 
 ### Step 2: screen (which pairs respond to trains)
 
-Every electrode of each live organoid gets hardware trains of 2, 10 and 20 pulses (6 trials each; `--levels`, `--reps` to change; at least 5 trials, since 4 against 4 can never reach p < 0.01), measured as solve will (see Step 3). For every stimulating → recording pair:
+Every electrode of each live organoid gets hardware trains of 2, 10 and 20 pulses (6 trials each; `--levels`, `--reps` to change; at least 5 trials, since 4 against 4 can never reach p < 0.01), delivered and read out by `measure` as in solve (see Step 3), on every other electrode, so pairs across organoids serve as controls. For every stimulating → recording pair:
 - **falling** if 2-pulse trials beat 20-pulse trials, **rising** if the reverse, **peaked** if the best middle length beats both ends;
 - the comparison is on single trials (rank test, one-sided p < 0.01, at least 1.5 events apart);
 - "single trial wins" = how often one trial at the favoured length beats one at the other.
@@ -70,7 +70,7 @@ events apart). This is a heuristic with ~24 such pairs per electrode, and none w
 organoid is screened. On fs666 (1 Oct) it drops e13→e14, the only peaked candidate, which e19→e14
 and e26→e14 beat and a full curve did not confirm; it keeps all nine falling pairs from e9/e10.
 
-solve measures the clearest of these pairs (highest single-trial win, then the largest difference); `--pairs` chooses others. One upload holds at most 8 stimulating electrodes (keys 8–14 carry train codes), so electrodes are dealt two per organoid per recording and all organoids run side by side.
+solve measures the clearest of these pairs (highest single-trial win, then the largest difference); `--pairs` chooses others. One upload holds at most 8 stimulating electrodes (keys 8–14 carry train codes), so electrodes are dealt two per organoid per recording and all organoids run side by side; each electrode gets its lengths in random order. No sham trials since 16 Oct 2026 (see Step 3).
 
 Why not single pulses: on fs666 (1 Oct 2026) a single-pulse screen picked e2, e20, e29 and e10; only e10 responded after trains.
 
@@ -143,18 +143,19 @@ cd ~/Documents/orgchar
 Useful options:
 - `screen --blocks 1,2`: override the census choice. `screen --electrodes 21,15`: a subset.
 - `solve --pairs 13:10`: choose the pair(s) (stim:rec); `--sweep-reps 8`, `--reps 6` (trains per pulse count in the sweep and the run), `--width 12`, `--points 26`.
-- `--amplitude 3` / `--phase 150`: more current. Stimulation limits are enforced before any upload: ≤ 3 µA, ≤ 200 µs, ≤ 0.4 nC/phase, ≤ 20 pulses. Change them in `orgchar/protocol.py` (`LIMITS`).
+- `screen --amplitude 3` / `--phase 150`: more current. Stimulation limits are enforced before any upload: ≤ 3 µA, ≤ 200 µs, ≤ 0.4 nC/phase, ≤ 20 pulses. Change them in `orgchar/protocol.py` (`LIMITS`).
 
-Each step directory contains:
-- `plan.json` (everything sent);
-- one folder per segment with `sent.csv`, `trials.csv` (recorded trigger edge ↔ planned event), `close_status.json` and `remote_path.txt`;
-- `result.json`, `report.html` (open in a browser; figures are embedded).
+Each step directory contains `plan.json` (the step's settings), `result.json` and `report.html`
+(open in a browser; figures are embedded). Recordings sit one folder each, with `sent.csv`,
+`trials.csv` (recorded trigger edge ↔ planned event), `close_status.json` and `remote_path.txt`:
+- census and codetest: directly in the step directory;
+- screen: in `pass/` (and `retry1/`, `retry2/` for trains requested again), each with its own
+  `plan.json`, and `responses.csv` per recording and for the whole step;
+- solve: the same layout in `sweep/` and `evaluate/`, plus `model.pt`. Its report gives the verdict,
+  the solution (true, network on the curve, network on the tissue, as TUM's Fig. 4f), the measured
+  curve with the run's responses on it, and the checks.
 
-A solve directory holds `sweep/` and `evaluate/` (each: `plan.json`, one folder per recording with
-`trials.csv` and `responses.csv`, and every response in `responses.csv`), `model.pt` and
-`result.json`. Its `report.html` gives the verdict, the solution (true, network on the curve,
-network on the tissue, as TUM's Fig. 4f), the measured curve with the run's responses on it, and the
-checks.
+`analyze` re-reads a census or a screen (one recorded since 16 Oct 2026) from its recordings.
 
 **Raw recordings stay where the platform saves them**, `/mnt/s3-intanraws` (read at ~60 MB/s);
 `remote_path.txt` points to each one. Hardware runs before 5 Oct 2026 copied them into the segment
@@ -215,7 +216,7 @@ Timing alone says *where* each train is, not *which* train it is; the alignment 
 - **Trigger matching:** all 62 fs666 segments of 1–2 Oct and 110 fs675 FuncSolver segments give identical trial tables with the current alignment.
 - **Simulation:** census → screen → solve finds the planted pairs; an organoid with artifacts but no responses gives `NO_CANDIDATE`, and solve on it stops after the sweep.
 - **Not verified:** `solve` itself on hardware.
-- **Codes on keys 8–14 (and the screen's sham key 15) assume no electrode is bound to them.** Each segment starts with disable-all and only the planned electrodes (keys 0–7) are uploaded; every coded run checks for an artifact after code triggers.
+- **Codes on keys 8–14 (and codetest's marker key 15) assume no electrode is bound to them.** Each segment starts with disable-all and only the planned electrodes (keys 0–7) are uploaded; every coded run checks for an artifact after code triggers.
 
-Tests: 26, about 4 min. pytest is not in `ncp`, so use a side venv that leaves `ncp` untouched:
+Tests: 28, about 4 min. pytest is not in `ncp`, so use a side venv that leaves `ncp` untouched:
 `python -m venv --system-site-packages /tmp/t && /tmp/t/bin/pip install pytest && /tmp/t/bin/python -m pytest -q` (create the venv with the `ncp` python).

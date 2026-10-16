@@ -32,10 +32,6 @@ def _type(role):
     return f"{SC.SHAPE_SYMBOL[role]} {TYPE[role]}"
 
 
-def _planned(plan):
-    return sum(1 for s in plan["segments"] for e in s["events"] if e["kind"] == "stim")
-
-
 def _organoid(e):
     return f"e{8 * (e // 8)}–e{8 * (e // 8) + 7}"
 
@@ -51,8 +47,7 @@ TERMS_COMMON = [
     ("Trial", "One train on one stimulating electrode, then counting spikes on the other seven electrodes of the "
               "same organoid. Trials on the same organoid are at least 4 s apart."),
     ("Evoked spikes", "Spikes counted 10 to 210 ms after the end of the train. From this we subtract the spontaneous "
-                      "count in the 500 ms before the train (scaled to the same length) and the sham average."),
-    ("Sham trial", "A trigger that delivers no current. It shows what the counting gives when nothing is stimulated."),
+                      "count in the 500 ms before the train (scaled to the same length)."),
     ("Response types", f"<b>{TYPE['short']}</b>: {TYPE_DESC['short']}. <b>{TYPE['band']}</b>: {TYPE_DESC['band']}. "
                        f"<b>{TYPE['long']}</b>: {TYPE_DESC['long']}."),
 ]
@@ -107,7 +102,7 @@ def _shape_maps(pairs, stims):
     return f"<p class=note>{key}</p><div class=maps>{''.join(out)}</div>"
 
 
-def _candidate_figure(cands, D, levels):
+def _candidate_figure(cands, responses, levels):
     n = len(cands)
     ncol = min(4, n)
     nrow = -(-n // ncol)
@@ -115,9 +110,9 @@ def _candidate_figure(cands, D, levels):
                              gridspec_kw=dict(hspace=0.85, wspace=0.4))
     for k, (role, p) in enumerate(cands):
         ax = axes[k // ncol, k % ncol]
-        g = D[(D.kind == "stim") & (D.stim == p["stim"]) & (D.rec == p["rec"])]
-        y = g.adjusted - p.get("control", 0.0)
-        xs = np.array([levels.index(v) for v in g.level])
+        g = responses[(responses.stim == p["stim"]) & (responses.rec == p["rec"])]
+        y = g.response
+        xs = np.array([levels.index(v) for v in g.pulses])
         ax.scatter(xs + _jitter(len(xs), 0.12, k), y, s=10, color=TYPE_COLOUR[role], alpha=0.7, linewidths=0)
         ax.plot(range(len(levels)), p["means"], color=INK, lw=1.8, marker="o", ms=3.5)
         ax.axhline(0, color=GREY, lw=0.5)
@@ -136,19 +131,18 @@ def _candidate_figure(cands, D, levels):
     return _svg(fig)
 
 
-def screen_page(path, plan, r, problems, when):
-    D = r["_D"]
+def screen_page(path, plan, r, when):
     levels = list(plan["levels"])
     fs = plan["fsname"]
     sim = plan.get("backend") == "simulated"
     best, stims = r["best"], plan["stims"]
-    planned = _planned(plan)
+    planned = r["n_requests"]
     organoids = sorted({e // 8 for e in stims})
     body = [f"<h1>{html.escape(fs)}: screen with pulse trains</h1>",
             f"<p class=meta>{html.escape(when)}{' (SIMULATED)' if sim else ''}; every electrode of the "
             f"organoid(s) on {', '.join(_organoid(8 * o) for o in organoids)}; trains of "
             f"{', '.join(map(str, levels))} pulses, {plan['ipi_ms']:g} ms apart, {plan['amplitude_uA']:g} µA, "
-            f"{plan['phase_us']:g} µs per phase; {r['n_trials']} of {planned} trials usable</p>",
+            f"{plan['phase_us']:g} µs per phase; {r['n_trials']} of {planned} trains usable</p>",
             f"<p>This step is a quick scan. It stimulates every electrode with {len(levels)} train lengths and looks "
             "for pairs that might show one of the three response types. The solve step then measures the clearest "
             "pair's curve in full, trains the network on it and runs it on the tissue.</p>"]
@@ -193,14 +187,13 @@ def screen_page(path, plan, r, problems, when):
 
     c = r["controls"]
     body.append("<h2>Checks</h2><ul class=checks>")
-    body.append(f"<li>{_icon(CHECK_BAD if problems else CHECK_OK)}<span>"
-                + ("<b>Incomplete.</b> " + " ".join(html.escape(x[0].upper() + x[1:]) + "." for x in problems)
-                   if problems else f"All {len(plan['segments'])} recordings are complete.") + "</span></li>")
+    for w in r["warnings"]:
+        body.append(f"<li>{_icon(CHECK_WARN)}<span>{html.escape(w[0].upper() + w[1:])}.</span></li>")
     lost = planned - r["n_trials"]
-    if lost:
-        body.append(f"<li>{_icon(CHECK_OK if lost <= 0.1 * planned else CHECK_WARN)}<span>{lost} of {planned} trials "
-                    "could not be used. Either their trigger was not found in the recording, or a gap in the raw "
-                    "data cut into their counting window.</span></li>")
+    body.append(f"<li>{_icon(CHECK_OK if lost <= 0.1 * planned else CHECK_WARN)}<span>"
+                + (f"{lost} of {planned} trains could not be used, even when requested again: their trigger was not "
+                   "found, or a gap in the raw data cut into their counting window." if lost else
+                   f"All {planned} trains usable.") + "</span></li>")
     ok = r["verdict"] != "CONTROLS_FAILED"
     into = c.get("passing_into", [])
     body.append(f"<li>{_icon(CHECK_OK if ok else CHECK_BAD)}<span>Control pairs: {c['cross_organoid_passing']} of "
@@ -216,7 +209,7 @@ def screen_page(path, plan, r, problems, when):
                 + ("It has faded on every pair 10 ms after the train." if not bad
                    else f"It still reaches the counting window on {len(bad)} pair(s), which were excluded.")
                 + "</span></li>")
-    body.append(f"<li>{_icon(CHECK_OK)}<span>The sham correction uses {c['sham_trials']} sham trials.</span></li></ul>")
+    body.append("</ul>")
 
     body.append("<h2>Every electrode pair</h2><p class=note>The large layout is FinalSpark's electrode map. At each "
                 "electrode sits a small copy of its organoid's map, showing what stimulating that electrode did. "
@@ -229,7 +222,7 @@ def screen_page(path, plan, r, problems, when):
     if cands:
         body.append("<h2>The candidates</h2><p class=note>Up to four per response type, best first. Dots are "
                     "single trials. The line joins the means.</p>"
-                    f"<div class=fig>{_candidate_figure(cands, D, levels)}</div>")
+                    f"<div class=fig>{_candidate_figure(cands, r['_responses'], levels)}</div>")
     trs = "".join(
         f"<tr><td>{_pair(p['stim'], p['rec'])}</td><td>{', '.join(TYPE[k] for k in p['shapes']) or '–'}</td>"
         f"<td class=n>{', '.join(f'{m:.1f}' for m in p['means'])}</td>"

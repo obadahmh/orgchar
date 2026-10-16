@@ -247,6 +247,7 @@ def solve_page(path, res: dict, when: str):
                        f"Oscillation: R² {res['r2']:.2f} on the tissue; the best plain decay a × exp(-kt) + b, which has "
                        f"no oscillation, scores {res['decay_r2']:.2f} at the same times. Only an R² above it shows the "
                        "oscillation."))
+    checks += [(CHECK_WARN, w[0].upper() + w[1:]) for w in res.get("warnings", [])]
     if res.get("drift_max") is not None:
         checks.append((CHECK_OK if res["drift_max"] < 0.3 else CHECK_WARN,
                        f"Largest change of a response between the sweep and the run: {res['drift_max']:.0%} of the "

@@ -173,6 +173,19 @@ def code_artifact_uV(X, onsets) -> float:
     return float(np.abs(med[:, S.samples(1):] - base).max())
 
 
+def recording(seg_dir: Path) -> Path | None:
+    """The segment's raw file: raw.h5 in the folder (simulations; hardware runs before 5 Oct 2026 copied
+    it), else the file the platform saved on the S3 mount (remote_path.txt)."""
+    if (seg_dir / "raw.h5").exists():
+        return seg_dir / "raw.h5"
+    if not (seg_dir / "remote_path.txt").exists():
+        return None
+    p = Path((seg_dir / "remote_path.txt").read_text().strip())
+    if not p.exists():
+        raise FileNotFoundError(f"Recording {p} is not reachable. Is {RAW_ROOT} mounted?")
+    return p
+
+
 def match_triggers(seg: dict, raw_path, sent: pd.DataFrame | None = None, min_fraction=0.9) -> pd.DataFrame:
     """One row per recorded stim/sham trigger edge (one per train: the board times the pulses),
     with its planned event. Rows with exclude=True are kept, so their stimulation stays visible,

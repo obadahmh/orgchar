@@ -139,54 +139,8 @@ def _spaced_timeline(trials, organoid_isi_s, spacing_s, rng, t0=1.0):
     return out
 
 
-def _train_segment(seg_id, stims, n, partition, block, n_reps, n_sham, ipi_ms, amplitude_uA, phase_us, polarity,
-                   organoid_isi_s, spacing_s, rng):
-    """One upload + recording: every electrode in `stims` gets n_reps hardware trains of n pulses,
-    plus n_sham no-current trials, interleaved under the organoid rest and spacing rules."""
-    el = _electrodes(stims, amplitude_uA, phase_us, polarity, n_pulses=n, ipi_ms=ipi_ms)
-    trials = [dict(key=el[e]["key"], kind="stim", stim_electrode=e, level=float(n), pulse_index=0)
-              for e in stims for _ in range(n_reps)]
-    trials += [dict(key=SHAM_KEY, kind="sham", stim_electrode=-1, level=float(n), pulse_index=0)
-               for _ in range(n_sham)]
-    rng.shuffle(trials)
-    evs = _spaced_timeline(trials, organoid_isi_s, spacing_s, rng)
-    for i, ev in enumerate(evs):
-        ev.update(train_id=f"{seg_id}t{i:03d}", partition=partition, block=block)
-    return dict(id=seg_id, electrodes=el, events=evs, partition=partition, block=block,
-                n_pulses=n, duration_s=round(evs[-1]["t_s"] + 1.5, 1))
-
-
 SCREEN_COUNTS = (2, 10, 20)   # still tells falling, peaked and rising apart
-MAX_UPLOAD_STIMS = 8
-
-
-def plan_train_screen(blocks=None, electrodes=None, counts=SCREEN_COUNTS, ipi_ms=10.0, amplitude_uA=2.0,
-                      phase_us=100.0, polarity="negative-first", reps=6, sham_reps=4,
-                      organoid_isi_s=(4.0, 4.5), spacing_s=(1.0, 1.25), seed=0):
-    """Which electrode, given a train, changes what its neighbours do AFTER the train, and how
-    does that change with train length? Every electrode of every chosen organoid gets hardware
-    trains of each length (the network's input), measured with the network's readout. One segment
-    per length (a train's length is part of the upload); all organoids interleaved."""
-    stims = sorted(electrodes) if electrodes else [e for b in sorted(blocks) for e in range(8 * b, 8 * b + 8)]
-    counts = sorted(int(n) for n in counts)
-    for n in counts:
-        check_setting(amplitude_uA, phase_us, n, ipi_ms)
-    # One upload binds at most MAX_UPLOAD_STIMS electrodes to trigger keys (keys 8-14 stay free for
-    # train codes). Electrodes are dealt round-robin across organoids, so every recording holds an
-    # equal share of each organoid and the organoids keep running side by side.
-    by_org = {}
-    for e in stims:
-        by_org.setdefault(e // 8, []).append(e)
-    dealt = [e for i in range(8) for o in sorted(by_org) for e in by_org[o][i:i + 1]]
-    groups = [dealt[i:i + MAX_UPLOAD_STIMS] for i in range(0, len(dealt), MAX_UPLOAD_STIMS)]
-    rng = random.Random(seed)
-    order = [(n, g) for n in counts for g in range(len(groups))]
-    rng.shuffle(order)
-    segs = [_train_segment(f"len{n:02d}_g{g}", sorted(groups[g]), n, "screen", 0, reps, sham_reps, ipi_ms,
-                           amplitude_uA, phase_us, polarity, organoid_isi_s, spacing_s, rng) for n, g in order]
-    return dict(step="screen", mode="trains", vary="pulse_train", readout="after_train", levels=counts,
-                ipi_ms=ipi_ms, amplitude_uA=amplitude_uA, phase_us=phase_us, polarity=polarity, reps=reps,
-                sham_reps=sham_reps, organoid_isi_s=list(organoid_isi_s), stims=stims, segments=segs)
+MAX_UPLOAD_STIMS = 8          # keys 8-14 stay free for train codes
 
 
 # One recording holds at most this much: larger raw files made stop_raw_recording time out (Sep 2026),
@@ -201,7 +155,11 @@ def plan_trials(trials, ipi_ms=10.0, amplitude_uA=2.0, phase_us=100.0, polarity=
     trials: (stim_electrode, n_pulses) pairs, one hardware train each. A train's length is part of
     the upload, so each segment binds every electrode to one length; segments repeat until every
     trial is placed; a segment longer than MAX_SEGMENT_S hands its later trials to the next one. Event i
-    of the input list carries request=i. No sham trials."""
+    of the input list carries request=i. No sham trials.
+
+    A segment takes at most MAX_UPLOAD_STIMS electrodes, dealt round-robin across organoids, so the
+    organoids rest in parallel. Each electrode gets the length with most trials still waiting, ties at
+    random, so lengths are not measured in order (responses drift within a session)."""
     trials = [(int(e), int(n)) for e, n in trials]
     for n in {n for _, n in trials}:
         check_setting(amplitude_uA, phase_us, n, ipi_ms)
@@ -212,8 +170,11 @@ def plan_trials(trials, ipi_ms=10.0, amplitude_uA=2.0, phase_us=100.0, polarity=
         for _, (e, n) in pending:
             counts.setdefault(e, {}).setdefault(n, 0)
             counts[e][n] += 1
-        # per electrode, the length with most trials still waiting; at most MAX_UPLOAD_STIMS electrodes
-        length = {e: max(c, key=c.get) for e, c in sorted(counts.items())[:MAX_UPLOAD_STIMS]}
+        by_org = {}
+        for e in sorted(counts):
+            by_org.setdefault(e // 8, []).append(e)
+        dealt = [e for i in range(8) for o in sorted(by_org) for e in by_org[o][i:i + 1]][:MAX_UPLOAD_STIMS]
+        length = {e: max(counts[e], key=lambda n: (counts[e][n], rng.random())) for e in dealt}
         el = {e: dict(key=i, amplitude_uA=amplitude_uA, phase_us=phase_us, polarity=polarity,
                       n_pulses=n, ipi_ms=float(ipi_ms) if n > 1 else 0.0) for i, (e, n) in enumerate(length.items())}
         now = [(i, e, n) for i, (e, n) in pending if length.get(e) == n]

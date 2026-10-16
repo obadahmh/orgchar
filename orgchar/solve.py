@@ -78,11 +78,11 @@ def run(fsname, pairs, backend, step_dir: Path, codes: bool, ode=N.Oscillator(),
           f"e{', e'.join(map(str, stims))}")
     sweep_req = [(s, n) for s in stims for n in SWEEP_COUNTS for _ in range(sweep_reps)]
     traces = {}
-    sweep, thr = measure(sweep_req, backend, step_dir / "sweep", tag, codes, seed=seed, traces=traces)
+    sweep, thr, problems = measure(sweep_req, backend, step_dir / "sweep", tag, codes, seed=seed, traces=traces)
     art = {(s, r): max((artifact_score(v) for (s2, r2, _), v in traces.items() if (s2, r2) == (s, r) and len(v) >= 3),
                        default=0.0) for s, r in pairs}
     measured = curves_from(sweep, pairs, SWEEP_COUNTS)
-    res.update(sweep_trains=len(sweep_req), sweep_pulses=sum(n for _, n in sweep_req), thresholds_uV=thr,
+    res.update(sweep_trains=len(sweep_req), sweep_pulses=sum(n for _, n in sweep_req), thresholds_uV=thr, warnings=problems,
                curves=[dict(stim=c.stim, rec=c.rec, counts=c.counts, mean=c.mean, sd=c.sd, p=pv, explained=w,
                             artifact=art[(c.stim, c.rec)]) for c, pv, w in measured])
     keep = [c for c, pv, _ in measured if pv < GATE_P and art[(c.stim, c.rec)] < ARTIFACT_LIMIT]
@@ -125,7 +125,8 @@ def run(fsname, pairs, backend, step_dir: Path, codes: bool, ode=N.Oscillator(),
     needed = sorted({(u.stim, int(n)) for j, u in enumerate(net.curves) for n in p[:, j]})
     eval_req = [(s, n) for s, n in needed for _ in range(eval_reps)]
     print(f"\n3/3 Running the network on the tissue: {len(needed)} pulse counts x {eval_reps} trains")
-    ev, _ = measure(eval_req, backend, step_dir / "evaluate", tag, codes, thresholds=thr, seed=seed + 100)
+    ev, _, prob = measure(eval_req, backend, step_dir / "evaluate", tag, codes, thresholds=thr, seed=seed + 100)
+    res["warnings"] += prob
     means = ev.groupby(["stim", "rec", "pulses"]).response.mean()
     h = np.array([[means.get((u.stim, u.rec, int(p[i, j])), np.nan) for j, u in enumerate(net.curves)]
                   for i in range(len(p))])
@@ -154,7 +155,6 @@ def run(fsname, pairs, backend, step_dir: Path, codes: bool, ode=N.Oscillator(),
                        f"{decay:.2f}, so this {'shows' if score > decay else 'does not show'} the oscillation)"
                        + (f"; largest drift since the sweep {max(drift):.0%} of the curve's range" if drift else ""))
     _save(step_dir, res)
-    print(f"\n{res['verdict']}")
     return res
 
 

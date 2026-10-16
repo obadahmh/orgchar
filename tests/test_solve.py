@@ -12,7 +12,7 @@ from orgchar import signals as S
 from orgchar import simulate
 from orgchar import solve as SV
 from orgchar.backends import SimBackend, match_triggers
-from orgchar.measure import ARTIFACT_LIMIT, artifact_score, measure
+from orgchar.measure import ARTIFACT_LIMIT, artifact_score, measure, reread
 
 FALLING = N.Curve(13, 10, tuple(range(2, 21, 2)), tuple(float(40 / (1 + np.exp(0.6 * (n - 9)))) for n in range(2, 21, 2)),
                   (3.0,) * 10)
@@ -87,9 +87,20 @@ def test_trains_lost_in_a_dropped_row_are_requested_again(tmp_path):
                 del f[name]
                 f.create_dataset(name, data=data, chunks=(1, 1280)).attrs["sampling_rate"] = np.uint32(S.FS)
     requests = [(13, 4)] * 8
-    df, thr = measure(requests, _Edit(simulate.demo_organoid(), drop_a_trigger_row), tmp_path, "t")
-    assert sorted(df.request.unique()) == list(range(8)) and (tmp_path / "retry1").is_dir()
+    df, thr, problems = measure(requests, _Edit(simulate.demo_organoid(), drop_a_trigger_row), tmp_path, "t")
+    assert sorted(df.request.unique()) == list(range(8)) and (tmp_path / "retry1").is_dir() and not problems
     assert set(df.rec) == set(range(8, 16)) - {13} and len(thr) == S.N_CH
+    again, _ = reread(tmp_path)                                       # the same responses from the saved recordings
+    assert again.sort_values(["request", "rec"]).reset_index(drop=True).equals(
+        df.sort_values(["request", "rec"]).reset_index(drop=True))
+
+
+def test_every_electrode_and_an_unanswered_disable(tmp_path):
+    def unanswered(call, seg, raw):
+        (raw.parent / "close_status.json").write_text(json.dumps(dict(stop_ok=True, disable_ok=False, messages=[])))
+    df, _, problems = measure([(13, 4)] * 3, _Edit(simulate.demo_organoid(), unanswered), tmp_path, "t",
+                              all_channels=True)
+    assert set(df.rec) == set(range(32)) - {13} and problems == ["final 'disable all stimulation' unanswered after pass/seg00"]
 
 
 def test_artifact_in_the_counting_window_is_caught(tmp_path):

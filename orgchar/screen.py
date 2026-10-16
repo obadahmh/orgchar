@@ -1,97 +1,21 @@
-"""The screen's analysis: which stim -> rec pairs respond to the train length, and how (response
-types: short = falling, band = peaked, long = rising with the number of pulses). solve then measures
-the best pairs' curves in full.
+"""The screen: every electrode of the live organoids gets trains of 2, 10 and 20 pulses, read out on every
+other electrode; which stim -> rec pairs respond to the train length, and how (response types: short =
+falling, band = peaked, long = rising with the number of pulses). solve then measures the clearest pair's
+curve in full.
+
+Pairs across organoids cannot respond: they are the negative controls (drop_chance, CONTROLS_FAILED).
 """
 from __future__ import annotations
 
-import math
 import warnings
+from pathlib import Path
 
 import numpy as np
-import pandas as pd
 from scipy import stats
 
-from . import readout as RO
-from . import signals as S
+from .measure import ARTIFACT_LIMIT, CONDITION, artifact_score, measure, reread
 
 ROLES = ("short", "band", "long")
-# Artifact check: the median across trials of the first ARTIFACT_CHECK_MS of the response window,
-# in units of what a median of that many trials varies by anyway (1.25 x across-trial SD /
-# sqrt(trials), from the same samples). An artifact tail is identical on every trial: large median,
-# small spread. Spikes and bursts are not time-locked: they raise the spread as much as the median
-# (fs666 e10, 1 Oct 2026: 30-50 µV bursts were flagged when the quiet noise was the yardstick).
-ARTIFACT_CHECK_MS = 5.0
-ARTIFACT_LIMIT = 3.0
-
-
-# ------------------------------------------------------------------------------ measurement
-
-def measure(segments, plan, spec=RO.SPEC, all_channels=False):
-    """Every trial on every electrode of its organoid (shams: every electrode), with the readout.
-    all_channels: stimulation trials on every electrode, so other-organoid pairs can serve as
-    negative controls. Thresholds come from the pre-train baselines."""
-    segs = {s["id"]: s for s in plan["segments"]}
-    nb = int(round(spec["baseline_duration_ms"] * spec["sample_rate_hz"] / 1000))
-    # 1) noise -> frozen thresholds, from the pre-train baselines
-    noise = {c: [] for c in range(S.N_CH)}
-    for raw, trials in segments:
-        X, _ = S.load_raw(raw)
-        on = trials[~trials.exclude].onset.values
-        on = on[on > nb]
-        for c in range(S.N_CH):
-            v = np.concatenate([X[c, o - nb:o - S.samples(20)] for o in on[:60]]) if len(on) else X[c, :S.FS * 10]
-            noise[c].append(RO.noise_uV(v, spec))
-    thr = {c: RO.threshold_from_noise(np.median(v), spec) for c, v in noise.items() if v}
-    # 2) every trial
-    rows, traces = [], {}
-    for si, (raw, trials) in enumerate(segments):
-        seg = segs[trials.segment.iloc[0]]
-        X, _ = S.load_raw(raw)
-        n, ipi = int(seg["n_pulses"]), float(plan["ipi_ms"])
-        need = RO.post_samples_needed(n, ipi, plan["phase_us"], spec)
-        for t in trials[~trials.exclude & trials.kind.isin(["stim", "sham"])].itertuples():
-            o = int(t.onset)
-            if o < nb or o + need > X.shape[1]:
-                continue
-            stim = int(t.stim_electrode)
-            recs = (range(S.N_CH) if t.kind == "sham" else [c for c in range(S.N_CH) if c != stim] if all_channels
-                    else [c for c in range(8 * (stim // 8), 8 * (stim // 8) + 8) if c != stim])
-            for c in recs:
-                m = RO.measure_trial(X[c, o - nb:o], X[c, o:o + need], n, ipi, plan["phase_us"], thr[c], spec,
-                                     keep_trace=t.kind == "stim")
-                rows.append(dict(segment=seg["id"], seg_index=si, kind=t.kind, stim=stim, rec=c, level=n, onset=o, train_id=t.train_id,
-                                 response=m["response_events"], baseline=m["baseline_events"], adjusted=m["adjusted"]))
-                if t.kind == "stim" and c // 8 == stim // 8:   # window start, to check for time-locked artifact
-                    lst = traces.setdefault((stim, c, n), [])
-                    if len(lst) < 24:
-                        lst.append(m["trace"][:S.samples(ARTIFACT_CHECK_MS)])
-    D = pd.DataFrame(rows)
-    seg_order = {s["id"]: i for i, s in enumerate(plan["segments"])}
-    D["order"] = D.segment.map(seg_order) * 1e9 + D.onset
-    # artifact = what is common to every trial (median); spikes are not time-locked and drop out
-    art = {}
-    for k, v in traces.items():
-        if len(v) >= 3:
-            A = np.stack(v)
-            spread = np.sqrt((A.std(axis=0) ** 2).mean())
-            art[k] = float(np.sqrt((np.median(A, axis=0) ** 2).mean()) / max(1.2533 * spread / np.sqrt(len(v)), 1e-9))
-    return D, thr, art
-
-
-def _clean(v):
-    if isinstance(v, dict):
-        return {str(k): _clean(x) for k, x in v.items()}
-    if isinstance(v, (list, tuple)):
-        return [_clean(x) for x in v]
-    if isinstance(v, (np.floating, float)):
-        return float(v) if math.isfinite(v) else None
-    if isinstance(v, np.integer):
-        return int(v)
-    return v
-
-
-# ------------------------------------------------------------------------------ screen: find candidates
-
 SCOUT_MAX_P = 0.01       # one-sided Mann-Whitney between the two train lengths that define the shape
 SCOUT_MIN_EVENTS = 1.5   # and at least this many events apart (a curve the network can use)
 SHAPE_SYMBOL = dict(short="↘", band="∧", long="↗")
@@ -148,25 +72,35 @@ def drop_chance(same, cross):
     return dropped
 
 
-def scout(segments, plan):
-    """The after-train screen: for every electrode pair, the response to trains of each length,
-    and which pairs fall, peak or rise with it."""
-    D, thr, art = measure(segments, plan, all_channels=True)
-    levels = list(plan["levels"])
-    sham = D[D.kind == "sham"]
-    control = sham.groupby("rec").adjusted.mean().to_dict()
-    stim = D[D.kind == "stim"].copy()
-    stim["y"] = stim.adjusted - stim.rec.map(control)
+def run(fsname, stims, counts, reps, backend, step_dir: Path, codes: bool, condition=CONDITION, seed=0) -> dict:
+    """Deliver `reps` trains of each length in `counts` on each electrode in `stims`, and analyse them."""
+    requests = [(e, n) for e in stims for n in counts for _ in range(reps)]
+    traces = {}
+    responses, thr, problems = measure(requests, backend, step_dir, f"orgchar_{fsname}_{step_dir.name}", codes,
+                                       seed=seed, condition=condition, all_channels=True, traces=traces)
+    return scout(responses, traces, list(counts), len(requests), thr, problems)
+
+
+def reanalyse(step_dir: Path, plan: dict) -> dict:
+    """The screen again from its saved recordings (e.g. after a change to the readout or the analysis)."""
+    traces = {}
+    responses, thr = reread(step_dir, all_channels=True, traces=traces)
+    return scout(responses, traces, plan["levels"], len(plan["stims"]) * len(plan["levels"]) * plan["reps"], thr)
+
+
+def scout(responses, traces, levels, n_requests, thresholds, warnings_=()) -> dict:
+    """For every electrode pair, the response to trains of each length, and which pairs look falling,
+    peaked or rising."""
+    art = {k: artifact_score(v) for k, v in traces.items() if len(v) >= 3}
+    d = responses.rename(columns={"pulses": "level", "response": "y"})
     pairs = []
-    for (e, c), g in stim.groupby(["stim", "rec"]):
+    for (e, c), g in d.groupby(["stim", "rec"]):
         if g.level.nunique() < len(levels) or g.groupby("level").size().min() < 3:
             continue
         sc = shape_scores(g, levels)
-        same = e // 8 == c // 8
         a = max((art.get((e, c, n), 0.0) for n in levels), default=0.0)
-        means = g.groupby("level").y.mean().reindex(levels)
-        row = dict(stim=int(e), rec=int(c), same_organoid=same, levels=[int(n) for n in levels],
-                   control=float(control.get(c, 0.0)), means=means.round(3).tolist(),
+        row = dict(stim=int(e), rec=int(c), same_organoid=e // 8 == c // 8, levels=[int(n) for n in levels],
+                   means=g.groupby("level").y.mean().reindex(levels).round(3).tolist(),
                    sd=g.groupby("level").y.std().reindex(levels).round(3).tolist(), artifact=a,
                    artifact_ok=a < ARTIFACT_LIMIT, scores=sc)
         row["shapes"] = [k for k, v in sc.items()
@@ -191,9 +125,8 @@ def scout(segments, plan):
     verdict = "CANDIDATES_FOUND" if best else "NO_CANDIDATE"
     if cross and false_pos > max(3, 3 * ceiling):
         verdict = "CONTROLS_FAILED"
-    return dict(step="screen", mode="trains", verdict=verdict, levels=levels, best=best,
-                chance=chance, controls=dict(cross_organoid_pairs=len(cross), cross_organoid_passing=false_pos,
-                                             passing_into=sorted({p["rec"] for p in cross if p["shapes"]}),
-                                             nominal_ceiling=ceiling, sham_trials=int(sham.train_id.nunique())),
-                pairs=[_clean(p) for p in same], thresholds_uV=_clean(thr),
-                n_trials=int(stim.train_id.nunique()), _D=D, _cross=cross)
+    return dict(step="screen", mode="trains", verdict=verdict, levels=list(levels), best=best, chance=chance,
+                controls=dict(cross_organoid_pairs=len(cross), cross_organoid_passing=false_pos,
+                              passing_into=sorted({p["rec"] for p in cross if p["shapes"]}), nominal_ceiling=ceiling),
+                pairs=same, thresholds_uV=thresholds, n_trials=int(responses.request.nunique()), n_requests=n_requests,
+                warnings=list(warnings_), _responses=responses, _cross=cross)
