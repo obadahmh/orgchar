@@ -7,8 +7,8 @@ Three steps tell you, for this week's FinalSpark organoids:
 
 ```
 census   ~8 min, no stimulation       → which organoids are alive?             GO / NO-GO
-screen   ~40 min (4 live organoids)   → which electrodes give which shape?     candidates
-curve    40–65 min                    → curves checked on new trials           calibration.json
+screen   ~30 min (4 live organoids)   → which electrodes give which shape?     candidates
+curve    30–45 min                    → curves checked on new trials           calibration.json
 ```
 
 One paste runs all three; each step only starts if the previous one found something:
@@ -53,7 +53,7 @@ An organoid (block of 8) with ≥ 1 active electrode is **LIVE**. LIVE covers a 
 
 ### Step 2: screen (which electrodes give which shape after a train)
 
-Every electrode of each live organoid gets hardware trains of 2, 6, 12 and 20 pulses (6 trials each), measured exactly as FuncSolver will (events 10–210 ms after the train; see Step 3). For every stimulating → recording pair:
+Every electrode of each live organoid gets hardware trains of 2, 10 and 20 pulses (6 trials each; `--levels`, `--reps` to change; at least 5 trials, since 4 against 4 can never reach p < 0.01), measured exactly as FuncSolver will (events 10–210 ms after the train; see Step 3). For every stimulating → recording pair:
 - **falling** if 2-pulse trials beat 20-pulse trials, **rising** if the reverse, **peaked** if the best middle length beats both ends;
 - the comparison is on single trials (rank test, one-sided p < 0.01, at least 1.5 events apart);
 - "single trial wins" = how often one trial at the favoured length beats one at the other: the number that decides whether FuncSolver can use it.
@@ -75,15 +75,15 @@ Why not single pulses: on fs666 (1 Oct 2026) a single-pulse screen picked e2, e2
 FuncSolver (NeuralControlProgram) uses one organoid pair per function shape it can get: **short** (falling: more pulses → fewer events), **band** (peaked) and **long** (rising); any subset works. It sends **one** train per evaluation and reads **one** response, so a curve is only as good as single trials are close to it. Each evaluation gives the three roles different pulse counts at once, so each role needs its own stimulating electrode.
 
 `curve` measures exactly what FuncSolver uses:
-- **Input:** a hardware train of 2, 4, …, 20 pulses, 10 ms apart, 2 µA × 100 µs. One trigger; the stimulator repeats the pulse, as FuncSolver delivers it. A train's length is part of the upload, so there is one recording per pulse count.
+- **Input:** a hardware train of 2, 5, 8, 11, 14, 17 or 20 pulses (8 trials per count and pass; `--levels`, `--reps` to change), 10 ms apart, 2 µA × 100 µs. One trigger; the stimulator repeats the pulse, as FuncSolver delivers it. A train's length is part of the upload, so there is one recording per pulse count.
 - **Output** (`orgchar/readout.py`, one function for calibration and live use): 300–3000 Hz band-pass, events = crossings of −5× noise counted **10–210 ms after the train**, minus the 500 ms before it (scaled), minus the mean of no-current sham trials. The raw voltage swings by hundreds of µV on some electrodes; counting on it unfiltered would count those swings.
-- **Order:** reference (10 pulses) → **fit** (every count, shuffled) → reference → **test** (reshuffled) → reference. Folders are named `ref0`, `fit_n02` … `fit_n20`, `ref1`, `test_n02` … `test_n20`, `ref2` (sessions before 6 Oct 2026 used `dev_` and `con_`). Each organoid ≥ 4 s between trains, trains ≥ 1 s apart. Every other electrode of each stimulated organoid is measured.
+- **Order:** reference (10 pulses) → **fit** (every count, shuffled) → reference → **test** (reshuffled) → reference. Folders are named `ref0`, `fit_n02` … `fit_n20`, `ref1`, `test_n02` … `test_n20`, `ref2`. Until 13 Oct 2026 the defaults were 2, 4, …, 20 pulses × 10 trials, and a screen of 2, 6, 12, 20: changed to cut recordings and stimulation by about a third (fs674 faded within an hour of being stimulated, 12 Oct) (sessions before 6 Oct 2026 used `dev_` and `con_`). Each organoid ≥ 4 s between trains, trains ≥ 1 s apart. Every other electrode of each stimulated organoid is measured.
 - **Fit trials alone** choose the pairs (FuncSolver's shape rule, then the best cross-validated single-trial fit, each role on its own stimulating electrode) and fit FuncSolver's curve formulas. **Test trials** only score those frozen curves: R² and error on new single trials. The references show drift.
 - **Artifact check:** the median across trials of the window's first 5 ms, in units of its own noise floor. Spikes are not time-locked and drop out; an artifact tail does not. Pairs over 3× are excluded. On the fs647 hardware-train recordings of 8 Sep the largest value was 2.6×.
 
 Verdict per function: **Good** (new-trial R² ≥ 0.5, no large drift), **Fair** (≥ 0.2), **Poor**, or **Missing**.
 
-Outputs: `calibration.json` in FuncSolver's format (schema 1; tested with `FuncSolver/calibration.load`), copied to `sessions/<fsname>/calibration_latest.json` when one complete run finds at least one Good or Fair function (Poor ones are left out: on fs674, 12 Oct, a falling curve at R² −1.18 on test trials had been passed on); `report.html` leads with the three functions, then single-trial evidence for each, then every pair measured.
+Outputs: `calibration.json` in FuncSolver's format (schema 1; tested with `FuncSolver/calibration.load`), copied to `sessions/<fsname>/calibration_latest.json` when one complete run finds at least one Good or Fair function (Poor ones are left out: on fs674, 12 Oct, a falling curve at R² −1.18 on test trials had been passed on); `report.html` opens with the verdict and the command for the network, then one tile per response type (grade, R² on test trials, the pair on a small electrode map, the curve), the checks, single-trial evidence and a drift check for each chosen pair, and every pair measured: per stimulating electrode, the organoid's electrode map coloured by response size beside a table of responses per train length, on one colour scale.
 
 The window starts at the end of the train, so it starts later for longer trains. On fs666 e10, 2–4 pulses set off a burst across the whole organoid lasting ~400 ms; longer trains cut it short and leave the organoid quiet afterwards. Both effects make the curve fall. The four "pairs" e10→e8, e9, e13, e15 are that one burst seen on four electrodes.
 

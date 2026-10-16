@@ -160,8 +160,8 @@ NCP = Path.home() / "NeuralControlProgram"
 
 def test_funcsolver_plan_timing_and_structure():
     plan = P.plan_funcsolver([2, 10, 20, 29], reps=4, sham_reps=2, seed=1)
-    parts = [s["partition"] for s in plan["segments"]]
-    assert parts[0] == parts[11] == parts[-1] == "reference" and parts.count("fit") == 10
+    parts, n = [s["partition"] for s in plan["segments"]], len(P.FUNCSOLVER_COUNTS)
+    assert parts[0] == parts[n + 1] == parts[-1] == "reference" and parts.count("fit") == n
     for s in plan["segments"]:
         assert all(v["n_pulses"] == s["n_pulses"] for v in s["electrodes"].values())
         t = np.array([e["t_s"] for e in s["events"]])
@@ -261,7 +261,7 @@ def test_funcsolver_artifact_in_window_is_caught(tmp_path):
 
 def test_train_screen_deals_electrodes_two_per_organoid():
     plan = P.plan_train_screen(blocks=[0, 1, 2, 3], reps=2, sham_reps=1, seed=0)
-    assert len(plan["segments"]) == 4 * 4
+    assert len(plan["segments"]) == 4 * len(P.SCREEN_COUNTS)
     for s in plan["segments"]:
         orgs = [e // 8 for e in s["electrodes"]]
         assert len(orgs) == P.MAX_UPLOAD_STIMS and all(orgs.count(o) == 2 for o in range(4))
@@ -305,3 +305,23 @@ def test_candidate_matched_by_another_organoid_is_dropped():
     dropped = F.drop_chance(same, cross)
     assert dropped == [dict(stim=13, rec=14, role="band", beaten_by=19)]
     assert same[0]["shapes"] == [] and same[1]["shapes"] == ["short"]
+
+
+def test_live_trials_fit_in_short_recordings():
+    """540 trains of one length on one electrode (FuncSolver, fs675, 14 Oct 2026) made one 38-min recording
+    that the platform never saved. Every trial must still be placed exactly once."""
+    trials = [(18, 20)] * 540 + [(18, 2)] * 40
+    plan = P.plan_trials(trials, seed=1)
+    assert all(s["duration_s"] <= P.MAX_SEGMENT_S + 2 for s in plan["segments"])
+    placed = sorted(e["request"] for s in plan["segments"] for e in s["events"])
+    assert placed == list(range(len(trials)))
+    assert all(len({v["n_pulses"] for v in s["electrodes"].values()}) == 1 for s in plan["segments"])
+
+
+def test_short_recording_with_one_late_first_trigger():
+    """FuncSolver retry, fs675, 15 Oct 2026: two code triggers and one train; the first code trigger was
+    recorded 2.5 ms later than the other two. All three must be matched."""
+    from orgchar.backends import _align
+    edges = [(88650, 8), (88890, 8), (91570, 0)]
+    pairs, _ = _align(edges, [0.9, 0.91024, 0.999522], [8, 8, 0])
+    assert pairs == [(0, 0), (1, 1), (2, 2)]

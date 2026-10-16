@@ -69,11 +69,38 @@ dl.terms dd{margin:0;color:var(--muted)}
 @media (max-width:600px){dl.terms{grid-template-columns:1fr}dl.terms dd{margin-bottom:6px}}
 details{margin:10px 0}
 summary{cursor:pointer;color:var(--muted)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 18px}
+.chip{font-size:12px;color:var(--muted);background:var(--code);border:1px solid var(--line);border-radius:999px;padding:2px 10px}
+.verdict{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:0 0 14px}
+.verdict .lede{margin:0 0 4px}
+.verdict p{margin:0 0 6px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;margin:0 0 8px}
+.tile{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--type);border-radius:10px;
+      padding:12px 14px;display:flex;flex-direction:column;gap:4px}
+.tile.missing{border-style:dashed;border-left-style:dashed;color:var(--muted)}
+.tile .head{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.tile .type{font-weight:700}
+.tile .pair{display:flex;align-items:center;gap:10px;font-size:15px;font-weight:600}
+.tile .big{font-size:26px;font-weight:700;line-height:1.1}
+.tile .sub{font-size:12px;color:var(--muted)}
+.pill{display:inline-flex;align-items:center;gap:4px;font-size:12px;font-weight:600;border-radius:999px;padding:1px 9px;
+      background:color-mix(in srgb,var(--status) 16%,transparent);white-space:nowrap}
+.pill .ico{color:var(--status);width:auto}
+.stim{display:flex;flex-wrap:wrap;gap:16px 28px;align-items:flex-start;margin:14px 0 22px}
+.stim h3{margin:0 0 6px}
+table.heat{border-collapse:separate;border-spacing:2px;font-size:12px}
+table.heat th{border:0;padding:0 4px;font-weight:500;text-align:center}
+table.heat th.row{text-align:left;padding-right:10px;font-weight:600;color:var(--ink)}
+table.heat td{border:0;padding:0;width:30px;height:24px;border-radius:3px}
+table.heat td.type{width:auto;padding:0 0 0 10px;font-size:12px;color:var(--muted);white-space:nowrap}
+.scale{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin:4px 0 10px}
+.scale .bar{width:160px;height:10px;border-radius:3px}
 """
 
 
 def _page(title: str, body: list[str]) -> str:
-    return (f"<title>{html.escape(title)}</title>\n<meta charset=utf-8>\n<style>{CSS}</style>\n<main>\n"
+    return (f"<title>{html.escape(title)}</title>\n<meta charset=utf-8>\n"
+            f"<meta name=viewport content='width=device-width,initial-scale=1'>\n<style>{CSS}</style>\n<main>\n"
             + "\n".join(body) + "\n</main>\n")
 
 
@@ -112,7 +139,7 @@ def census_figures(r: dict) -> list[tuple[str, str]]:
             a.axis("off")
         for a, (_, row) in zip(axs.flat, act.iterrows()):
             a.plot(t, row.waveform, color=BLUE, lw=1.4)
-            a.set_title(f"e{row.channel} · {row.rate_hz:.1f} Hz", fontsize=8, fontweight="normal")
+            a.set_title(f"e{row.channel}: {row.rate_hz:.1f} Hz", fontsize=8, fontweight="normal")
             a.set_xticks([0, 1])
         for a in axs[:, 0]:
             a.set_ylabel("µV")

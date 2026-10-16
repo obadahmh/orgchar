@@ -1,8 +1,8 @@
 """orgchar: weekly characterisation of FinalSpark organoids.
 
     orgchar census --fsname fs652          # ~8 min, no stimulation: which organoids fire?
-    orgchar screen --fsname fs652          # ~40 min: which electrodes give FuncSolver's shapes after trains?
-    orgchar curve  --fsname fs652          # 40-65 min: FuncSolver curves (2-20 pulse trains) -> calibration.json
+    orgchar screen --fsname fs652          # ~30 min: which electrodes give FuncSolver's shapes after trains?
+    orgchar curve  --fsname fs652          # 30-45 min: FuncSolver curves (2-20 pulse trains) -> calibration.json
     orgchar status [--fsname fs652]        # where each organoid stands (default: every organoid run this week)
     orgchar analyze <step dir>             # re-run the analysis of a finished step, offline
     orgchar codetest --fsname fs652        # ~3 min: check that train codes (--codes) are safe and readable
@@ -135,8 +135,8 @@ def _execute(args, plan):
     n = len(plan["segments"])
     planned = [P.plan_duration_s(dict(segments=[s])) for s in plan["segments"]]
     t0 = time.monotonic()
-    print(f"\n{plan['step']} · {args.fsname}{' · SIMULATED' if args.simulate else ''} · {n} segment{'s' * (n != 1)} · "
-          f"about {sum(planned) / 60:.0f} min · started {_local():%H:%M %Z}")
+    print(f"\n{plan['step']}, {args.fsname}{' (SIMULATED)' if args.simulate else ''}: {n} segment{'s' * (n != 1)}, "
+          f"about {sum(planned) / 60:.0f} min, started {_local():%H:%M %Z}")
     try:
         segs = []
         for i, s in enumerate(plan["segments"]):
@@ -144,7 +144,7 @@ def _execute(args, plan):
             seg_dir.mkdir()
             tag = f"orgchar_{args.fsname}_{stamp}_{plan['step']}_{s['id']}"
             t_seg = time.monotonic()
-            print(f"[{i + 1:>{len(str(n))}}/{n}] {s['id']} · {_seg_text(plan, s)} · {_local():%H:%M:%S}", flush=True)
+            print(f"[{i + 1:>{len(str(n))}}/{n}] {s['id']}: {_seg_text(plan, s)} ({_local():%H:%M:%S})", flush=True)
             raw = backend.run_segment(s, seg_dir, tag)
             status("checking the recording…", live=True)
             sent_csv = seg_dir / "sent.csv"
@@ -155,9 +155,9 @@ def _execute(args, plan):
             clear_status()
             done = time.monotonic() - t0
             left = sum(planned[i + 1:]) * done / sum(planned[:i + 1])   # the plan, scaled by the pace so far
-            print(f"        {_seg_result(s, trials)} · took {_mmss(time.monotonic() - t_seg)}"
-                  + (f" · {i + 1}/{n} done, about {left / 60:.0f} min left (until ~{_local(left):%H:%M})" if i + 1 < n
-                     else f" · {'all ' if n > 1 else ''}done in {_mmss(done)}"), flush=True)
+            print(f"        {_seg_result(s, trials)}; took {_mmss(time.monotonic() - t_seg)}"
+                  + (f"; {i + 1}/{n} done, about {left / 60:.0f} min left (until ~{_local(left):%H:%M})" if i + 1 < n
+                     else f"; {'all ' if n > 1 else ''}done in {_mmss(done)}"), flush=True)
     except BaseException:
         # keep the failure with the data, so an aborted step is never a silent empty folder
         (step_dir / "error.txt").write_text(f"{_now().isoformat()}\n{traceback.format_exc()}")
@@ -202,7 +202,7 @@ def _seg_result(s, trials):
     if m.get("codes_ok") is not None:
         parts.append(f"codes {m['codes_ok']}/{m['planned']}" + (f", {m['codes_bad']} CONTRADICT" if m["codes_bad"] else ""))
     ok = m["usable"] == m["planned"] and not m.get("codes_bad")
-    return ("✓ " if ok else "! ") + " · ".join(parts)
+    return ("✓ " if ok else "! ") + ", ".join(parts)
 
 
 def _raw(seg_dir: Path) -> Path | None:
@@ -313,7 +313,7 @@ def analyse(step_dir: Path, plan: dict, segs) -> dict:
                  f"analysed with {r['code_version']}.")
     (step_dir / "result.json").write_text(R.to_json(r))
     if step == "census":
-        title = f"{plan['fsname']} · census · {_when(step_dir)}" + (" · SIMULATED" if plan.get("backend") == "simulated" else "")
+        title = f"{plan['fsname']}: census, {_when(step_dir)}" + (" (SIMULATED)" if plan.get("backend") == "simulated" else "")
         R.write_html(step_dir / "report.html", title, verdict, lines, R.census_figures(r),
                      pd.DataFrame(r["channels"]).drop(columns=["waveform"]))
     else:
@@ -423,7 +423,7 @@ def _status(fs: str, simulate: bool, elsewhere: set[str]) -> list[str]:
             act = [x for x in c["channels"] if x["block"] == b["block"] and x["active"]]
             orgs.append(f"e{8 * b['block']}-{8 * b['block'] + 7}: " + (
                 f"{len(act)} active, {sum(x['rate_hz'] for x in act):.1f} Hz" if act else "silent"))
-        out.append("          " + " · ".join(orgs))
+        out.append("          " + "; ".join(orgs))
     screens = [p for p in done if p.name.endswith("_screen") and res[p].get("mode") == "trains"]
     if screens:
         s = res[screens[-1]]
@@ -435,7 +435,7 @@ def _status(fs: str, simulate: bool, elsewhere: set[str]) -> list[str]:
             n = v["n_candidates"] if v else 0
             parts.append(f"{SHAPE[role]} " + (f"e{v['stim']}→e{v['rec']} ({n} pair{'s' * (n != 1)})" if v else "none")
                          + (f" ({dropped} dropped as chance)" if dropped else ""))
-        out.append("          " + " · ".join(parts)
+        out.append("          " + "; ".join(parts)
                    + ("" if "chance" in s else f"  [analysed before the chance check: ./orgchar.sh analyze "
                                                f"{os.path.relpath(screens[-1], Path(__file__).resolve().parents[1])}]"))
     curves = [p for p in done if p.name.endswith("_curve") and res[p].get("readout") == "after_train"]
@@ -517,6 +517,8 @@ def cmd_screen(a):
         print(f"Using live blocks {blocks} from census {d.name} ({age_h:.1f} h old).")
         if age_h > STALE_H:
             print(f"  Warning: census is more than {STALE_H:.0f} h old; consider re-running it.")
+    if a.reps < 5:
+        sys.exit("--reps must be at least 5: with 4 trials against 4 the rank test cannot reach p < 0.01.")
     plan = P.plan_train_screen(blocks=blocks, electrodes=electrodes,
                                counts=[int(x) for x in a.levels.split(",")] if a.levels else P.SCREEN_COUNTS,
                                amplitude_uA=a.amplitude, phase_us=a.phase, polarity=a.polarity, reps=a.reps,
@@ -705,22 +707,23 @@ def main(argv=None):
     p.add_argument("--duration", type=float, default=300.0)
     p.set_defaults(func=cmd_census)
 
-    p = sub.add_parser("screen", help="which electrodes give FuncSolver's shapes after trains of 2, 6, 12, 20 pulses")
+    p = sub.add_parser("screen", help="which electrodes give FuncSolver's shapes after trains of 2, 10, 20 pulses")
     common(p)
     stimulus(p)
-    p.add_argument("--levels", help="train lengths, default 2,6,12,20")
+    p.add_argument("--levels", help=f"train lengths, default {','.join(map(str, P.SCREEN_COUNTS))}")
     p.add_argument("--blocks", help="e.g. 1,2 (default: live blocks from latest census)")
     p.add_argument("--electrodes", help="subset, e.g. 21,15 (quick re-check before a session)")
-    p.add_argument("--reps", type=int, default=6, help="trials per electrode and length")
+    p.add_argument("--reps", type=int, default=6, help="trials per electrode and length (at least 5: with 4 "
+                                                       "against 4 the rank test cannot reach p < 0.01)")
     p.set_defaults(func=cmd_screen)
 
     p = sub.add_parser("curve", help="FuncSolver calibration: hardware trains of 2-20 pulses -> calibration.json")
     common(p)
     stimulus(p)
     p.add_argument("--stims", help="stimulating electrodes, e.g. 0,10,30 (default: from latest screen)")
-    p.add_argument("--levels", help="pulse counts, default 2,4,...,20")
+    p.add_argument("--levels", help=f"pulse counts, default {','.join(map(str, P.FUNCSOLVER_COUNTS))}")
     p.add_argument("--ipi", type=float, default=10.0, help="ms between the pulses of a train")
-    p.add_argument("--reps", type=int, default=10, help="trials per pulse count and pass")
+    p.add_argument("--reps", type=int, default=P.FUNCSOLVER_REPS, help="trials per pulse count and pass")
     p.set_defaults(func=cmd_curve)
 
     p = sub.add_parser("codetest", help="~3 min: check that train codes are safe and readable")

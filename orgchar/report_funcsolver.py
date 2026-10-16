@@ -13,9 +13,6 @@ from . import funcsolver as F
 from . import protocol as P
 from .report import BLUE, CHECK_BAD, CHECK_OK, CHECK_WARN, GREY, INK, MUTED, ORANGE, _icon, _page, _svg
 
-GRADE = {"good": ("✓", "#0ca30c", "Good"), "fair": ("◐", "#d69300", "Fair"),
-         "poor": ("✗", "#d03b3b", "Poor"), "unknown": ("?", MUTED, "Unknown"), "none": ("–", MUTED, "No curve")}
-FIT, TEST = "#a3a29c", BLUE
 TYPE = dict(short="short-pass", band="band-pass", long="long-pass")
 TYPE_DESC = dict(short="fewer evoked spikes after longer trains", band="most evoked spikes at a middle train length",
                  long="more evoked spikes after longer trains")
@@ -23,11 +20,6 @@ TYPE_COLOUR = dict(short=ORANGE, band="#1baf7a", long=BLUE)
 # FinalSpark's electrode map: each organoid is a cross of eight electrodes over three rows.
 # Key: electrode number within the organoid (0-7). Value: (column, row) in the cross.
 LAYOUT = {0: (1, 0), 7: (2, 0), 1: (0, 1), 2: (1, 1), 5: (2, 1), 6: (3, 1), 3: (1, 2), 4: (2, 2)}
-
-
-def _grade(g):
-    sym, col, label = GRADE.get(g, GRADE["unknown"])
-    return f"{_icon((sym, col))}<b>{label}</b>"
 
 
 def _fmt(v, f=".2f", na="–"):
@@ -78,265 +70,289 @@ TERMS_COMMON = [
 
 # ============================================================================== curve step
 
+# Sequential blue (dataviz reference ramp, steps 100-700) for evoked spikes; near zero recedes to the surface.
+RAMP = ["#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec", "#5598e7", "#3987e5", "#2a78d6", "#256abf",
+        "#1c5cab", "#184f95", "#104281", "#0d366b"]
+ZERO = "#f1f0eb"
+STATUS = dict(good=("✓", "#0ca30c", "Good"), fair=("◐", "#fab219", "Fair"), poor=("✗", "#d03b3b", "Poor"),
+              unknown=("?", MUTED, "Unknown"), none=("–", MUTED, "No curve"))
+
+
+def _pill(g, extra=""):
+    sym, col, label = STATUS.get(g, STATUS["unknown"])
+    return f"<span class=pill style='--status:{col}'><span class=ico>{sym}</span>{label}{extra}</span>"
+
+
+def _heat(v, vmax):
+    """(fill, dark) for a mean evoked-spike count on the page's shared scale."""
+    if v is None or not np.isfinite(v) or vmax <= 0 or v <= 0.03 * vmax:
+        return ZERO, False
+    i = int(round(min(1.0, v / vmax) * (len(RAMP) - 1)))
+    return RAMP[i], i >= 6
+
+
+def _map_svg(stim, peak, vmax, picked, cs=34):
+    """FinalSpark's cross of eight electrodes for the stimulated electrode's organoid: the stimulated
+    electrode in ink, each recording electrode filled by its largest mean response (the table's scale),
+    the chosen ones ringed and starred. Hover for numbers."""
+    o, r = 8 * (stim // 8), cs * 0.4
+    out = [f"<svg viewBox='0 0 {4 * cs} {3 * cs}' width='{4 * cs}' height='{3 * cs}' role=img "
+           f"aria-label='Electrode map of e{o}-e{o + 7}, stimulating e{stim}'>"]
+    for k, (col, row) in LAYOUT.items():
+        e, x, y = o + k, (col + 0.5) * cs, (row + 0.5) * cs
+        if e == stim:
+            fill, dark, tip, ring = INK, True, f"e{e}: stimulated", ""
+        else:
+            v = peak.get(e)
+            fill, dark = _heat(v, vmax)
+            tip = f"e{e}: up to {v:.1f} evoked spikes" if v is not None else f"e{e}: not analysed"
+            role = picked.get(e)
+            ring = (f"<circle cx='{x}' cy='{y}' r='{r + 3}' fill='none' stroke='{INK}' stroke-width='2'/>"
+                    if role else "")
+        txt = "#fff" if dark else INK
+        out.append(f"<g><title>{tip}</title>{ring}<circle cx='{x}' cy='{y}' r='{r}' fill='{fill}' "
+                   f"stroke='{'none' if e == stim else '#d6d5ce'}'/><text x='{x}' y='{y + 4}' font-size='{cs * 0.3:.0f}' "
+                   f"text-anchor='middle' fill='{txt}' font-weight='600'>{e}{'★' if picked.get(e) else ''}</text></g>")
+    return "".join(out) + "</svg>"
+
+
+def _spark(role, v, p, levels):
+    """The fitted curve (line) and the test-trial means (dots), for a tile."""
+    w, h, pad = 240, 64, 6
+    xs = np.linspace(min(levels), max(levels), 60)
+    ys = F.model(role, xs, v["params"])
+    tl, tm = p["fits"][role].get("conf_levels", []), p["fits"][role].get("conf_means", [])
+    lo, hi = min(0.0, ys.min(), *tm), max(ys.max(), *tm, 1e-9)
+    X = lambda n: pad + (n - min(levels)) / (max(levels) - min(levels)) * (w - 2 * pad)  # noqa: E731
+    Y = lambda y: h - pad - (y - lo) / (hi - lo) * (h - 2 * pad)  # noqa: E731
+    col = TYPE_COLOUR[role]
+    path = " ".join(f"{'M' if i == 0 else 'L'}{X(a):.1f},{Y(b):.1f}" for i, (a, b) in enumerate(zip(xs, ys)))
+    dots = "".join(f"<circle cx='{X(n):.1f}' cy='{Y(m):.1f}' r='3.5' fill='{col}' stroke='#fff' stroke-width='2'>"
+                   f"<title>{n} pulses: {m:.1f} evoked spikes (test-trial mean)</title></circle>" for n, m in zip(tl, tm))
+    return (f"<svg viewBox='0 0 {w} {h}' width='100%' height='{h}' preserveAspectRatio='none' role=img "
+            f"aria-label='fitted curve and test-trial means'><line x1='{pad}' x2='{w - pad}' y1='{Y(0):.1f}' "
+            f"y2='{Y(0):.1f}' stroke='#e1e0d9'/><path d='{path}' fill='none' stroke='{INK}' stroke-width='2'/>{dots}</svg>"
+            f"<div class=sub>{levels[0]} to {levels[-1]} pulses; line: fitted curve; dots: test-trial means</div>")
+
+
+def _tile(role, r, levels, pairs, peak_by_stim, vmax):
+    v = r["roles"].get(role)
+    col = TYPE_COLOUR[role]
+    head = f"<div class=head><span class=type>{_type(role)}</span>"
+    if not v:
+        return (f"<div class='tile missing' style='--type:var(--line)'>{head}<span class=pill style='--status:{MUTED}'>"
+                f"Not found</span></div><div class=sub>{TYPE_DESC[role]}</div><div>No pair gives this curve.</div></div>")
+    p = next(q for q in pairs if q["stim"] == v["stim"] and q["rec"] == v["rec"])
+    used = role in r["_usable"]
+    rng = np.ptp(F.model(role, levels, v["params"]))
+    glyph = _map_svg(v["stim"], peak_by_stim[v["stim"]], vmax, {v["rec"]: role}, cs=27)
+    return (f"<div class=tile style='--type:{col}'>{head}{_pill(v['grade'])}</div>"
+            f"<div class=pair>{glyph}<span>e{v['stim']} → e{v['rec']}</span></div>"
+            f"<div><span class=big>{_fmt(v.get('conf_r2'))}</span> <span class=sub>R² on test trials</span></div>"
+            f"<div class=sub>±{_fmt(v.get('conf_rmse'), '.1f')} spikes per trial on a {rng:.0f}-spike range"
+            + ("" if used else "; <b>left out of the calibration</b>") + "</div>"
+            + _spark(role, v, p, levels) + "</div>")
+
+
 def _role_figure(p, role, D, levels, ref_n):
     f = p["fits"][role]
+    col = TYPE_COLOUR[role]
     stim = D[(D.kind == "stim") & (D.stim == p["stim"]) & (D.rec == p["rec"])].copy()
     stim["y"] = stim.adjusted - p["control"]
-    fig, (a, b) = plt.subplots(1, 2, figsize=(9.0, 2.9), gridspec_kw=dict(width_ratios=[4.2, 1.5], wspace=0.28))
+    fig, (a, b) = plt.subplots(1, 2, figsize=(9.0, 3.0), gridspec_kw=dict(width_ratios=[4.2, 1.4], wspace=0.3))
     step = np.median(np.diff(levels)) if len(levels) > 1 else 1.0
-    for part, col, dx, lab in (("fit", FIT, -0.22, "fit trials"), ("test", TEST, 0.22, "test trials")):
+    for part, c, dx, lab in (("fit", "#b5b4ad", -0.18, "fit trials"), ("test", col, 0.18, "test trials")):
         g = stim[stim.partition == part]
-        a.scatter(g.level + dx * step + _jitter(len(g), 0.08 * step, 1), g.y, s=12, color=col, alpha=0.75,
+        a.scatter(g.level + dx * step + _jitter(len(g), 0.07 * step, 1), g.y, s=14, color=c, alpha=0.8,
                   linewidths=0, label=lab, zorder=2)
         if part == "test" and len(g):
             m = g.groupby("level").y.mean()
-            a.plot(m.index + dx * step, m.values, "o", ms=4.5, mfc="white", mec=TEST, mew=1.4, zorder=4,
+            a.plot(m.index + dx * step, m.values, "o", ms=6, mfc="white", mec=col, mew=1.8, zorder=4,
                    label="test-trial mean")
     xs = np.linspace(min(levels), max(levels), 200)
-    a.plot(xs, F.model(role, xs, f["params"]), color=INK, lw=2, zorder=3, label="curve fitted to the fit trials")
-    a.axhline(0, color=GREY, lw=0.6, zorder=1)
+    a.plot(xs, F.model(role, xs, f["params"]), color=INK, lw=2, zorder=3, label="fitted curve")
+    a.axhline(0, color="#c3c2b7", lw=0.8, zorder=1)
     a.set_xticks(levels)
     a.set_xlabel("pulses in the train")
     a.set_ylabel("evoked spikes per trial")
-    a.legend(loc="upper left", bbox_to_anchor=(0, -0.26), ncol=4, frameon=False, fontsize=7.5, markerscale=1.6,
-             handletextpad=0.3, columnspacing=1.4)
+    a.legend(loc="lower left", bbox_to_anchor=(0, 1.02), ncol=4, frameon=False, fontsize=8, markerscale=1.3,
+             handletextpad=0.3, columnspacing=1.2)
     ref = stim[stim.partition == "reference"]
     if len(ref):
         blocks = sorted(ref.block.unique())
         for i, bk in enumerate(blocks):
             g = ref[ref.block == bk]
-            b.scatter(i + _jitter(len(g), 0.12, 2), g.y, s=12, color=ORANGE, alpha=0.75, linewidths=0, zorder=2)
-            b.plot([i - 0.25, i + 0.25], [g.y.mean()] * 2, color=ORANGE, lw=2, zorder=3)
-        b.axhline(f.get("reference_expected", np.nan), color=INK, lw=1.2, ls="--", zorder=1)
+            b.scatter(i + _jitter(len(g), 0.1, 2), g.y, s=14, color="#898781", alpha=0.8, linewidths=0, zorder=2)
+            b.plot([i - 0.25, i + 0.25], [g.y.mean()] * 2, color=INK, lw=2, zorder=3)
+        exp = f.get("reference_expected", np.nan)
+        b.axhline(exp, color=col, lw=1.4, zorder=1)
+        b.text(len(blocks) - 0.45, exp, f" curve: {exp:.0f}", color=MUTED, fontsize=7.5, va="bottom", ha="right")
         b.set_xticks(range(len(blocks)))
         b.set_xticklabels(["start", "middle", "end"][:len(blocks)])
         b.set_xlim(-0.6, len(blocks) - 0.4)
-        b.set_title(f"{ref_n}-pulse reference train\n(dashed: what the curve predicts)", fontsize=8.5)
+        b.set_title(f"Drift check: {ref_n}-pulse train", fontsize=9, loc="left")
     else:
         b.axis("off")
     return _svg(fig)
 
 
-def _all_pairs_figure(pairs, chosen):
-    """One block per stimulating electrode. The panels sit where the recording electrodes sit on
-    FinalSpark's electrode map."""
-    stims = sorted({p["stim"] for p in pairs})
-    by = {(p["stim"], p["rec"]): p for p in pairs}
+def _pair_maps(pairs, chosen, levels):
+    """Every pair, one block per stimulating electrode: the organoid's electrode map coloured by response
+    size, beside a table of mean evoked spikes per train length (rows = recording electrodes, largest
+    first). One colour scale for the whole page, so a 2-spike wobble never looks like a 50-spike response."""
+    vmax = max([max(p["dev_means"]) for p in pairs] + [1.0])
     picked = {(p["stim"], p["rec"]): r for r, p in chosen.items()}
-    fig = plt.figure(figsize=(9.6, 4.4 * len(stims)))
-    subs = fig.subfigures(len(stims), 1, hspace=0.04) if len(stims) > 1 else [fig]
-    for sf, s in zip(subs, stims):
-        sf.suptitle(f"Stimulating e{s}  (organoid on {_organoid(s)})", x=0.02, y=0.99, ha="left", va="top",
-                    fontsize=11, fontweight="bold")
-        axes = sf.subplots(3, 4, gridspec_kw=dict(hspace=0.95, wspace=0.42, top=0.84, bottom=0.07,
-                                                   left=0.06, right=0.98))
-        for ax in axes.flat:
-            ax.axis("off")
-        for k, (col, row) in LAYOUT.items():
-            e, ax = 8 * (s // 8) + k, axes[row, col]
-            if e == s:
-                ax.text(0.5, 0.5, f"e{e}\nstimulated", ha="center", va="center", fontsize=8, fontweight="bold",
-                        color="white", transform=ax.transAxes,
-                        bbox=dict(boxstyle="round,pad=0.6", fc=INK, ec="none"))
-                continue
-            p = by.get((s, e))
-            if p is None:
-                ax.text(0.5, 0.5, f"e{e}\nnot analysed", ha="center", va="center", fontsize=7.5, color=MUTED,
-                        transform=ax.transAxes)
-                continue
-            ax.axis("on")
-            lv = np.array(p["levels"])
-            dm, sd = np.array(p["dev_means"]), np.array(p["dev_sd"])
-            ax.fill_between(lv, dm - sd, dm + sd, color=FIT, alpha=0.25, linewidth=0)
-            ax.plot(lv, dm, color=FIT, lw=1.4)
-            if p.get("shape") and p["fits"][p["shape"]].get("conf_means"):
-                f = p["fits"][p["shape"]]
-                ax.plot(f.get("conf_levels", lv), f["conf_means"], color=TEST, lw=1.4)
-            ax.axhline(0, color=GREY, lw=0.5)
-            lo, hi = ax.get_ylim()
-            ax.set_ylim(min(lo, -1.0), max(hi, 3.0))   # flat pairs: no magnified noise
-            ax.set_xticks([lv[0], lv[-1]])
-            ax.tick_params(labelsize=7.5, length=2)
-            role = picked.get((s, e))
-            sub = f"★ {TYPE[role]}" if role else (TYPE[p["shape"]] if p.get("shape") else "no clear type")
-            ax.set_title(f"e{e}\n{sub}", fontsize=8.5, fontweight="bold" if role else "normal",
-                         color=INK if (role or p.get("shape")) else MUTED, loc="left", pad=3)
-            if role:
-                for sp in ("left", "bottom"):
-                    ax.spines[sp].set_color(INK)
-                    ax.spines[sp].set_linewidth(1.2)
-    return _svg(fig)
+    out = [f"<div class=scale><span>evoked spikes, mean of fit trials:</span><span>0</span><span class=bar style="
+           f"'background:linear-gradient(90deg,{ZERO},{','.join(RAMP)})'></span><span>{vmax:.0f}</span>"
+           "<span>(★ chosen pair; hover a cell for its value)</span></div>"]
+    for s in sorted({p["stim"] for p in pairs}):
+        rows = sorted([p for p in pairs if p["stim"] == s], key=lambda p: -max(p["dev_means"]))
+        peak = {p["rec"]: max(p["dev_means"]) for p in rows}
+        tr = []
+        for p in rows:
+            role = picked.get((s, p["rec"]))
+            cells = "".join(
+                f"<td style='background:{_heat(m, vmax)[0]}' title='e{s} → e{p['rec']}, {n} pulses: {m:.1f} "
+                f"evoked spikes (SD {sd:.1f})'></td>" for n, m, sd in zip(p["levels"], p["dev_means"], p["dev_sd"]))
+            kind = (f"★ {_type(role)}" if role else _type(p["shape"]) if p.get("shape") else "no clear type")
+            tr.append(f"<tr><th class=row>e{p['rec']}</th>{cells}<td class=type"
+                      f"{' style=\"color:var(--ink);font-weight:600\"' if role else ''}>{kind}</td></tr>")
+        out.append(f"<div class=stim><div><h3>Stimulating e{s}</h3>"
+                   f"{_map_svg(s, peak, vmax, {rec: r for (st, rec), r in picked.items() if st == s})}"
+                   f"<div class=sub>{_organoid(s)}, FinalSpark layout</div></div>"
+                   f"<div class=wrap><table class=heat><tr><th></th>"
+                   + "".join(f"<th>{n}</th>" for n in levels) + "<th></th></tr>" + "".join(tr)
+                   + f"<tr><th></th><th colspan={len(levels)} class=sub>pulses in the train →</th></tr></table></div></div>")
+    return "".join(out), vmax
 
 
 def page(path, plan, r, problems, when):
-    D = r["_D"]
-    chosen = r["_chosen"]
-    pairs = r["pairs"]
+    D, chosen, pairs = r["_D"], r["_chosen"], r["pairs"]
     levels = list(plan["levels"])
     fs = plan["fsname"]
     sim = plan.get("backend") == "simulated"
     planned = _planned(plan)
-    title = f"{fs} · response curves · {when}" + (" · SIMULATED" if sim else "")
-    body = [f"<h1>{html.escape(fs)} · response curves to pulse trains</h1>",
-            f"<p class=meta>{html.escape(when)}{' · SIMULATED' if sim else ''} · stimulating "
-            f"{', '.join('e' + str(s) for s in plan['stims'])} · trains of {levels[0]} to {levels[-1]} pulses, "
-            f"{plan['ipi_ms']:g} ms apart, {plan['amplitude_uA']:g} µA, {plan['phase_us']:g} µs per phase · "
-            f"{r['n_trials']} of {planned} trials usable</p>",
-            "<p>This step looks for electrode pairs with the three response types to pulse trains. Our "
-            "function-approximation network needs one pair of each type. It sends one train per evaluation and "
-            "reads a single response, so the question is how well a fitted curve predicts single new trials.</p>"]
+    title = f"{fs}: response curves, {when}" + (" (SIMULATED)" if sim else "")
+    maps, vmax = _pair_maps(pairs, chosen, levels)
+    peak_by_stim = {s: {p["rec"]: max(p["dev_means"]) for p in pairs if p["stim"] == s} for s in {p["stim"] for p in pairs}}
+    chips = [when] + (["SIMULATED"] if sim else []) + [
+        "stimulating " + ", ".join(f"e{s}" for s in plan["stims"]), f"trains of {', '.join(map(str, levels))} pulses",
+        f"{plan['amplitude_uA']:g} µA × {plan['phase_us']:g} µs", f"{r['n_trials']} of {planned} trials usable",
+        f"orgchar {plan.get('code_version', '?')}"]
+    body = [f"<h1>{html.escape(fs)}: response curves</h1>",
+            "<div class=chips>" + "".join(f"<span class=chip>{html.escape(c)}</span>" for c in chips) + "</div>"]
 
-    # ---- the decision
-    n = len(chosen)
-    missing = [TYPE[x] for x in F.ROLES if x not in chosen]
-    lede = {3: "All three response types found.", 0: "No pair gives a usable response type."}.get(
-        n, f"{n} of the 3 response types found. Missing: {', '.join(missing)}.")
-    body.append(f"<p class=lede>{html.escape(lede)}</p>")
-    rows = []
-    for role in F.ROLES:
-        v = r["roles"].get(role)
-        name = f"<b>{_type(role)}</b><br><span class=note>{TYPE_DESC[role]}</span>"
-        if v:
-            rows.append(f"<tr><td>{name}</td><td>{_pair(v['stim'], v['rec'])}</td><td>{_grade(v['grade'])}</td>"
-                        f"<td class=n>{_fmt(v.get('conf_r2'))}</td><td class=n>±{_fmt(v.get('conf_rmse'), '.1f')}</td>"
-                        f"<td class=n>{_fmt(np.ptp(F.model(role, levels, v['params'])), '.1f')}</td>"
-                        f"<td>{html.escape(v['reason'])}</td></tr>")
-        else:
-            rows.append(f"<tr><td>{name}</td><td>–</td><td>{_icon(CHECK_BAD)}<b>Missing</b></td><td></td><td></td>"
-                        "<td></td><td>no pair gives this curve</td></tr>")
-    body.append("<div class=wrap><table><tr><th>Response type</th><th>Pair</th><th>Verdict</th>"
-                "<th class=n>R² on test trials</th><th class=n>Error per trial</th><th class=n>Curve range</th>"
-                "<th>Why</th></tr>" + "".join(rows) + "</table></div>")
-    body.append("<p class=note>Errors and ranges are in evoked spikes. Verdicts: <b>Good</b> means R² on test "
-                f"trials of at least {F.GOOD_R2:g}. <b>Fair</b> means at least {F.FAIR_R2:g}. Anything lower is "
-                "<b>Poor</b>. A reference train that drifts by more than half the curve range also lowers the "
-                "verdict. As a rule of thumb, if the error per trial is a third of the curve range, one response "
-                "can tell apart only about three train lengths.</p>")
-
-    # ---- terms
-    body.append("<h2>Terms used in this report</h2>" + _terms(TERMS_COMMON + [
-        ("Fit trials and test trials", "Every train length is measured twice. The first pass (fit trials) picks "
-                                       "the pairs and fits the curves. The second pass (test trials) comes later in "
-                                       "the same session, in a new random order. It is never used for fitting. It "
-                                       "only checks the fitted curves on new data."),
-        ("Reference train", f"The same {plan['reference_pulses']}-pulse train, given at the start, middle and end "
-                            "of the session. If the responses drift during the session, these three blocks "
-                            "disagree."),
-        ("R² on test trials", "The share of the trial-to-trial variation in the test trials that the fitted curve "
-                              "explains. 1 means every trial falls on the curve. 0 means the curve does no better "
-                              "than the overall average."),
-        ("Error per trial", "How far a single test trial typically falls from the curve (root mean square)."),
-        ("p", "The probability of seeing differences across train lengths at least this large if train length had "
-              f"no effect (Kruskal–Wallis test on the fit trials). A pair needs p below {F.MIN_EFFECT_P:g}."),
-    ]))
+    # ---- the decision, first
+    usable = r["_usable"]
+    found = [x for x in F.ROLES if x in chosen]
+    lede = (f"{len(usable)} of 3 response types usable for the network"
+            + (f": {', '.join(TYPE[x] for x in F.ROLES if x in usable)}." if usable else "."))
+    notes = []
+    if [x for x in found if x not in usable]:
+        notes.append("Found but Poor on test trials, so left out: "
+                     + ", ".join(TYPE[x] for x in found if x not in usable) + ".")
+    if len(found) < 3:
+        notes.append("Not found: " + ", ".join(TYPE[x] for x in F.ROLES if x not in found) + ".")
+    if problems:
+        notes.append("<b>Incomplete run:</b> " + html.escape("; ".join(problems)) + ".")
+    cmd = (f"<pre class=cmd>cd ~/NeuralControlProgram/FuncSolver\npython main.py train {html.escape(r['calibration'])}</pre>"
+           if r.get("calibration") else
+           "<p>Nothing to hand to the network. Try other stimulating electrodes (<code>--stims</code>) or stronger "
+           "trains, after re-checking the screen.</p>")
+    body.append(f"<div class=verdict><p class=lede>{html.escape(lede)}</p>"
+                + "".join(f"<p class=note>{n}</p>" for n in notes)
+                + ("<p>Next: train the network offline on these curves (no hardware needed):</p>" if r.get("calibration") else "")
+                + cmd + "</div>")
+    body.append("<div class=tiles>" + "".join(_tile(x, r, levels, pairs, peak_by_stim, vmax) for x in F.ROLES) + "</div>")
+    body.append(f"<p class=note><b>Good</b>: R² on test trials ≥ {F.GOOD_R2:g}. <b>Fair</b>: ≥ {F.FAIR_R2:g}. "
+                "<b>Poor</b>: lower, or the drift-check train moved by more than half the curve's range. Only Good "
+                "and Fair curves go to the network. The small map shows where the pair sits on its organoid "
+                "(stimulated electrode in black, recording electrode ringed).</p>")
 
     # ---- checks
-    body.append("<h2>Checks</h2><ul class=checks>")
-    if problems:
-        body.append(f"<li>{_icon(CHECK_BAD)}<span><b>Incomplete.</b> "
-                    + " ".join(html.escape(x[0].upper() + x[1:]) + "." for x in problems) + "</span></li>")
-    else:
-        body.append(f"<li>{_icon(CHECK_OK)}<span>All {len(plan['segments'])} recordings are complete.</span></li>")
     lost = planned - r["n_trials"]
-    body.append(f"<li>{_icon(CHECK_OK if lost <= 0.1 * planned else CHECK_WARN)}<span>{r['n_trials']} of {planned} "
-                "planned trials are usable."
-                + (f" The other {lost} could not be used. Either their trigger was not found in the recording, or a "
-                   "gap in the raw data cut into their counting window. The platform sometimes drops 42.7 ms of "
-                   "data without a marker." if lost else "") + "</span></li>")
     art = max((p["artifact"] for p in pairs), default=0.0)
     bad_art = [p for p in pairs if not p["artifact_ok"]]
-    body.append(f"<li>{_icon(CHECK_OK if not bad_art else CHECK_WARN)}<span>Stimulation artifact. "
-                + ("It has faded on every pair by the start of the counting window (10 ms after the train)."
-                   if not bad_art else
-                   f"It still reaches the counting window on {len(bad_art)} pair(s), which were excluded: "
-                   + ", ".join(_pair(p["stim"], p["rec"]) for p in bad_art) + ".")
-                + f" The largest leftover is {art:.1f} times its noise floor. The limit is {F.ARTIFACT_LIMIT:g}."
-                "</span></li>")
     sh = D[(D.kind == "sham") & (D.partition == "fit")]
-    body.append(f"<li>{_icon(CHECK_OK)}<span>The sham correction uses {sh.train_id.nunique()} sham trials.</span></li>")
     thr = pd.Series(r["thresholds_uV"]).astype(float)
-    body.append(f"<li>{_icon(CHECK_OK)}<span>Spike thresholds were fixed per electrode at {plan.get('k', 5)} times "
-                f"its noise, in the 300–3000 Hz band. They range from {thr.abs().min():.0f} to "
-                f"{thr.abs().max():.0f} µV.</span></li></ul>")
+    checks = [(CHECK_BAD if problems else CHECK_OK,
+               "; ".join(problems) if problems else f"All {len(plan['segments'])} recordings complete."),
+              (CHECK_OK if lost <= 0.1 * planned else CHECK_WARN,
+               f"{r['n_trials']} of {planned} trials usable" + (f"; {lost} lost to missing triggers or dropped data."
+                                                                 if lost else ".")),
+              (CHECK_OK if not bad_art else CHECK_WARN,
+               "Stimulation artifact gone before the counting window on every pair." if not bad_art else
+               f"Artifact reaches the counting window on {', '.join(_pair(p['stim'], p['rec']) for p in bad_art)}: "
+               f"excluded (largest {art:.1f}× its noise floor, limit {F.ARTIFACT_LIMIT:g}×)."),
+              (CHECK_OK, f"Sham correction from {sh.train_id.nunique()} no-current trials; spike thresholds "
+                         f"{thr.abs().min():.0f}–{thr.abs().max():.0f} µV (5× noise, 300–3000 Hz).")]
+    body.append("<h2>Checks</h2><ul class=checks>"
+                + "".join(f"<li>{_icon(i)}<span>{html.escape(t)}</span></li>" for i, t in checks) + "</ul>")
 
-    # ---- evidence per role
-    body.append("<h2>The chosen pairs</h2><p class=note>Grey dots are fit trials. They chose the pair and fitted the "
-                "black curve. Blue dots are test trials, and open circles are their means. On the right, the "
-                "reference train at the start, middle and end of the session shows drift.</p>")
+    # ---- evidence per chosen pair
+    if chosen:
+        body.append("<h2>The chosen pairs</h2><p class=note>Each dot is one trial. Fit trials (grey) chose the pair "
+                    "and fitted the black curve; test trials (coloured) came later and only score it. On the right, "
+                    "the same train at the start, middle and end of the session: if it moves, the organoid drifted.</p>")
     for role in F.ROLES:
         p = chosen.get(role)
         if not p:
             continue
         v = r["roles"][role]
-        refs = v.get("reference_blocks") or []
-        body.append(f"<div class=card><h3>{_type(role)}: {_pair(p['stim'], p['rec'])} &nbsp; {_grade(v['grade'])}</h3>"
-                    f"<p>On test trials the curve explains <b>{_fmt(v.get('conf_r2'), '.0%')}</b> of the "
-                    f"trial-to-trial variation. A single trial typically falls within "
-                    f"<b>±{_fmt(v.get('conf_rmse'), '.1f')}</b> spikes of the curve, whose range is "
-                    f"{_fmt(np.ptp(F.model(role, levels, v['params'])), '.1f')} spikes. "
-                    + (f"The reference train gave {', then '.join(_fmt(x, '.1f') for x in refs)} spikes. The curve "
-                       f"predicts {_fmt(v.get('reference_expected'), '.1f')}." if refs else "")
-                    + "</p>"
+        body.append(f"<div class=card style='border-left:4px solid {TYPE_COLOUR[role]}'><h3>{_type(role)}: "
+                    f"{_pair(p['stim'], p['rec'])} &nbsp; {_pill(v['grade'])}</h3><p>{html.escape(v['reason'][0].upper() + v['reason'][1:])}.</p>"
                     f"<div class=fig>{_role_figure(p, role, D, levels, plan['reference_pulses'])}</div>"
                     f"<details><summary>Fitted parameters (as written to calibration.json)</summary><p class=note>"
                     f"Parameters {', '.join(f'{x:.4g}' for x in v['params'])}. R² of the fit-trial means "
-                    f"{_fmt(v.get('r2_means'))}. Cross-validated R² within the fit trials {_fmt(v.get('cv_r2'))}. "
-                    f"Sham average {p['control']:.2f} spikes.</p></details></div>")
+                    f"{_fmt(v.get('r2_means'))}; cross-validated R² within the fit trials {_fmt(v.get('cv_r2'))}; "
+                    f"sham average {p['control']:.2f} spikes.</p></details></div>")
 
-    # ---- all pairs
-    body.append("<h2>Every pair measured</h2><p class=note>One block per stimulating electrode. Each panel is a "
-                "recording electrode, placed where it sits on FinalSpark's electrode map. The grey line and band "
-                "are the fit-trial mean ± one standard deviation. The blue line is the test-trial mean. Each panel "
-                "has its own vertical scale. ★ marks the chosen pairs.</p>")
-    body.append(f"<div class=fig>{_all_pairs_figure(pairs, chosen)}</div>")
+    # ---- every pair
+    body.append("<h2>Every pair measured</h2><p class=note>One block per stimulating electrode. Left: the organoid "
+                "on FinalSpark's electrode map, the stimulated electrode in black, every other electrode coloured by "
+                "its strongest response. Right: the same responses at each train length, strongest electrode first. "
+                "A bright cell on the left of a row is short-pass, in the middle band-pass, on the right long-pass.</p>"
+                + maps)
     trs = []
     for p in sorted(pairs, key=lambda q: (q["stim"], q["rec"])):
         best = p.get("shape")
         f = p["fits"].get(best, {}) if best else {}
         trs.append(f"<tr><td>{_pair(p['stim'], p['rec'])}</td><td>{TYPE.get(best, 'no clear type')}</td>"
-                   f"<td>{_grade(p['grade'])}</td><td>{_p_text(p['kw_p'])}</td>"
+                   f"<td>{_pill(p['grade'])}</td><td>{_p_text(p['kw_p'])}</td>"
                    f"<td class=n>{_fmt(p['dev_range'], '.1f')}</td><td class=n>{_fmt(p['trial_sd'], '.1f')}</td>"
                    f"<td class=n>{_fmt(f.get('conf_r2'))}</td><td class=n>{_fmt(f.get('conf_rmse'), '.1f')}</td>"
                    f"<td class=n>{_fmt(f.get('drift'), '+.1f')}</td><td class=n>{p['artifact']:.1f}</td>"
                    f"<td>{html.escape(p['grade_reason'])}</td></tr>")
-    body.append("<details><summary>All pairs as a table</summary><p class=note>Range: the difference between the "
-                "largest and smallest fit-trial mean. Trial SD: the typical scatter of single trials at one train "
-                "length. Drift: the last reference block minus the first. Artifact: the leftover at the start of "
-                "the counting window, in units of its noise floor.</p><div class=wrap><table><tr><th>Pair</th>"
-                "<th>Type</th><th>Verdict</th><th>Changes with train length?</th><th class=n>Range</th>"
-                "<th class=n>Trial SD</th><th class=n>R² on test trials</th><th class=n>Error per trial</th>"
-                "<th class=n>Drift</th><th class=n>Artifact</th><th>Why</th></tr>"
-                + "".join(trs) + "</table></div></details>")
+    body.append("<details><summary>All pairs as a table</summary><p class=note>Range: largest minus smallest fit-trial "
+                "mean. Trial SD: typical scatter of single trials at one train length. Drift: last drift-check block "
+                "minus the first. Artifact: leftover at the start of the counting window, in units of its noise "
+                "floor.</p><div class=wrap><table><tr><th>Pair</th><th>Type</th><th>Verdict</th>"
+                "<th>Train-length effect</th><th class=n>Range</th><th class=n>Trial SD</th>"
+                "<th class=n>R² test</th><th class=n>Error/trial</th><th class=n>Drift</th><th class=n>Artifact</th>"
+                "<th>Why</th></tr>" + "".join(trs) + "</table></div></details>")
 
-    # ---- method
-    body.append("<h2>How this was measured</h2><details><summary>Method</summary><ul>"
-                "<li>Each train comes from one trigger. The stimulator repeats the pulse itself, which is also how "
-                "the network delivers it. A train's length is part of the uploaded settings, so each train length "
-                "has its own recording.</li>"
-                "<li>Order: reference train, fit pass (every train length, shuffled), reference train, test pass "
-                "(every train length, reshuffled), reference train. Trials on the same organoid are at least 4 s "
-                "apart. Trials on different organoids are at least 1 s apart.</li>"
-                "<li>Spike counting: 300–3000 Hz band-pass. The train and the 4 ms after it are blanked. A spike is a "
-                "crossing of −5 times the noise, at least 1 ms after the previous one.</li>"
-                "<li>Fit trials choose the pairs and fit the curves. Test trials only score those frozen curves.</li>"
-                "</ul></details>")
-
-    # ---- operator
-    body.append("<h2>For the operator</h2>")
-    if r.get("calibration"):
-        cal = r["calibration"]
-        body.append("<p>Train the network offline on these curves (no hardware needed); it uses the types found:</p>"
-                    f"<pre class=cmd>cd ~/NeuralControlProgram/FuncSolver\npython main.py train {html.escape(cal)}</pre>")
-        if n < 3:
-            body.append("<p class=note>To look for the missing type, re-run this step with other stimulating "
-                        "electrodes (<code>--stims</code>) or more current (<code>--amplitude</code>).</p>")
-        poor = [_type(k) for k in chosen if k not in r["_usable"]]
-        if poor:
-            body.append(f"<p class=note>Left out of the calibration as Poor on test trials: {', '.join(poor)}.</p>")
-    else:
-        body.append(("<p>The curves found are all Poor on test trials, so there is " if chosen else "<p>There is ")
-                    + "nothing to hand to the network. Try other stimulating electrodes (<code>--stims</code>) or "
-                    "stronger trains, after re-checking the screen.</p>")
+    # ---- reference material, folded
+    body.append("<details><summary>Terms used in this report</summary>" + _terms(TERMS_COMMON + [
+        ("Fit and test trials", "Every train length is measured twice. The first pass (fit trials) picks the pairs "
+                                "and fits the curves. The second pass (test trials), later and reshuffled, only "
+                                "scores the frozen curves."),
+        ("Drift check", f"The same {plan['reference_pulses']}-pulse train at the start, middle and end of the session."),
+        ("R² on test trials", "The share of the trial-to-trial variation in test trials that the curve explains: 1 = "
+                              "every trial on the curve, 0 = no better than the average."),
+        ("Error per trial", "How far a single test trial typically falls from the curve (root mean square)."),
+        ("p", "Chance of differences across train lengths this large if length had no effect (Kruskal–Wallis on "
+              f"fit trials). A pair needs p < {F.MIN_EFFECT_P:g}."),
+    ]) + "</details>")
+    body.append("<details><summary>How this was measured</summary><ul>"
+                "<li>Each train comes from one trigger; the stimulator repeats the pulse, as the network delivers it. "
+                "A train's length is part of the uploaded settings, so each length has its own recording.</li>"
+                "<li>Order: drift check, fit pass (every length, shuffled), drift check, test pass (reshuffled), "
+                "drift check. Trials on one organoid ≥ 4 s apart; on different organoids ≥ 1 s apart.</li>"
+                "<li>Spike counting: 300–3000 Hz band-pass; the train and 4 ms after it are blanked; a spike is a "
+                "crossing of −5× noise, ≥ 1 ms after the previous one.</li></ul></details>")
+    if r.get("calibration") and len(found) < 3:
+        body.append("<p class=note>To look for a missing type, re-run this step with other stimulating electrodes "
+                    "(<code>--stims</code>) or more current (<code>--amplitude</code>).</p>")
     with open(path, "w") as fh:
         fh.write(_page(title, body))
 
@@ -427,11 +443,11 @@ def screen_page(path, plan, r, problems, when):
     best, stims = r["best"], plan["stims"]
     planned = _planned(plan)
     organoids = sorted({e // 8 for e in stims})
-    body = [f"<h1>{html.escape(fs)} · screen with pulse trains</h1>",
-            f"<p class=meta>{html.escape(when)}{' · SIMULATED' if sim else ''} · every electrode of the "
-            f"organoid(s) on {', '.join(_organoid(8 * o) for o in organoids)} · trains of "
+    body = [f"<h1>{html.escape(fs)}: screen with pulse trains</h1>",
+            f"<p class=meta>{html.escape(when)}{' (SIMULATED)' if sim else ''}; every electrode of the "
+            f"organoid(s) on {', '.join(_organoid(8 * o) for o in organoids)}; trains of "
             f"{', '.join(map(str, levels))} pulses, {plan['ipi_ms']:g} ms apart, {plan['amplitude_uA']:g} µA, "
-            f"{plan['phase_us']:g} µs per phase · {r['n_trials']} of {planned} trials usable</p>",
+            f"{plan['phase_us']:g} µs per phase; {r['n_trials']} of {planned} trials usable</p>",
             "<p>This step is a quick scan. It stimulates every electrode with four train lengths and looks for "
             "pairs that might show one of the three response types. The curve step then measures the most "
             "promising stimulating electrodes in full.</p>"]
@@ -451,13 +467,13 @@ def screen_page(path, plan, r, problems, when):
         if v:
             p = next(q for q in r["pairs"] if q["stim"] == v["stim"] and q["rec"] == v["rec"])
             rows.append(f"<tr><td>{name}</td><td>{_pair(v['stim'], v['rec'])}</td><td class=n>{v['win']:.0%}</td>"
-                        f"<td class=n>{v['diff']:.1f}</td><td class=n>{' · '.join(f'{m:.1f}' for m in p['means'])}</td>"
+                        f"<td class=n>{v['diff']:.1f}</td><td class=n>{', '.join(f'{m:.1f}' for m in p['means'])}</td>"
                         f"<td class=n>{v['n_candidates'] - 1}</td></tr>")
         else:
             rows.append(f"<tr><td>{name}</td><td>{_icon(CHECK_BAD)}none</td><td></td><td></td><td></td><td></td></tr>")
     body.append("<div class=wrap><table><tr><th>Response type</th><th>Best pair</th><th class=n>Single trial wins</th>"
                 "<th class=n>Difference (spikes)</th>"
-                f"<th class=n>Mean evoked spikes at {' · '.join(map(str, levels))} pulses</th>"
+                f"<th class=n>Mean evoked spikes at {', '.join(map(str, levels))} pulses</th>"
                 "<th class=n>Other candidates</th></tr>" + "".join(rows) + "</table></div>")
 
     body.append("<h2>Terms used in this report</h2>" + _terms(TERMS_COMMON + [
@@ -514,14 +530,14 @@ def screen_page(path, plan, r, problems, when):
                     f"<div class=fig>{_candidate_figure(cands, D, levels)}</div>")
     trs = "".join(
         f"<tr><td>{_pair(p['stim'], p['rec'])}</td><td>{', '.join(TYPE[k] for k in p['shapes']) or '–'}</td>"
-        f"<td class=n>{' · '.join(f'{m:.1f}' for m in p['means'])}</td>"
+        f"<td class=n>{', '.join(f'{m:.1f}' for m in p['means'])}</td>"
         + "".join(f"<td class=n>{'<b>' if k in p['shapes'] else ''}{p['scores'][k]['win']:.0%}"
                   f"{'</b>' if k in p['shapes'] else ''}</td>" if k in p["scores"] else "<td></td>" for k in F.ROLES)
         + f"<td class=n>{p['artifact']:.1f}</td></tr>" for p in sorted(r["pairs"], key=lambda q: (q["stim"], q["rec"])))
     body.append("<details><summary>All pairs as a table</summary><p class=note>Single trial wins for each type. "
                 "Bold means the pair is a candidate for that type. Artifact: the leftover at the start of the "
                 "counting window, in units of its noise floor.</p><div class=wrap><table><tr><th>Pair</th>"
-                f"<th>Candidate for</th><th class=n>Mean evoked spikes at {' · '.join(map(str, levels))}</th>"
+                f"<th>Candidate for</th><th class=n>Mean evoked spikes at {', '.join(map(str, levels))}</th>"
                 "<th class=n>Short-pass wins</th><th class=n>Band-pass wins</th><th class=n>Long-pass wins</th>"
                 "<th class=n>Artifact</th></tr>" + trs + "</table></div></details>")
 
@@ -535,4 +551,4 @@ def screen_page(path, plan, r, problems, when):
         body.append("<p>Nothing to measure further with these trains. Try more current (<code>--amplitude 3</code>), "
                     "or re-check the census, because the organoids may be quiet today.</p>")
     with open(path, "w") as fh:
-        fh.write(_page(f"{fs} · screen with pulse trains · {when}", body))
+        fh.write(_page(f"{fs}: screen with pulse trains, {when}", body))

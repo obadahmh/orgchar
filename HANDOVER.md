@@ -25,6 +25,12 @@ Use FinalSpark organoid channels as activation functions in FuncSolver (`~/Neura
 - FuncSolver now accepts any subset of the three types: `calibration_latest.json` is written whenever a complete curve finds at least one Good or Fair function (Poor ones are left out since 13 Oct); report and README updated; the test uses FuncSolver's new `calibration.load`.
 - Tests pass (18) and the simulated chain passes. Commit and push once the user agrees.
 
+- **13 Oct changes:**
+  - defaults: screen 2, 10, 20 pulses × 6 trials; curve 2, 5, …, 20 pulses × 8 trials. Recordings and stimulation are down about a third, and the chain takes ~1 h 15 min instead of ~1 h 40.
+  - only Good or Fair functions go into `calibration.json`.
+  - curve report redesigned: verdict and command first, then a tile per type, then electrode maps with a response table per stimulating electrode.
+  - fs674 (np10) faded within an hour of stimulation; fs675 (np14) stayed steady: falling e19→e17 Fair, peaked e17→e19 Good.
+
 ## Open questions / next steps
 1. **Detector difference with TUM** (most urgent). TUM used FinalSpark's 6 × SD spike detection and a 0–300 ms window; orgchar uses −5σ (MAD) fixed and 10–210 ms. Re-analysing the five curve runs with TUM's settings would show whether the missing long-pass is method or biology. Not done yet.
 2. **Long-pass search** with other settings (up to 3 µA, longer pulses, other spacing), on MEA 7 or a new set.

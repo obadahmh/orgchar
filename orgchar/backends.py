@@ -85,7 +85,10 @@ def _align(edges, times, keys):
             cands.append(c)
         if len(cands) == 5:
             break
-    off = min((np.full(len(tm), c) for c in cands), key=lambda o: _align_pass(rec, tm, ek, kk, o, EARLY_TOL_ROUGH_S)[3])
+    # ranked by the strict cost of the final pass: under the loose limit an edge a little early costs
+    # nothing, so the latest candidate always won and the final pass then dropped the other edges
+    # (a 3-trigger FuncSolver recording, fs675, 15 Oct 2026). Drift is < 1 ms per 6-min recording.
+    off = min((np.full(len(tm), c) for c in cands), key=lambda o: _align_pass(rec, tm, ek, kk, o, EARLY_TOL_S)[3])
     pairs, gaps, rows, _ = _align_pass(rec, tm, ek, kk, off, EARLY_TOL_ROUGH_S)
     if len(pairs) >= 10:                    # linear drift, fitted to the promptly delivered edges
         i, j = np.array(pairs).T
@@ -341,7 +344,7 @@ class HardwareBackend:
 
             def show_rec(k=None):
                 t = min(dur, time.monotonic() - start)
-                status(f"recording {_bar(t / dur)} {t:.0f}/{dur:.0f} s" + (f" · {k}/{n_tr} trains sent" if n_tr else ""),
+                status(f"recording {_bar(t / dur)} {t:.0f}/{dur:.0f} s" + (f", {k}/{n_tr} trains sent" if n_tr else ""),
                        live=True)
             status(f"recording {dur:.0f} s" + (f", {n_tr} trains" if n_tr else ", no stimulation"))
             if seg["events"]:

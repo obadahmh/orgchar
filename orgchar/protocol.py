@@ -120,7 +120,10 @@ def plan_codetest(stims, amplitude_uA=2.0, phase_us=100.0, polarity="negative-fi
     return add_train_codes(plan)
 
 
-FUNCSOLVER_COUNTS = tuple(range(2, 21, 2))
+# Defaults since 13 Oct 2026: fewer recordings and a third less stimulation (fs674 faded within an hour
+# of being stimulated, 12 Oct). Each recording costs ~50 s plus half its length in platform overhead.
+FUNCSOLVER_COUNTS = (2, 5, 8, 11, 14, 17, 20)
+FUNCSOLVER_REPS = 8
 
 
 def _spaced_timeline(trials, organoid_isi_s, spacing_s, rng, t0=1.0):
@@ -159,7 +162,7 @@ def _train_segment(seg_id, stims, n, partition, block, n_reps, n_sham, ipi_ms, a
                 n_pulses=n, duration_s=round(evs[-1]["t_s"] + 1.5, 1))
 
 
-SCREEN_COUNTS = (2, 6, 12, 20)
+SCREEN_COUNTS = (2, 10, 20)   # still tells falling, peaked and rising apart
 MAX_UPLOAD_STIMS = 8
 
 
@@ -193,7 +196,7 @@ def plan_train_screen(blocks=None, electrodes=None, counts=SCREEN_COUNTS, ipi_ms
 
 
 def plan_funcsolver(stims, counts=FUNCSOLVER_COUNTS, ipi_ms=10.0, amplitude_uA=2.0, phase_us=100.0,
-                    polarity="negative-first", reps=10, sham_reps=4, reference_pulses=10, reference_reps=5,
+                    polarity="negative-first", reps=FUNCSOLVER_REPS, sham_reps=4, reference_pulses=10, reference_reps=5,
                     organoid_isi_s=(4.0, 4.5), spacing_s=(1.0, 1.25), seed=0):
     """Characterise stim->rec pairs exactly as FuncSolver will use them.
 
@@ -230,14 +233,20 @@ def plan_funcsolver(stims, counts=FUNCSOLVER_COUNTS, ipi_ms=10.0, amplitude_uA=2
                 organoid_isi_s=list(organoid_isi_s), stims=list(stims), segments=segs)
 
 
+# One recording holds at most this much: larger raw files made stop_raw_recording time out (Sep 2026),
+# and a 38-min FuncSolver recording (fs675, 14 Oct 2026, ~9 GB) was never saved to the S3 mount.
+MAX_SEGMENT_S = 360.0
+
+
 def plan_trials(trials, ipi_ms=10.0, amplitude_uA=2.0, phase_us=100.0, polarity="negative-first",
                 organoid_isi_s=(4.0, 4.5), spacing_s=(1.0, 1.25), seed=0):
     """Segments that deliver an arbitrary list of trials, as FuncSolver's live inference needs them.
 
     trials: (stim_electrode, n_pulses) pairs, one hardware train each. A train's length is part of
     the upload, so each segment binds every electrode to one length; segments repeat until every
-    trial is placed. Event i of the input list carries request=i. No sham trials: the caller applies
-    the sham correction from its calibration."""
+    trial is placed; a segment longer than MAX_SEGMENT_S hands its later trials to the next one. Event i
+    of the input list carries request=i. No sham trials: the caller applies the sham correction from its
+    calibration."""
     trials = [(int(e), int(n)) for e, n in trials]
     for n in {n for _, n in trials}:
         check_setting(amplitude_uA, phase_us, n, ipi_ms)
@@ -257,7 +266,10 @@ def plan_trials(trials, ipi_ms=10.0, amplitude_uA=2.0, phase_us=100.0, polarity=
         evs = [dict(key=el[e]["key"], kind="stim", stim_electrode=e, level=float(n), pulse_index=0, request=i)
                for i, e, n in now]
         rng.shuffle(evs)
-        evs = _spaced_timeline(evs, organoid_isi_s, spacing_s, rng)
+        evs = _spaced_timeline(evs, organoid_isi_s, spacing_s, rng)      # in time order
+        later = {ev["request"] for ev in evs if ev["t_s"] > MAX_SEGMENT_S}
+        pending += [(i, (e, n)) for i, e, n in now if i in later]
+        evs = [ev for ev in evs if ev["request"] not in later]
         sid = f"seg{len(segs):02d}"
         for k, ev in enumerate(evs):
             ev.update(train_id=f"{sid}t{k:03d}", partition="live", block=0)
