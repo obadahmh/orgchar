@@ -1,12 +1,11 @@
 """Run with pytest from the repository root (see README for a venv that leaves `ncp` untouched)."""
-from pathlib import Path
 
 import numpy as np
 import pytest
 
 from orgchar import analysis as A
-from orgchar import funcsolver as F
 from orgchar import protocol as P
+from orgchar import screen as SC
 from orgchar import signals as S
 from orgchar import simulate
 from orgchar.backends import SimBackend, match_triggers
@@ -43,12 +42,12 @@ def test_census_separates_live_and_silent_blocks(tmp_path):
 # ------------------------------------------------------------------------------ trigger matching
 
 def _train_segment(reps=12, coded=False):
-    """A fit segment of a FuncSolver curve: one trigger per train (the board times the
-    pulses), trains >= 1 s apart, shams interleaved."""
-    plan = P.plan_funcsolver([21], counts=(2, 4), reps=reps, sham_reps=4, seed=2)
+    """A screen segment on one electrode: one trigger per train (the board times the pulses), trains
+    >= 4 s apart, shams interleaved."""
+    plan = P.plan_train_screen(electrodes=[21], counts=(2,), reps=reps, sham_reps=4, seed=2)
     if coded:
         plan = P.add_train_codes(plan)
-    return next(s for s in plan["segments"] if s["partition"] == "fit")
+    return plan["segments"][0]
 
 
 def _record(seg, path, edit=lambda ev, s: (s, ev["key"]), code_pulse=False, clock=1.0):
@@ -114,7 +113,7 @@ def test_train_codes_plan():
         assert P.decode_keys(k1, k2) == n % P.N_CODES
     assert [e["t_s"] for e in seg["events"]] == sorted(e["t_s"] for e in seg["events"])
     with pytest.raises(ValueError):          # 10 electrodes would bind keys 8 and 9
-        P.add_train_codes(P.plan_funcsolver(list(range(10)), counts=(2,), reps=1, sham_reps=1))
+        P.add_train_codes(dict(segments=[dict(id="s", electrodes={e: dict(key=e) for e in range(10)}, events=[])]))
 
 
 def test_codes_confirm_alignment_despite_lost_row_and_late_trigger(tmp_path):
@@ -153,26 +152,6 @@ def test_code_trigger_that_stimulates_stops_the_run(tmp_path):
         match_triggers(seg, _record(seg, tmp_path / "raw.h5", code_pulse=True))
 
 
-# ------------------------------------------------------------------------------ FuncSolver curve
-
-NCP = Path.home() / "NeuralControlProgram"
-
-
-def test_funcsolver_plan_timing_and_structure():
-    plan = P.plan_funcsolver([2, 10, 20, 29], reps=4, sham_reps=2, seed=1)
-    parts, n = [s["partition"] for s in plan["segments"]], len(P.FUNCSOLVER_COUNTS)
-    assert parts[0] == parts[n + 1] == parts[-1] == "reference" and parts.count("fit") == n
-    for s in plan["segments"]:
-        assert all(v["n_pulses"] == s["n_pulses"] for v in s["electrodes"].values())
-        t = np.array([e["t_s"] for e in s["events"]])
-        assert np.diff(t).min() >= 1.0 - 1e-9                     # trains >= 1 s apart
-        for o in range(4):                                         # each organoid >= 4 s
-            to = [e["t_s"] for e in s["events"] if e["stim_electrode"] >= 0 and e["stim_electrode"] // 8 == o]
-            assert len(to) < 2 or np.diff(to).min() >= 4.0 - 1e-9
-    with pytest.raises(ValueError):
-        P.plan_funcsolver([2], counts=(2, 30))                     # beyond the 20-pulse limit
-
-
 def test_plan_trials_places_every_requested_train_once():
     trials = [(8, 4), (10, 12), (8, 4), (8, 6), (10, 12), (8, 20), (21, 2)]
     plan = P.plan_trials(trials, seed=1)
@@ -183,6 +162,12 @@ def test_plan_trials_places_every_requested_train_once():
             placed[e["request"]] = (e["stim_electrode"], int(e["level"]))
     assert placed == dict(enumerate(trials))
     assert len(plan["segments"]) == 3                              # e8 needs three different lengths
+    for s in plan["segments"]:
+        t = np.array([e["t_s"] for e in s["events"]])
+        assert len(t) < 2 or np.diff(t).min() >= 1.0 - 1e-9        # trains >= 1 s apart
+        for o in range(4):                                         # each organoid >= 4 s
+            to = [e["t_s"] for e in s["events"] if e["stim_electrode"] // 8 == o]
+            assert len(to) < 2 or np.diff(to).min() >= 4.0 - 1e-9
     with pytest.raises(ValueError):
         P.plan_trials([(8, 30)])                                   # beyond the 20-pulse limit
 
@@ -197,66 +182,6 @@ def test_readout_counts_events_after_the_train_only():
         post[end + ms * 30:end + ms * 30 + 8] -= 80
     m = RO.measure_trial(base, post, 5, 10, 100, -25.0)
     assert m["response_events"] == 3 and m["baseline_events"] == 0
-
-
-def _sim_funcsolver(tmp_path, reps=6):
-    org = simulate.demo_organoid()
-    plan = P.plan_funcsolver([5, 13, 21], reps=reps, sham_reps=3, seed=1)
-    segs = []
-    for s in plan["segments"]:
-        d = tmp_path / s["id"]
-        d.mkdir()
-        raw = SimBackend(org).run_segment(s, d, "f")
-        segs.append((str(raw), match_triggers(s, raw)))
-    return plan, segs, F.characterise(segs, plan)
-
-
-def test_funcsolver_finds_the_three_planted_shapes_and_writes_a_loadable_calibration(tmp_path):
-    plan, segs, r = _sim_funcsolver(tmp_path)
-    assert {k: (v["stim"], v["rec"]) for k, v in r["roles"].items()} == {"short": (13, 10), "band": (5, 3), "long": (21, 22)}
-    assert all(not p["shape"] for p in r["pairs"] if (p["stim"], p["rec"]) not in {(13, 10), (5, 3), (21, 22)})
-    plan = dict(plan, fsname="fstest")
-    cal = F.calibration(plan, "fstest", "fstest_s1", {int(k): v for k, v in r["thresholds_uV"].items()},
-                        r["_chosen"], r["pairs"], "test", True, tmp_path)
-    path = tmp_path / "calibration.json"
-    path.write_text(__import__("json").dumps(cal, allow_nan=False))
-    if (NCP / "FuncSolver" / "calibration.py").exists():          # FuncSolver's own loader accepts it
-        import importlib
-        import sys
-        sys.path.insert(0, str(NCP / "FuncSolver"))
-        try:
-            C = importlib.import_module("calibration")
-            assert [ch.type for ch in C.load(path).channels] == ["short", "band", "long"]
-        finally:
-            sys.path.remove(str(NCP / "FuncSolver"))
-
-
-def test_funcsolver_artifact_in_window_is_caught(tmp_path):
-    import h5py
-    from orgchar import readout as RO
-    plan = P.plan_funcsolver([21], counts=(2, 4, 6), reps=6, sham_reps=2, seed=3)
-    plan["segments"] = [s for s in plan["segments"] if s["partition"] == "fit"]
-    segs = []
-    for s in plan["segments"]:
-        d = tmp_path / s["id"]
-        d.mkdir()
-        raw = SimBackend(simulate.Organoid(seed=2)).run_segment(s, d, "a")
-        t = match_triggers(s, raw)
-        end = RO.train_end_ms(s["n_pulses"], plan["ipi_ms"], plan["phase_us"])
-        rng = np.random.default_rng(len(segs))
-        with h5py.File(raw, "r+") as f:
-            x = f["electrode_22"][...].reshape(-1)                 # a tail still there 10-13 ms after the train
-            y = f["electrode_20"][...].reshape(-1)                 # big bursts at random times (fs666 e10, 1 Oct)
-            for o in t[t.kind == "stim"].onset:
-                a = int(o + (end + 10) * 30)
-                x[a:a + 90] += 60 * np.sin(np.arange(90) / 4.0)
-                y[a:a + 3000] += rng.normal(0, 40, 3000)
-            f["electrode_22"][...] = x.reshape(f["electrode_22"].shape)
-            f["electrode_20"][...] = y.reshape(f["electrode_20"].shape)
-        segs.append((str(raw), t))
-    D, thr, art = F.measure(segs, plan)
-    assert max(art[(21, 22, n)] for n in (2, 4, 6)) > F.ARTIFACT_LIMIT
-    assert max(art[(21, c, n)] for c in (16, 17, 18, 19, 20, 23) for n in (2, 4, 6)) < F.ARTIFACT_LIMIT  # e20: bursts, no artifact
 
 
 def test_train_screen_deals_electrodes_two_per_organoid():
@@ -278,20 +203,20 @@ def _sim_train_screen(tmp_path, org, blocks):
         d.mkdir()
         raw = SimBackend(org).run_segment(s, d, "s")
         segs.append((str(raw), match_triggers(s, raw)))
-    return F.scout(segs, plan)
+    return SC.scout(segs, plan)
 
 
 def test_train_screen_finds_the_planted_shapes(tmp_path):
     r = _sim_train_screen(tmp_path, simulate.demo_organoid(), [0, 1, 2])
     assert {k: (v["stim"], v["rec"]) for k, v in r["best"].items()} == {"short": (13, 10), "band": (5, 3), "long": (21, 22)}
-    assert sorted(r["curve_stims"]) == [5, 13, 21] and r["verdict"] == "CANDIDATES_FOUND"
+    assert r["verdict"] == "CANDIDATES_FOUND"
     assert r["controls"]["cross_organoid_passing"] <= r["controls"]["nominal_ceiling"]
 
 
 def test_train_screen_artifacts_alone_find_nothing(tmp_path):
     # strong artifacts and lively spontaneous firing, but nothing responds to the trains
     r = _sim_train_screen(tmp_path, simulate.Organoid(seed=7), [2])
-    assert r["verdict"] == "NO_CANDIDATE" and not r["curve_stims"]
+    assert r["verdict"] == "NO_CANDIDATE" and not r["best"]
 
 
 def test_candidate_matched_by_another_organoid_is_dropped():
@@ -302,7 +227,7 @@ def test_candidate_matched_by_another_organoid_is_dropped():
         return dict(stim=stim, rec=rec, shapes=[role], scores={role: dict(p=p, diff=diff, win=0.95)})
     same = [pair(13, 14, "band", 0.0096, 1.8), pair(10, 15, "short", 0.0011, 82.1)]
     cross = [pair(19, 14, "short", 0.0041, 2.5), pair(26, 14, "long", 0.0051, 2.7), pair(30, 15, "long", 0.0031, 12.4)]
-    dropped = F.drop_chance(same, cross)
+    dropped = SC.drop_chance(same, cross)
     assert dropped == [dict(stim=13, rec=14, role="band", beaten_by=19)]
     assert same[0]["shapes"] == [] and same[1]["shapes"] == ["short"]
 

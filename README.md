@@ -1,23 +1,24 @@
-# orgchar: weekly organoid characterisation for FuncSolver
+# orgchar: organoid characterisation and the hybrid network
 
-Three steps tell you, for this week's FinalSpark organoids:
+Three steps, for this week's FinalSpark organoids:
 1. which organoids fire at all;
-2. which electrodes give FuncSolver's three response shapes (falling, peaked, rising) after a train;
-3. the full curve of those electrodes, checked on new trials, as FuncSolver's `calibration.json`.
+2. which stimulating → recording pairs respond to the length of a pulse train;
+3. the best pair's curve, measured now, the hybrid network trained on it, and the network run on the tissue.
 
 ```
 census   ~8 min, no stimulation       → which organoids are alive?             GO / NO-GO
-screen   ~30 min (4 live organoids)   → which electrodes give which shape?     candidates
-curve    30–45 min                    → curves checked on new trials           calibration.json
+screen   ~30 min (4 live organoids)   → which pairs respond to trains?         candidates
+solve    ≤ 45 min (one pair)          → network on the tissue                  R² against the true solution
 ```
 
-One paste runs all three; each step only starts if the previous one found something:
+One paste runs all three; each step only starts if the previous one found something, and solve
+stops itself before its costly part if the curve cannot support the network:
 
 ```bash
 cd ~/Documents/orgchar && git pull && FS=fs666 && \
 ./orgchar.sh census --fsname $FS --yes && \
 ./orgchar.sh screen --fsname $FS --yes && \
-./orgchar.sh curve  --fsname $FS --yes
+./orgchar.sh solve  --fsname $FS --yes
 ```
 
 Then `./orgchar.sh status` says where every organoid run this week stands.
@@ -35,8 +36,11 @@ Re-analysing the raw HDF5 of earlier work (Aug–Sep 2026) showed four problems:
    artifact check on every pair, and never reading the stimulated electrode.
 3. **Cross-talk has a fixed geometry**: up to ~1.7 mV on electrodes near 31 − *e* in another
    organoid. Pairs across organoids cannot respond, so they serve as negative controls.
-4. **Responses are bursty and heavy-tailed**, and FuncSolver reads one response per train. Hence
-   rank tests and single-trial scores rather than means.
+4. **Responses are bursty and heavy-tailed.** Hence rank tests and single-trial scores rather than
+   means.
+5. **Responses change within hours** (fs675, 15 Oct 2026: the 2-pulse response fell from 48 to 27
+   spikes between the morning's curve and the live run). Hence solve measures its curve in the same
+   session, minutes before the network uses it.
 
 ## The method
 
@@ -51,12 +55,12 @@ An organoid (block of 8) with ≥ 1 active electrode is **LIVE**. LIVE covers a 
 (1 Oct) one organoid had 8 active electrodes at 180 Hz in total and another a single one at 0.2 Hz.
 `status` shows both numbers per organoid.
 
-### Step 2: screen (which electrodes give which shape after a train)
+### Step 2: screen (which pairs respond to trains)
 
-Every electrode of each live organoid gets hardware trains of 2, 10 and 20 pulses (6 trials each; `--levels`, `--reps` to change; at least 5 trials, since 4 against 4 can never reach p < 0.01), measured exactly as FuncSolver will (events 10–210 ms after the train; see Step 3). For every stimulating → recording pair:
+Every electrode of each live organoid gets hardware trains of 2, 10 and 20 pulses (6 trials each; `--levels`, `--reps` to change; at least 5 trials, since 4 against 4 can never reach p < 0.01), measured as solve will (see Step 3). For every stimulating → recording pair:
 - **falling** if 2-pulse trials beat 20-pulse trials, **rising** if the reverse, **peaked** if the best middle length beats both ends;
 - the comparison is on single trials (rank test, one-sided p < 0.01, at least 1.5 events apart);
-- "single trial wins" = how often one trial at the favoured length beats one at the other: the number that decides whether FuncSolver can use it.
+- "single trial wins" = how often one trial at the favoured length beats one at the other.
 
 **Chance check.** With 6 trials against 6 the smallest possible p is 0.0011, so p < 0.01 alone
 lets noise through, mostly on bursting electrodes. Pairs across organoids cannot respond, so for
@@ -64,28 +68,59 @@ each recording electrode they show what chance reaches there. A candidate is dro
 another organoid into the same electrode did at least as well, in any shape (p as small, as many
 events apart). This is a heuristic with ~24 such pairs per electrode, and none when only one
 organoid is screened. On fs666 (1 Oct) it drops e13→e14, the only peaked candidate, which e19→e14
-and e26→e14 beat and the curve did not confirm; it keeps all nine falling pairs from e9/e10.
+and e26→e14 beat and a full curve did not confirm; it keeps all nine falling pairs from e9/e10.
 
-The best remaining pair per shape decides which electrodes the curve stimulates (one electrode may serve two shapes). One upload holds at most 8 stimulating electrodes (keys 8–14 carry train codes), so electrodes are dealt two per organoid per recording and all organoids run side by side.
+solve measures the clearest of these pairs (highest single-trial win, then the largest difference); `--pairs` chooses others. One upload holds at most 8 stimulating electrodes (keys 8–14 carry train codes), so electrodes are dealt two per organoid per recording and all organoids run side by side.
 
 Why not single pulses: on fs666 (1 Oct 2026) a single-pulse screen picked e2, e20, e29 and e10; only e10 responded after trains.
 
-### Step 3: curve (FuncSolver's activation functions)
+### Step 3: solve (the hybrid network on the tissue)
 
-FuncSolver (NeuralControlProgram) uses one organoid pair per function shape it can get: **short** (falling: more pulses → fewer events), **band** (peaked) and **long** (rising); any subset works. It sends **one** train per evaluation and reads **one** response, so a curve is only as good as single trials are close to it. Each evaluation gives the three roles different pulse counts at once, so each role needs its own stimulating electrode.
+**The network.** One hidden layer of 12 units. Unit *j* turns the time *t* into a pulse count
+p = round(w t / T + b), clipped to 2–20; the tissue answers with its pair's evoked spikes after a train
+of p pulses; the computer sums the units' responses with weights. The activation is the measured
+table (mean evoked spikes per pulse count, linear in between), not a fitted formula. Units take the
+available curves in turn: one pair is enough in principle
+(`~/Documents/FinalSpark_summary/sufficiency/sufficiency.pdf`), and in simulation a second response
+type added nothing.
 
-`curve` measures exactly what FuncSolver uses:
-- **Input:** a hardware train of 2, 5, 8, 11, 14, 17 or 20 pulses (8 trials per count and pass; `--levels`, `--reps` to change), 10 ms apart, 2 µA × 100 µs. One trigger; the stimulator repeats the pulse, as FuncSolver delivers it. A train's length is part of the upload, so there is one recording per pulse count.
-- **Output** (`orgchar/readout.py`, one function for calibration and live use): 300–3000 Hz band-pass, events = crossings of −5× noise counted **10–210 ms after the train**, minus the 500 ms before it (scaled), minus the mean of no-current sham trials. The raw voltage swings by hundreds of µV on some electrodes; counting on it unfiltered would count those swings.
-- **Order:** reference (10 pulses) → **fit** (every count, shuffled) → reference → **test** (reshuffled) → reference. Folders are named `ref0`, `fit_n02` … `fit_n20`, `ref1`, `test_n02` … `test_n20`, `ref2`. Until 13 Oct 2026 the defaults were 2, 4, …, 20 pulses × 10 trials, and a screen of 2, 6, 12, 20: changed to cut recordings and stimulation by about a third (fs674 faded within an hour of being stimulated, 12 Oct) (sessions before 6 Oct 2026 used `dev_` and `con_`). Each organoid ≥ 4 s between trains, trains ≥ 1 s apart. Every other electrode of each stimulated organoid is measured.
-- **Fit trials alone** choose the pairs (FuncSolver's shape rule, then the best cross-validated single-trial fit, each role on its own stimulating electrode) and fit FuncSolver's curve formulas. **Test trials** only score those frozen curves: R² and error on new single trials. The references show drift.
-- **Artifact check:** the median across trials of the window's first 5 ms, in units of its own noise floor. Spikes are not time-locked and drop out; an artifact tail does not. Pairs over 3× are excluded. On the fs647 hardware-train recordings of 8 Sep the largest value was 2.6×.
+**The task.** m y'' + c y' + k y = 0, y(0) = 1, y'(0) = 0 on [0, 10], with m, c, k = 1, 2, 10, read
+off TUM's Fig. 4f.
 
-Verdict per function: **Good** (new-trial R² ≥ 0.5, no large drift), **Fair** (≥ 0.2), **Poor**, or **Missing**.
+Four steps in one session, each gated:
+1. **Sweep:** 8 trains at 2, 4, …, 20 pulses on each pair's stimulating electrode. Gate: the response
+   depends on the pulse count (Kruskal–Wallis p < 0.01), and the stimulation artifact has faded by
+   the counting window (below 3× its noise floor: the median across trials of the window's first 5 ms,
+   in units of what a median of that many trials varies by anyway; spikes are not time-locked and
+   drop out, an artifact tail does not). A pair that fails is dropped; none left, stop.
+2. **Train** (no stimulation): the weak-form residual of the ODE (smooth overlapping test functions,
+   integrated by parts, so only values of y are needed), plus y(0) and the output's noise variance
+   from the measured trial spread. First with fractional pulse counts, then whole ones; 8 starts,
+   lowest loss kept. Gate: the expected R² must beat a plain decay's (see below). Expected = with
+   the noise of the run's 6 trials per count and the sweep's own uncertainty, each count's error
+   shared by every time point that uses it (as in step 3). Else stop: no further stimulation.
+3. **Evaluate:** at 25 held-out times, each unit asks for a pulse count. Each distinct (electrode,
+   count) is measured 6 times and reused wherever it is asked for (on the 15 Oct live trials: the
+   same R² as one train per request, with 20× fewer pulses). y(t) is computed from those responses.
+4. **Drift:** the run's responses against the sweep, at the counts both measured.
 
-Outputs: `calibration.json` in FuncSolver's format (schema 1; tested with `FuncSolver/calibration.load`), copied to `sessions/<fsname>/calibration_latest.json` when one complete run finds at least one Good or Fair function (Poor ones are left out: on fs674, 12 Oct, a falling curve at R² −1.18 on test trials had been passed on); `report.html` opens with the verdict and the command for the network, then one tile per response type (grade, R² on test trials, the pair on a small electrode map, the curve), the checks, single-trial evidence and a drift check for each chosen pair, and every pair measured: per stimulating electrode, the organoid's electrode map coloured by response size beside a table of responses per train length, on one colour scale.
+**Reading the R².** A plain decay a × exp(−kt) + b, with no oscillation, scores 0.80 at the 25
+times, because the solution is near zero after t ≈ 4. Only an R² above that shows the oscillation;
+the report says which side a run is on. As of 16 Oct 2026 no network trained on one curve clears it
+(simulated sweep and synthetic shapes): they follow the first drop and miss the rebound.
 
-The window starts at the end of the train, so it starts later for longer trains. On fs666 e10, 2–4 pulses set off a burst across the whole organoid lasting ~400 ms; longer trains cut it short and leave the organoid quiet afterwards. Both effects make the curve fall. The four "pairs" e10→e8, e9, e13, e15 are that one burst seen on four electrodes.
+**Measuring** (`orgchar/measure.py`, the one hardware primitive): trains are grouped into recordings
+by length (a length is part of the upload), at most 6 min each, each organoid ≥ 4 s between trains;
+each recording is read out as soon as it is saved, its responses written at once; trains lost to
+dropped rows are requested again (2 retries). Spike thresholds are frozen from the first recording.
+No sham trials: a no-current trigger evokes nothing (tested many times), and each trial's own
+pre-train baseline is subtracted.
+
+**Readout** (`orgchar/readout.py`): 300–3000 Hz band-pass, crossings of −5× noise counted
+**10–210 ms after the train**, minus the 500 ms before it (scaled). The window starts at the end of
+the train, so later for longer trains. On fs666 e10, 2–4 pulses set off a burst across the whole
+organoid lasting ~400 ms; longer trains cut it short and leave the organoid quiet. Both effects make
+the curve fall.
 
 ## Running it
 
@@ -96,7 +131,7 @@ cd ~/Documents/orgchar
 ./orgchar.sh census --fsname fs652 --dry-run    # shows the plan and its duration, touches nothing
 ./orgchar.sh census --fsname fs652              # asks you to type the fsname to confirm
 ./orgchar.sh screen --fsname fs652              # after-train screen of the live organoids from the census
-./orgchar.sh curve  --fsname fs652              # FuncSolver curves on the screen's candidate electrodes
+./orgchar.sh solve  --fsname fs652              # the screen's clearest pair: sweep, train, run the network
 ./orgchar.sh status                             # every organoid run in the last 7 days (or --fsname fs652)
 ./orgchar.sh analyze sessions/fs652/<step dir>  # re-analyse offline, e.g. after changing a setting
 ```
@@ -107,24 +142,29 @@ cd ~/Documents/orgchar
 
 Useful options:
 - `screen --blocks 1,2`: override the census choice. `screen --electrodes 21,15`: a subset.
-- `curve --stims 0,10,30`: choose the stimulating electrodes; `curve --levels 2,4,8,12,16,20 --reps 12`.
+- `solve --pairs 13:10`: choose the pair(s) (stim:rec); `--sweep-reps 8`, `--reps 6` (trains per pulse count in the sweep and the run), `--width 12`, `--points 26`.
 - `--amplitude 3` / `--phase 150`: more current. Stimulation limits are enforced before any upload: ≤ 3 µA, ≤ 200 µs, ≤ 0.4 nC/phase, ≤ 20 pulses. Change them in `orgchar/protocol.py` (`LIMITS`).
 
 Each step directory contains:
 - `plan.json` (everything sent);
 - one folder per segment with `sent.csv`, `trials.csv` (recorded trigger edge ↔ planned event), `close_status.json` and `remote_path.txt`;
-- `result.json`, `report.html` (open in a browser; figures are embedded), and for a curve `calibration.json`.
+- `result.json`, `report.html` (open in a browser; figures are embedded).
+
+A solve directory holds `sweep/` and `evaluate/` (each: `plan.json`, one folder per recording with
+`trials.csv` and `responses.csv`, and every response in `responses.csv`), `model.pt` and
+`result.json`. Its `report.html` gives the verdict, the solution (true, network on the curve,
+network on the tissue, as TUM's Fig. 4f), the measured curve with the run's responses on it, and the
+checks.
 
 **Raw recordings stay where the platform saves them**, `/mnt/s3-intanraws` (read at ~60 MB/s);
 `remote_path.txt` points to each one. Hardware runs before 5 Oct 2026 copied them into the segment
 folder as `raw.h5` (41 GB in the first week); those copies are still used when present.
 
 **`status`** shows, per organoid: the latest complete census (active electrodes and Hz per
-organoid), the latest screen (best pair per shape, and what the chance check dropped), the best pair
-found so far for each FuncSolver function with its grade and date, the calibration, the last run,
-and runs recorded by another machine. A run on neuroplatform10 is visible from np14 through its
+organoid), the latest screen (best pair per shape, and what the chance check dropped), the latest
+solve, the last run, and runs recorded by another machine. A run on neuroplatform10 is visible from np14 through its
 recordings on the S3 mount, but its results stay on neuroplatform10. Anything recorded more than
-24 h ago is marked STALE, and `screen` / `curve` warn when they build on a census / screen that old:
+24 h ago is marked STALE, and `screen` / `solve` warn when they build on a census / screen that old:
 responses change within a day (fs666 e10's reference fell from 22 to 8.5 events within one hour).
 
 ## Reading the verdicts
@@ -133,23 +173,20 @@ responses change within a day (fs666 e10's reference fell from 22 to 8.5 events 
 |---|---|---|
 | census | `GO: screen blocks …` | run screen |
 | census | `NO-GO` | do not stimulate; re-check later, contact FinalSpark |
-| screen | `CANDIDATES_FOUND` | run curve (it stimulates the candidates) |
-| screen | `NO_CANDIDATE` | nothing for FuncSolver with these trains; try `--amplitude 3`, or re-check the census |
+| screen | `CANDIDATES_FOUND` | run solve (it measures the clearest pair) |
+| screen | `NO_CANDIDATE` | nothing responds to these trains; try `--amplitude 3`, or re-check the census |
 | screen | `CONTROLS_FAILED` | far more other-organoid pairs pass than p < 0.01 allows: artifact reaches the readout; do not trust the candidates |
-| curve | `ALL THREE FUNCTIONS FOUND` | train FuncSolver on `calibration_latest.json` (command in the report) |
-| curve | `SOME FUNCTIONS MISSING` | train FuncSolver on the functions found; to find the missing shape, re-run with other `--stims` or more current |
-| curve | `NO USABLE FUNCTION` | the organoid does not give FuncSolver's shapes with these trains |
+| solve | `STOPPED after the sweep` | no pair responds cleanly now; try another screen candidate (`--pairs`) or re-screen |
+| solve | `STOPPED after training` | the network on this curve could not show the oscillation; nothing more was stimulated |
+| solve | `R² … on the tissue` | compare with the expected R² and the plain decay's (in the verdict) |
 
 Any step can also end `INCOMPLETE: …` (a recording cut short or a failed final disable): inspect, then re-run it.
 
-## Using it for function approximation
+## Notes
 
-- Train FuncSolver offline on the calibration (no hardware):
-  `cd ~/NeuralControlProgram/FuncSolver && python main.py train <curve session folder>`.
-- Live inference (`python main.py infer <run> --organoid`) runs through orgchar: `protocol.plan_trials` lays out each layer's trains, `HardwareBackend` delivers them under the same hardware lock, and `readout.measure_trial` counts the events with the calibration's frozen thresholds, minus its sham mean. `--simulate` runs the same path on simulated recordings. See FuncSolver's README.
-- Responses change within a day. Re-run `curve` at the start of each FuncSolver session; after a medium change, start again from `census`.
 - Each fsXXX is one preparation: FinalSpark replaces all four organoids at once, under a new fsXXX, so a new fsname starts from `census` with nothing carried over.
-- Do not read the vendor spike database for evoked responses. It counts artifacts and knows nothing about sham or cross-talk.
+- Do not read the vendor spike database for evoked responses. It counts artifacts and knows nothing about cross-talk.
+- `solve` replaces the `curve` step and FuncSolver's calibration (`~/NeuralControlProgram/FuncSolver`), 16 Oct 2026. Old curve folders keep their reports.
 
 ## Platform quirks (handled)
 
@@ -169,16 +206,16 @@ Timing alone says *where* each train is, not *which* train it is; the alignment 
 
 - Codes are read straight from the recording, independently of the alignment, and compared with it. A contradiction excludes that train (`note = code mismatch`) and is reported; a code lost in a dropped row just leaves that train unconfirmed (`code = missing`).
 - Every coded run checks that code triggers leave no artifact (< 50 µV; real stimulation leaves thousands). If they ever do, the run stops with an error.
-- Before first use on a machine, run `./orgchar.sh codetest --fsname <fs>` (about 3 min). It uploads the curve electrodes' real parameters, sends 60 codes (each followed by a sham marker), then 5 real pulses as a positive control, and prints PASS or FAIL with the evidence.
-- Once codetest has passed on a machine, screen and curve use codes by default there (`--no-codes` to switch off). Run it again after FinalSpark changes their setup. Passed on np14, 1 Oct 2026 (130/130 code triggers recorded, 60/60 codes read back, 3.3 µV after codes vs 6259 µV after real pulses).
+- Before first use on a machine, run `./orgchar.sh codetest --fsname <fs>` (about 3 min). It uploads the screen's best electrodes' real parameters, sends 60 codes (each followed by a sham marker), then 5 real pulses as a positive control, and prints PASS or FAIL with the evidence.
+- Once codetest has passed on a machine, screen and solve use codes by default there (`--no-codes` to switch off). Run it again after FinalSpark changes their setup. Passed on np14, 1 Oct 2026 (130/130 code triggers recorded, 60/60 codes read back, 3.3 µV after codes vs 6259 µV after real pulses).
 
 ## What is and is not verified
 
-- **On the platform:** census, screen and curve have run on fs660 (29 Sep), fs666 (30 Sep–2 Oct, np14) and fs667 (30 Sep–1 Oct, neuroplatform10). On fs666 the e10 falling curve reproduced on 1 and 2 Oct (R² 0.62 on new trials on 2 Oct); its events have the shape and size of spontaneous spikes, not artifact.
-- **Trigger matching:** all 62 fs666 segments of 1–2 Oct give identical trial tables with the current alignment.
-- **Simulation:** the full census → screen → curve chain finds the planted falling, peaked and rising pairs, and an organoid with artifacts but no responses gives `NO_CANDIDATE`.
-- **Not verified:** reading raw files from the S3 mount during a hardware run (5 Oct change; the same files read fine offline); FuncSolver live inference (not connected).
-- **Sham on key 15 and codes on keys 8–14 assume no electrode is bound to them.** Each segment starts with disable-all and only the planned electrodes (keys 0–7) are uploaded; every coded run checks for an artifact after code triggers.
+- **On the platform:** census and screen have run on fs660, fs666, fs667, fs674 and fs675 (29 Sep–15 Oct). The curve step that solve replaces ran there too; on fs666 the e10 falling curve reproduced on 1 and 2 Oct, and its events have the shape and size of spontaneous spikes, not artifact. solve's pieces ran live through FuncSolver on fs675 (14–15 Oct): trains by plan_trials, the readout, reuse by pulse count.
+- **Trigger matching:** all 62 fs666 segments of 1–2 Oct and 110 fs675 FuncSolver segments give identical trial tables with the current alignment.
+- **Simulation:** census → screen → solve finds the planted pairs; an organoid with artifacts but no responses gives `NO_CANDIDATE`, and solve on it stops after the sweep.
+- **Not verified:** `solve` itself on hardware.
+- **Codes on keys 8–14 (and the screen's sham key 15) assume no electrode is bound to them.** Each segment starts with disable-all and only the planned electrodes (keys 0–7) are uploaded; every coded run checks for an artifact after code triggers.
 
-Tests: about 4 min. pytest is not in `ncp`, so use a side venv that leaves `ncp` untouched:
+Tests: 26, about 4 min. pytest is not in `ncp`, so use a side venv that leaves `ncp` untouched:
 `python -m venv --system-site-packages /tmp/t && /tmp/t/bin/pip install pytest && /tmp/t/bin/python -m pytest -q` (create the venv with the `ncp` python).

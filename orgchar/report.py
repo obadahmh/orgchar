@@ -1,5 +1,5 @@
-"""Self-contained HTML pages: shared page parts and the census page (the screen and curve pages are
-in report_funcsolver.py). Figures are inline SVG, so a page stays sharp when zoomed and opens offline."""
+"""Self-contained HTML pages: shared page parts and the census page (the screen page is in
+report_screen.py). Figures are inline SVG, so a page stays sharp when zoomed and opens offline."""
 from __future__ import annotations
 
 import html
@@ -181,3 +181,77 @@ def write_html(path, title: str, verdict: str, summary_lines: list[str], figs, t
                     + table.to_html(index=False, float_format=lambda x: f"{x:.3g}", na_rep="") + "</div></details>")
     with open(path, "w") as f:
         f.write(_page(title, body))
+
+
+# ============================================================================== solve
+
+def solve_page(path, res: dict, when: str):
+    """The solve run: verdict, the network on the tissue against the true solution, the measured curve
+    (with the evaluation's responses on it), and each check."""
+    from .measure import ARTIFACT_LIMIT
+    from .net import Oscillator
+    from .solve import GATE_P
+    sim = res.get("simulated")
+    chips = [when] + (["SIMULATED"] if sim else []) + [
+        "pairs " + ", ".join(f"e{s}→e{r}" for s, r in res["pairs"]),
+        f"curve: {res['sweep_trains']} trains, {res['sweep_pulses']} pulses"]
+    if "eval_trains" in res:
+        chips.append(f"network: {res['eval_trains']} trains, {res['eval_pulses']} pulses")
+    chips.append(f"orgchar {res.get('code_version', '?')}")
+    body = [f"<h1>{html.escape(res['fsname'])}: solve</h1>",
+            "<div class=chips>" + "".join(f"<span class=chip>{html.escape(c)}</span>" for c in chips) + "</div>",
+            f"<div class=verdict><p class=lede>{html.escape(res['verdict'])}</p></div>"]
+    if "y" in res:
+        ode = Oscillator(**res["ode"])
+        dense = np.linspace(0, ode.T, 1001)
+        fig, ax = plt.subplots(figsize=(8.5, 3.2))
+        ax.plot(dense, ode.exact(dense), color=GREY, lw=2, ls=(0, (5, 3)), label="true solution")
+        ax.plot(res["t"], res["y_model"], color=MUTED, lw=1, label="network on the measured curve")
+        ax.plot(res["t"], res["y"], color=BLUE, lw=2.2, marker="o", ms=4, label="network on the tissue")
+        ax.text(0.98, 0.9, f"$R^2$ = {res['r2']:.3f} (plain decay: {res['decay_r2']:.2f})", transform=ax.transAxes,
+                ha="right")
+        ax.text(0.98, 0.72, r"$m\ddot{y} + c\dot{y} + ky = 0$", transform=ax.transAxes, ha="right")
+        ax.set_xlabel("time")
+        ax.set_ylabel("y")
+        ax.legend(frameon=False, fontsize=8, loc="upper center", ncol=3)
+        body.append("<h2>Solution</h2>" + f"<div class=fig>{_svg(fig)}</div>")
+    fig, axes = plt.subplots(1, len(res["curves"]), figsize=(4.2 * len(res["curves"]), 2.8), squeeze=False)
+    for ax, c in zip(axes[0], res["curves"]):
+        m, sd = np.array(c["mean"]), np.array(c["sd"])
+        ax.fill_between(c["counts"], m - sd, m + sd, color=SHADE, lw=0)
+        ax.plot(c["counts"], m, color=INK, lw=2, marker="o", ms=4, label="curve (sweep mean ± SD)")
+        ev = [e for e in res.get("eval_means", []) if (e["stim"], e["rec"]) == (c["stim"], c["rec"])]
+        if ev:
+            ax.plot([e["pulses"] for e in ev], [e["mean"] for e in ev], "o", color=BLUE, ms=4,
+                    label="during the run")
+        ax.axhline(0, color=GREY, lw=0.6)
+        ax.set_title(f"e{c['stim']}→e{c['rec']}", fontsize=9)
+        ax.set_xlabel("pulses in the train")
+    axes[0][0].set_ylabel("evoked spikes")
+    axes[0][0].legend(frameon=False, fontsize=7.5)
+    body.append("<h2>Measured curve</h2>" + f"<div class=fig>{_svg(fig)}</div>")
+    checks = []
+    for c in res["curves"]:
+        ok = c["p"] < GATE_P and c["artifact"] < ARTIFACT_LIMIT
+        checks.append((CHECK_OK if ok else CHECK_BAD,
+                       f"e{c['stim']}→e{c['rec']}: the pulse count explains {c['explained']:.0%} of single-trial variance "
+                       f"(p {c['p']:.1g}; needs p < {GATE_P:g}); artifact {c['artifact']:.1f}x its noise floor "
+                       f"(limit {ARTIFACT_LIMIT:g}x)"))
+    if "expected" in res:
+        e = res["expected"]
+        checks.append((CHECK_OK if e["noisy_median"] > res["decay_r2"] else CHECK_BAD,
+                       f"Expected R² with the noise of {res['eval_reps']} trials: {e['noisy_median']:.2f} "
+                       f"(10-90 %: {e['noisy_p10']:.2f} to {e['noisy_p90']:.2f}; must beat a plain decay's {res['decay_r2']:.2f})"))
+    if "r2" in res:
+        checks.append((CHECK_OK if res["r2"] > res["decay_r2"] else CHECK_WARN,
+                       f"Oscillation: R² {res['r2']:.2f} on the tissue; the best plain decay a × exp(-kt) + b, which has "
+                       f"no oscillation, scores {res['decay_r2']:.2f} at the same times. Only an R² above it shows the "
+                       "oscillation."))
+    if res.get("drift_max") is not None:
+        checks.append((CHECK_OK if res["drift_max"] < 0.3 else CHECK_WARN,
+                       f"Largest change of a response between the sweep and the run: {res['drift_max']:.0%} of the "
+                       "curve's range (sampling noise alone gives ~10 %)"))
+    body.append("<h2>Checks</h2><ul class=checks>"
+                + "".join(f"<li>{_icon(i)}<span>{html.escape(t)}</span></li>" for i, t in checks) + "</ul>")
+    with open(path, "w") as f:
+        f.write(_page(f"{res['fsname']}: solve, {when}", body))

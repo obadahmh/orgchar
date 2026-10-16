@@ -1,8 +1,5 @@
-"""The response readout FuncSolver uses: one function, shared by calibration and live inference.
-
-Self-contained (numpy + scipy only) so FuncSolver can import it unchanged. Calibration calls
-`measure_trial` on windows cut from the continuous recording; live inference calls it on the
-voltage it acquires for a single trial. Same function, same numbers.
+"""The response readout: one function for every trial, in the screen and in solve (measure.py), on
+windows cut from the continuous recording. Self-contained (numpy + scipy only).
 
 Definition (method 'orgchar_bandpass_events_v1'), for one electrode and one stimulation train:
   1. post = voltage from the train's trigger onwards; the train itself and `blank_after_train_ms`
@@ -15,8 +12,8 @@ Definition (method 'orgchar_bandpass_events_v1'), for one electrode and one stim
      `refractory_ms`;
   4. response = events in [train end + window[0], train end + window[1]]
               - baseline events scaled to the window's length.
-The sham correction (mean response of no-current trials with the same pulse count) is applied by
-the caller, from the calibration file.
+The screen also subtracts the mean of its no-current (sham) trials; solve does not, as they evoke
+nothing.
 """
 from __future__ import annotations
 

@@ -46,7 +46,7 @@ def check_setting(amplitude_uA, phase_us, n_pulses=1, ipi_ms=0.0, limits=LIMITS)
 
 def _electrodes(stims, amplitude_uA, phase_us, polarity, n_pulses=1, ipi_ms=0.0):
     """n_pulses > 1: a hardware train (the board repeats the pulse every ipi_ms after one trigger),
-    as FuncSolver delivers it."""
+    as the network delivers it."""
     if len(stims) > 15:
         raise ValueError("At most 15 stimulation electrodes per segment (key 15 is the sham key)")
     return {int(e): dict(key=i, amplitude_uA=amplitude_uA, phase_us=phase_us, polarity=polarity,
@@ -104,7 +104,7 @@ def add_train_codes(plan: dict) -> dict:
 def plan_codetest(stims, amplitude_uA=2.0, phase_us=100.0, polarity="negative-first", n_codes=60,
                   n_positive=5, seed=0):
     """One-minute check that train codes are safe and readable. The stimulating electrodes' real
-    parameters are uploaded exactly as in a curve (keys 0..), but no electrode is triggered: every
+    parameters are uploaded exactly as in a run (keys 0..), but no electrode is triggered: every
     ~1 s a code (keys 8-14) is sent, followed by a sham marker (key 15), cycling through all 49 codes. At the end, n_positive single pulses on the first
     electrode show what a real stimulation artifact looks like in this recording (positive control)."""
     check_setting(amplitude_uA, phase_us)
@@ -118,12 +118,6 @@ def plan_codetest(stims, amplitude_uA=2.0, phase_us=100.0, polarity="negative-fi
     plan = dict(step="codetest", amplitude_uA=amplitude_uA, phase_us=phase_us, polarity=polarity,
                 segments=[dict(id="seg00", electrodes=el, events=evs, duration_s=round(evs[-1]["t_s"] + 2.0, 1))])
     return add_train_codes(plan)
-
-
-# Defaults since 13 Oct 2026: fewer recordings and a third less stimulation (fs674 faded within an hour
-# of being stimulated, 12 Oct). Each recording costs ~50 s plus half its length in platform overhead.
-FUNCSOLVER_COUNTS = (2, 5, 8, 11, 14, 17, 20)
-FUNCSOLVER_REPS = 8
 
 
 def _spaced_timeline(trials, organoid_isi_s, spacing_s, rng, t0=1.0):
@@ -171,7 +165,7 @@ def plan_train_screen(blocks=None, electrodes=None, counts=SCREEN_COUNTS, ipi_ms
                       organoid_isi_s=(4.0, 4.5), spacing_s=(1.0, 1.25), seed=0):
     """Which electrode, given a train, changes what its neighbours do AFTER the train, and how
     does that change with train length? Every electrode of every chosen organoid gets hardware
-    trains of each length (FuncSolver's input), measured with FuncSolver's readout. One segment
+    trains of each length (the network's input), measured with the network's readout. One segment
     per length (a train's length is part of the upload); all organoids interleaved."""
     stims = sorted(electrodes) if electrodes else [e for b in sorted(blocks) for e in range(8 * b, 8 * b + 8)]
     counts = sorted(int(n) for n in counts)
@@ -195,44 +189,6 @@ def plan_train_screen(blocks=None, electrodes=None, counts=SCREEN_COUNTS, ipi_ms
                 sham_reps=sham_reps, organoid_isi_s=list(organoid_isi_s), stims=stims, segments=segs)
 
 
-def plan_funcsolver(stims, counts=FUNCSOLVER_COUNTS, ipi_ms=10.0, amplitude_uA=2.0, phase_us=100.0,
-                    polarity="negative-first", reps=FUNCSOLVER_REPS, sham_reps=4, reference_pulses=10, reference_reps=5,
-                    organoid_isi_s=(4.0, 4.5), spacing_s=(1.0, 1.25), seed=0):
-    """Characterise stim->rec pairs exactly as FuncSolver will use them.
-
-    Input = pulse count of a hardware train (one trigger; the board spaces pulses ipi_ms apart),
-    output = events 10-210 ms after the train (readout.py). One segment (= one upload) per pulse
-    count, because a hardware train's length is part of the uploaded parameters.
-
-    Order: reference, fit pass (every count once, shuffled), reference, test pass (every count
-    once, reshuffled), reference. Fit trials alone select the pairs and fit the curves. Test trials
-    only measure how well those frozen curves predict new trials. References (reference_pulses,
-    the same train in every reference segment) measure drift over the run.
-    Each segment also holds sham trials (no current) with the same timing, for the sham correction.
-    """
-    counts = sorted(int(n) for n in counts)
-    for n in counts + [reference_pulses]:
-        check_setting(amplitude_uA, phase_us, n, ipi_ms)
-    rng = random.Random(seed)
-    segs = []
-
-    def segment(seg_id, n, partition, block, n_reps, n_sham):
-        segs.append(_train_segment(seg_id, stims, n, partition, block, n_reps, n_sham, ipi_ms, amplitude_uA,
-                                   phase_us, polarity, organoid_isi_s, spacing_s, rng))
-
-    segment("ref0", reference_pulses, "reference", 0, reference_reps, 2)
-    for p, partition in enumerate(("fit", "test")):
-        order = list(counts)
-        rng.shuffle(order)
-        for n in order:
-            segment(f"{partition}_n{n:02d}", n, partition, p, reps, sham_reps)
-        segment(f"ref{p + 1}", reference_pulses, "reference", p + 1, reference_reps, 2)
-    return dict(step="curve", vary="pulse_train", readout="after_train", levels=counts, ipi_ms=ipi_ms,
-                amplitude_uA=amplitude_uA, phase_us=phase_us, polarity=polarity, reps=reps, sham_reps=sham_reps,
-                reference_pulses=reference_pulses, reference_reps=reference_reps,
-                organoid_isi_s=list(organoid_isi_s), stims=list(stims), segments=segs)
-
-
 # One recording holds at most this much: larger raw files made stop_raw_recording time out (Sep 2026),
 # and a 38-min FuncSolver recording (fs675, 14 Oct 2026, ~9 GB) was never saved to the S3 mount.
 MAX_SEGMENT_S = 360.0
@@ -240,13 +196,12 @@ MAX_SEGMENT_S = 360.0
 
 def plan_trials(trials, ipi_ms=10.0, amplitude_uA=2.0, phase_us=100.0, polarity="negative-first",
                 organoid_isi_s=(4.0, 4.5), spacing_s=(1.0, 1.25), seed=0):
-    """Segments that deliver an arbitrary list of trials, as FuncSolver's live inference needs them.
+    """Segments that deliver an arbitrary list of trials (measure.measure).
 
     trials: (stim_electrode, n_pulses) pairs, one hardware train each. A train's length is part of
     the upload, so each segment binds every electrode to one length; segments repeat until every
     trial is placed; a segment longer than MAX_SEGMENT_S hands its later trials to the next one. Event i
-    of the input list carries request=i. No sham trials: the caller applies the sham correction from its
-    calibration."""
+    of the input list carries request=i. No sham trials."""
     trials = [(int(e), int(n)) for e, n in trials]
     for n in {n for _, n in trials}:
         check_setting(amplitude_uA, phase_us, n, ipi_ms)

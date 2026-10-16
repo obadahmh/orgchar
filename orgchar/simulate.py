@@ -28,10 +28,11 @@ class Organoid:
 
 def demo_organoid() -> Organoid:
     """The organoid `--simulate` runs on: one falling, one peaked and one rising after-train response
-    (stim 5, 13, 21), so the screen and the curve have something to find."""
+    (stim 5, 13, 21), so the screen and solve have something to find."""
+    # sizes as on real tissue (fs675, Oct 2026: ranges of 40-100 evoked spikes)
     return Organoid(spont_hz={16: 2.0, 20: 4.0, 21: 2.0, 22: 3.0, 23: 2.5, 13: 1.0, 3: 3.0, 10: 3.0},
-                    after_train={(5, 3): ("band", 8, 10, 3.5), (13, 10): ("short", 8, 0.6, 9),
-                                 (21, 22): ("long", 10, 0.5, 10)})
+                    after_train={(5, 3): ("band", 30, 10, 3.5), (13, 10): ("short", 40, 0.6, 9),
+                                 (21, 22): ("long", 35, 0.5, 10)})
 
 
 def after_train_mean(shape, a, b, c, n):

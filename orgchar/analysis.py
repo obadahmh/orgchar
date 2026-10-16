@@ -1,5 +1,5 @@
 """Census: which electrodes and organoids contain firing neurons. Raw HDF5 in, plain dict out
-(JSON-serialisable); no hardware access here. The screen and curve analyses are in funcsolver.py."""
+(JSON-serialisable); no hardware access here. The screen's analysis is in screen.py."""
 from __future__ import annotations
 
 import numpy as np
