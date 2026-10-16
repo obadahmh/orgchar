@@ -8,7 +8,7 @@ Three steps, for this week's FinalSpark organoids:
 ```
 census   ~8 min, no stimulation       → which organoids are alive?             GO / NO-GO
 screen   ~30 min (4 live organoids)   → which pairs respond to trains?         candidates
-solve    ≤ 45 min (one pair)          → network on the tissue                  R² against the true solution
+solve    ≤ 50 min (one pair)          → network on the tissue                  R² against the true solution
 ```
 
 One paste runs all three; each step only starts if the previous one found something, and solve
@@ -96,7 +96,7 @@ Four steps in one session, each gated:
 2. **Train** (no stimulation): the weak-form residual of the ODE (smooth overlapping test functions,
    integrated by parts, so only values of y are needed), plus y(0) and the output's noise variance
    from the measured trial spread. First with fractional pulse counts, then whole ones; 8 starts,
-   lowest loss kept. Gate: the expected R² must beat a plain decay's (see below). Expected = with
+   lowest loss kept (40,000 steps, about 6 min). Gate: the expected R² must beat a plain decay's (see below). Expected = with
    the noise of the run's 6 trials per count and the sweep's own uncertainty, each count's error
    shared by every time point that uses it (as in step 3). Else stop: no further stimulation.
 3. **Evaluate:** at 25 held-out times, each unit asks for a pulse count. Each distinct (electrode,
@@ -106,8 +106,10 @@ Four steps in one session, each gated:
 
 **Reading the R².** A plain decay a × exp(−kt) + b, with no oscillation, scores 0.80 at the 25
 times, because the solution is near zero after t ≈ 4. Only an R² above that shows the oscillation;
-the report says which side a run is on. As of 16 Oct 2026 no network trained on one curve clears it
-(simulated sweep and synthetic shapes): they follow the first drop and miss the rebound.
+the report says which side a run is on, and gate 2 stops a run whose expected R² does not clear it.
+Training needs 40,000 steps (about 6 min on np14): at 6,000 every network stopped at the decay. With
+40,000, one measured curve is enough: in simulation, expected R² 0.97 and 0.92 on the simulated tissue,
+trough −0.40 (true −0.35) and rebound +0.10 (true +0.12), with 194 trains in all.
 
 **Measuring** (`orgchar/measure.py`, the one hardware primitive): trains are grouped into recordings
 by length (a length is part of the upload), at most 6 min each, each organoid ≥ 4 s between trains;

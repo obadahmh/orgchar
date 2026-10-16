@@ -20,7 +20,7 @@ morning curve and the live run), so the curve is measured in the same session, m
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -103,7 +103,9 @@ def run(fsname, pairs, backend, step_dir: Path, codes: bool, ode=N.Oscillator(),
     # own error (sweep_reps trains): train for, and predict with, both (sim, 16 Oct 2026: R² 0.40 against an
     # expected 0.73 when the table was taken as exact)
     reps_eff = 1 / (1 / eval_reps + 1 / sweep_reps)
-    print(f"\n2/3 Training on the measured curve{'s' * (len(keep) > 1)} ({width} units, {starts} starts; no stimulation)")
+    mins = N.train_minutes(starts, steps)
+    print(f"\n2/3 Training on the measured curve{'s' * (len(keep) > 1)} ({width} units, {starts} starts; no stimulation; "
+          f"about {max(mins, 1):.0f} min, until ~{datetime.now() + timedelta(minutes=mins):%H:%M})", flush=True)
     net, losses = N.train(keep, ode, width, reps_eff, starts, steps)
     torch.save(net.state_dict(), step_dir / "model.pt")
     t = N.held_out_times(ode, points)

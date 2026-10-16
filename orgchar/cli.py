@@ -2,7 +2,7 @@
 
     orgchar census --fsname fs652          # ~8 min, no stimulation: which organoids fire?
     orgchar screen --fsname fs652          # ~30 min: which pairs respond to the train length?
-    orgchar solve  --fsname fs652          # ≤ 45 min: measure a pair's curve, train the network on it, run it on the tissue
+    orgchar solve  --fsname fs652          # ≤ 50 min: measure a pair's curve, train the network on it, run it on the tissue
     orgchar status [--fsname fs652]        # where each organoid stands (default: every organoid run this week)
     orgchar analyze <step dir>             # re-run the analysis of a finished step, offline
     orgchar codetest --fsname fs652        # ~3 min: check that train codes (--codes) are safe and readable
@@ -598,7 +598,8 @@ def cmd_solve(a):
     stims = sorted({x for x, _ in pairs})
     sweep = P.plan_trials([(x, n) for x in stims for n in SV.SWEEP_COUNTS for _ in range(a.sweep_reps)])
     evaluate = P.plan_trials([(x, n) for x in stims for n in range(2, 21) for _ in range(a.reps)])   # at most
-    mins = (P.plan_duration_s(sweep) + P.plan_duration_s(evaluate)) / 60
+    from . import net as N
+    mins = (P.plan_duration_s(sweep) + P.plan_duration_s(evaluate)) / 60 + N.train_minutes()
     print(f"Plan: sweep {a.sweep_reps} trains at {len(SV.SWEEP_COUNTS)} pulse counts on e{', e'.join(map(str, stims))}, "
           f"train ({a.width} units), then at most {len(range(2, 21))} pulse counts x {a.reps} trains: "
           f"at most {mins:.0f} min. Each step stops the run if its check fails.")
@@ -660,7 +661,7 @@ def main(argv=None):
                                                        "against 4 the rank test cannot reach p < 0.01)")
     p.set_defaults(func=cmd_screen)
 
-    p = sub.add_parser("solve", help="≤ 45 min: measure the pair's curve now, train the network on it, run it on the tissue")
+    p = sub.add_parser("solve", help="≤ 50 min: measure the pair's curve now, train the network on it, run it on the tissue")
     common(p)
     p.add_argument("--pairs", help="stim:rec,... (default: the latest screen's clearest pair)")
     p.add_argument("--sweep-reps", type=int, default=8, help="trains per pulse count when measuring the curve")

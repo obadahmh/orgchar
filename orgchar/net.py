@@ -20,6 +20,7 @@ state with the lowest rounded loss (the straight-through gradient alone drove tr
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from multiprocessing import Pool
 
@@ -28,7 +29,9 @@ import torch
 from scipy import optimize
 
 IC_WEIGHT, WEIGHT_DECAY, NOISE_WEIGHT = 10.0, 1e-4, 1.0   # noise weight 0.1 collapsed on fs667, 10 cost accuracy
-STEPS, FINETUNE_STEPS, FINETUNE_LR = 6000, 1500, 1e-3
+# 6000 steps stopped at a plain decay (R² 0.80 at the 25 held-out times); on a steep falling curve with the
+# simulated trial noise, 20000 reach 0.95 (0.92 with noise), 40000 0.985 (0.95): ~5.5 min on 4 cores (16 Oct 2026)
+STEPS, FINETUNE_STEPS, FINETUNE_LR = 40000, 1500, 1e-3
 HALF_WIDTH, SPACING, POINTS = 0.5, 0.1, 101               # test bumps and training grid
 
 
@@ -197,6 +200,11 @@ def _fit(job):
         loss.backward()
         opt.step()
     return seed, best[0] if best[0] == best[0] else float("inf"), best[1]
+
+
+def train_minutes(starts: int = 8, steps: int = STEPS) -> float:
+    """About how long train() takes here (np14: 4 cores, 8 starts, 40000 steps: 5.5 min)."""
+    return 0.004 * (steps + FINETUNE_STEPS) * -(-starts // os.cpu_count()) / 60
 
 
 def train(curves, ode: Oscillator, width: int = 12, repeats: float = 6, starts: int = 8, steps: int = STEPS):

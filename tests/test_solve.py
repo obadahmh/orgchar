@@ -52,9 +52,10 @@ def test_expected_r2_without_noise_is_the_curve_r2():
 
 
 def test_training_follows_the_solution_on_one_falling_curve():
-    """It follows the drop (0.74); the oscillation needs more (a plain decay scores 0.80 here)."""
+    """Short training follows the drop (0.74; a plain decay scores 0.80 here). The default steps
+    reach the oscillation (0.95 with noise), in minutes: the simulated chain shows that."""
     ode = N.Oscillator()
-    net, _ = N.train([FALLING], ode, width=12, repeats=6, starts=4)
+    net, _ = N.train([FALLING], ode, width=12, repeats=6, starts=4, steps=6000)
     t = N.held_out_times(ode, 26)
     assert N.expected_r2(net, ode, t, 6)["curves"] > 0.6 and 0.75 < N.decay_r2(ode, t) < 0.85
 
