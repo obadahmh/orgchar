@@ -1,8 +1,11 @@
 """net, measure and solve, on synthetic data."""
+import base64
 import json
+import re
 
 import h5py
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
@@ -145,12 +148,22 @@ def test_solve_stops_after_training_when_it_cannot_beat_a_plain_decay(tmp_path):
 
 def test_solve_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr(N, "decay_r2", lambda *a: -np.inf)            # a short training; check the plumbing
-    res = SV.run("fstest", [(13, 10)], SimBackend(simulate.demo_organoid()), tmp_path, True, sweep_reps=4,
-                 eval_reps=2, width=4, points=11, starts=2, steps=300)
+    tags = []
+    backend = _Edit(simulate.demo_organoid(), lambda call, seg, raw: None)
+    backend.run_segment = lambda seg, seg_dir, tag: tags.append(tag) or _Edit.run_segment(backend, seg, seg_dir, tag)
+    res = SV.run("fstest", [(13, 10)], backend, tmp_path, True, sweep_reps=4, eval_reps=2, width=4, points=11,
+                 starts=2, steps=300)
+    assert len(set(tags)) == len(tags)          # the platform finds each recording by its tag (fs675, 18 Oct 2026)
     assert res["curves"][0]["p"] < SV.GATE_P and res["curves"][0]["artifact"] < ARTIFACT_LIMIT
     needed = {(13, n) for row in res["pulses"] for n in row}
     assert res["eval_trains"] == 2 * len(needed) and len(res["y"]) == len(res["t"]) == 10
-    assert np.isfinite(res["r2"]) and res["drift_max"] is not None
+    assert np.isfinite(res["r2"]) and res["drift_max"] is not None and res["eval_usable"] == res["eval_trains"]
+    assert -1e9 < res["shuffle"]["median"] < res["shuffle"]["p95"]
+    assert SV.refresh(tmp_path)["shuffle"] == res["shuffle"]      # `analyze` rebuilds the same control from disk
     assert json.loads((tmp_path / "result.json").read_text())["verdict"] == res["verdict"]
     R.solve_page(tmp_path / "report.html", dict(res, code_version="test", simulated=True), "today")
-    assert "Measured curve" in (tmp_path / "report.html").read_text()
+    page = (tmp_path / "report.html").read_text()
+    keys = {k for m in re.findall(r'data-k="([^"]+)"', page) for k in m.split()}       # hover a time point ...
+    assert keys and all(f'id="crv-{k}"' in page and f'id="use-n{k.split("-")[-1]}"' in page for k in keys)  # ... lights these
+    data = json.loads(base64.b64decode(re.search(r"base64,([\w+/=]+)", page)[1]))     # the data travels with the page
+    assert len(data["trains"]) == sum(len(pd.read_csv(tmp_path / d / "responses.csv")) for d in ("sweep", "evaluate"))

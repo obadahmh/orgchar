@@ -444,6 +444,8 @@ class HardwareBackend:
         deadline, last, stable = time.monotonic() + timeout_s, None, 0
         while time.monotonic() < deadline:
             hits = list(RAW_ROOT.glob(f"*_{tag}.h5"))
+            if len(hits) > 1:   # fs675, 18 Oct 2026: sweep and evaluation shared tags, and this waited 25 min
+                raise RuntimeError(f"{len(hits)} recordings end in _{tag}.h5: " + ", ".join(sorted(h.name for h in hits)))
             if len(hits) == 1:
                 st = hits[0].stat()
                 sig = (st.st_size, st.st_mtime_ns)

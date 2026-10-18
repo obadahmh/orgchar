@@ -549,8 +549,15 @@ def cmd_analyze(a):
         r = _census(step_dir, plan, _segments_from_dir(step_dir, plan))
     elif plan["step"] == "screen" and (step_dir / "pass").is_dir():
         r = SC.reanalyse(step_dir, plan)
+    elif plan["step"] == "solve" and (step_dir / "result.json").exists():
+        from . import solve as SV
+        res = SV.refresh(step_dir)
+        (step_dir / "result.json").write_text(json.dumps(res, indent=1, default=float))
+        R.solve_page(step_dir / "report.html", res, _when(step_dir))
+        print(f"{res['verdict']}\nReport: {step_dir / 'report.html'}")
+        return
     else:
-        sys.exit(f"{step_dir.name}: only a census or a screen recorded since 16 Oct 2026 can be re-analysed "
+        sys.exit(f"{step_dir.name}: only a census, a finished solve or a screen recorded since 16 Oct 2026 can be re-analysed "
                  "(older screens had sham trials; the curve step was replaced by solve). Its report.html and "
                  "result.json stay as they were.")
     _conclude(step_dir, plan, r)
@@ -614,7 +621,8 @@ def cmd_solve(a):
     res.update(code_version=code_version(), simulated=bool(a.simulate))
     (step_dir / "result.json").write_text(json.dumps(res, indent=1, default=float))
     R.solve_page(step_dir / "report.html", res, _when(step_dir))
-    print(f"\n{res['verdict']}\nReport: {step_dir / 'report.html'}")
+    print(f"\n{res['verdict']}" + (f"\nLargest change since the sweep: {res['drift_max']:.0%} of the curve's range."
+                                   if res.get("drift_max") is not None else "") + f"\nReport: {step_dir / 'report.html'}")
 
 
 def _confirm(a):

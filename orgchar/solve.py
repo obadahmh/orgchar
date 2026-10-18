@@ -78,11 +78,13 @@ def run(fsname, pairs, backend, step_dir: Path, codes: bool, ode=N.Oscillator(),
           f"e{', e'.join(map(str, stims))}")
     sweep_req = [(s, n) for s in stims for n in SWEEP_COUNTS for _ in range(sweep_reps)]
     traces = {}
-    sweep, thr, problems = measure(sweep_req, backend, step_dir / "sweep", tag, codes, seed=seed, traces=traces)
+    sweep, thr, problems = measure(sweep_req, backend, step_dir / "sweep", f"{tag}_sweep", codes, seed=seed,
+                                   traces=traces)
     art = {(s, r): max((artifact_score(v) for (s2, r2, _), v in traces.items() if (s2, r2) == (s, r) and len(v) >= 3),
                        default=0.0) for s, r in pairs}
     measured = curves_from(sweep, pairs, SWEEP_COUNTS)
     res.update(sweep_trains=len(sweep_req), sweep_pulses=sum(n for _, n in sweep_req), thresholds_uV=thr, warnings=problems,
+               sweep_usable=int(sweep.request.nunique()),
                curves=[dict(stim=c.stim, rec=c.rec, counts=c.counts, mean=c.mean, sd=c.sd, p=pv, explained=w,
                             artifact=art[(c.stim, c.rec)]) for c, pv, w in measured])
     keep = [c for c, pv, _ in measured if pv < GATE_P and art[(c.stim, c.rec)] < ARTIFACT_LIMIT]
@@ -93,8 +95,7 @@ def run(fsname, pairs, backend, step_dir: Path, codes: bool, ode=N.Oscillator(),
         print(f"  e{c.stim}→e{c.rec}: range {np.ptp(c.mean):.1f} spikes, pulse count explains {w:.0%} of single-trial "
               f"variance (p {pv:.1g}), artifact {a:.1f}x" + why)
     if not keep:
-        res["verdict"] = ("STOPPED after the sweep: no pair responds cleanly to the pulse count (see the curves). "
-                          "No further stimulation.")
+        res["verdict"] = "STOPPED after the sweep: no pair responds cleanly to the pulse count. No further stimulation."
         _save(step_dir, res)
         return res
 
@@ -116,8 +117,8 @@ def run(fsname, pairs, backend, step_dir: Path, codes: bool, ode=N.Oscillator(),
           f"the noise of {eval_reps} trials and the curve's own uncertainty; {exp['curves']:.2f} on the curve itself; "
           f"a plain decay, no oscillation, scores {decay:.2f}")
     if exp["noisy_median"] <= decay:
-        res["verdict"] = (f"STOPPED after training: expected R² {exp['noisy_median']:.2f} does not beat a plain decay "
-                          f"({decay:.2f}), so the run could not show the oscillation. No further stimulation.")
+        res["verdict"] = (f"STOPPED after training: expected R² {exp['noisy_median']:.2f}, not above the plain decay's "
+                          f"{decay:.2f}. No further stimulation.")
         _save(step_dir, res)
         return res
 
@@ -127,8 +128,10 @@ def run(fsname, pairs, backend, step_dir: Path, codes: bool, ode=N.Oscillator(),
     needed = sorted({(u.stim, int(n)) for j, u in enumerate(net.curves) for n in p[:, j]})
     eval_req = [(s, n) for s, n in needed for _ in range(eval_reps)]
     print(f"\n3/3 Running the network on the tissue: {len(needed)} pulse counts x {eval_reps} trains")
-    ev, _, prob = measure(eval_req, backend, step_dir / "evaluate", tag, codes, thresholds=thr, seed=seed + 100)
+    ev, _, prob = measure(eval_req, backend, step_dir / "evaluate", f"{tag}_evaluate", codes, thresholds=thr,
+                          seed=seed + 100)
     res["warnings"] += prob
+    res["eval_usable"] = int(ev.request.nunique())
     means = ev.groupby(["stim", "rec", "pulses"]).response.mean()
     h = np.array([[means.get((u.stim, u.rec, int(p[i, j])), np.nan) for j, u in enumerate(net.curves)]
                   for i in range(len(p))])
@@ -152,11 +155,54 @@ def run(fsname, pairs, backend, step_dir: Path, codes: bool, ode=N.Oscillator(),
         for n, m in zip(c.counts, c.mean):
             if (c.stim, c.rec, n) in means.index:
                 drift.append(abs(means[(c.stim, c.rec, n)] - m) / max(np.ptp(c.mean), 1e-9))
-    res.update(y=y.tolist(), y_model=model.tolist(), r2=score, drift_max=float(max(drift)) if drift else None,
-               verdict=f"R² {score:.2f} on the tissue (expected {exp['noisy_median']:.2f}; a plain decay scores "
-                       f"{decay:.2f}, so this {'shows' if score > decay else 'does not show'} the oscillation)"
-                       + (f"; largest drift since the sweep {max(drift):.0%} of the curve's range" if drift else ""))
+    res.update(y=y.tolist(), y_model=model.tolist(), r2=score, drift_max=float(max(drift)) if drift else None)
+    res.update(shuffle=shuffle_null(net, res), verdict=verdict(res))
     _save(step_dir, res)
+    return res
+
+
+def verdict(res: dict) -> str:
+    return (f"R² {res['r2']:.2f} on the tissue (expected {res['expected']['noisy_median']:.2f}). "
+            + (f"Above the plain decay's {res['decay_r2']:.2f}: the run shows the oscillation."
+               if res["r2"] > res["decay_r2"] else
+               f"Not above the plain decay's {res['decay_r2']:.2f}: the run does not show the oscillation."))
+
+
+def shuffle_null(net, res: dict, draws: int = 2000, seed: int = 0) -> dict:
+    """Control: the run's responses shuffled across pulse counts (within each pair), through the same
+    network. Tissue whose response did not depend on the count would score like this."""
+    means = {(m["stim"], m["rec"], m["pulses"]): m["mean"] for m in res["eval_means"]}
+    p, exact, rng = np.array(res["pulses"]), np.array(res["exact"]), np.random.default_rng(seed)
+    scores = []
+    for _ in range(draws):
+        shuffled = dict(means)
+        for s, r in {(s, r) for s, r, _ in means}:
+            keys = [k for k in means if k[:2] == (s, r)]
+            shuffled.update(zip(keys, rng.permutation([means[k] for k in keys])))
+        h = np.array([[shuffled[(u.stim, u.rec, int(n))] for u, n in zip(net.curves, row)] for row in p])
+        with torch.no_grad():
+            scores.append(N.r2(net.output(torch.from_numpy(h)).numpy().ravel(), exact))
+    scores = np.array(scores)
+    return dict(median=float(np.median(scores)), p95=float(np.percentile(scores, 95)),
+                share_above_run=float((scores >= res["r2"]).mean()),
+                hist=np.histogram(np.clip(scores, -3, 1), bins=40, range=(-3, 1))[0].tolist())   # below -3 at -3
+
+
+def refresh(step_dir: Path) -> dict:
+    """A finished run's result.json brought up to date (trains usable, the shuffled control, the
+    verdict), for its report."""
+    res = json.loads((step_dir / "result.json").read_text())
+    for part in ("sweep", "evaluate"):
+        f = step_dir / part / "responses.csv"
+        if f.exists():
+            res[f"{'eval' if part == 'evaluate' else part}_usable"] = int(pd.read_csv(f).request.nunique())
+    if "y" in res:
+        by = {(c["stim"], c["rec"]): c for c in res["curves"]}
+        keep = [N.Curve(s, r, tuple(by[(s, r)]["counts"]), tuple(by[(s, r)]["mean"]), tuple(by[(s, r)]["sd"]))
+                for s, r in res["kept"]]
+        net = N.Net(keep, res["ode"]["T"], res["width"])
+        net.load_state_dict(torch.load(step_dir / "model.pt"))
+        res.update(shuffle=shuffle_null(net, res), verdict=verdict(res))
     return res
 
 
