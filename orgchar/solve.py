@@ -109,6 +109,7 @@ def run(fsname, pairs, backend, step_dir: Path, codes: bool, ode=N.Oscillator(),
           f"about {max(mins, 1):.0f} min, until ~{datetime.now() + timedelta(minutes=mins):%H:%M})", flush=True)
     net, losses = N.train(keep, ode, width, reps_eff, starts, steps)
     torch.save(net.state_dict(), step_dir / "model.pt")
+    res["weights"] = weights(net)
     t = N.held_out_times(ode, points)
     exp, decay = N.expected_r2(net, ode, t, reps_eff), N.decay_r2(ode, t)
     res.update(expected=exp, decay_r2=decay, train_loss={str(k): v for k, v in losses.items()},
@@ -156,9 +157,17 @@ def run(fsname, pairs, backend, step_dir: Path, codes: bool, ode=N.Oscillator(),
             if (c.stim, c.rec, n) in means.index:
                 drift.append(abs(means[(c.stim, c.rec, n)] - m) / max(np.ptp(c.mean), 1e-9))
     res.update(y=y.tolist(), y_model=model.tolist(), r2=score, drift_max=float(max(drift)) if drift else None)
-    res.update(shuffle=shuffle_null(net, res), verdict=verdict(res))
+    res.update(shuffle=shuffle_null(net, res), bootstrap=bootstrap(res, ev), verdict=verdict(res))
     _save(step_dir, res)
     return res
+
+
+def weights(net) -> dict:
+    """The trained network as numbers a reader can follow: unit j asks for round(w_in[j] t + b_in[j]) pulses
+    (kept within the measured range), and y = b_out + the sum over units of w_out[j] x its spike count."""
+    with torch.no_grad():
+        return dict(w_in=(net.hidden.weight.ravel() / net.t_scale).tolist(), b_in=net.hidden.bias.tolist(),
+                    w_out=(net.out.weight.ravel() / net.scale).tolist(), b_out=float(net.out.bias))
 
 
 def verdict(res: dict) -> str:
@@ -170,10 +179,11 @@ def verdict(res: dict) -> str:
 
 def shuffle_null(net, res: dict, draws: int = 2000, seed: int = 0) -> dict:
     """Control: the run's responses shuffled across pulse counts (within each pair), through the same
-    network. Tissue whose response did not depend on the count would score like this."""
+    network. Tissue whose response did not depend on the count would score like this. `examples`: the
+    network's output for the first 30 shuffles."""
     means = {(m["stim"], m["rec"], m["pulses"]): m["mean"] for m in res["eval_means"]}
     p, exact, rng = np.array(res["pulses"]), np.array(res["exact"]), np.random.default_rng(seed)
-    scores = []
+    scores, examples = [], []
     for _ in range(draws):
         shuffled = dict(means)
         for s, r in {(s, r) for s, r, _ in means}:
@@ -181,16 +191,39 @@ def shuffle_null(net, res: dict, draws: int = 2000, seed: int = 0) -> dict:
             shuffled.update(zip(keys, rng.permutation([means[k] for k in keys])))
         h = np.array([[shuffled[(u.stim, u.rec, int(n))] for u, n in zip(net.curves, row)] for row in p])
         with torch.no_grad():
-            scores.append(N.r2(net.output(torch.from_numpy(h)).numpy().ravel(), exact))
+            y = net.output(torch.from_numpy(h)).numpy().ravel()
+        scores.append(N.r2(y, exact))
+        if len(examples) < 30:
+            examples.append(y.tolist())
     scores = np.array(scores)
     return dict(median=float(np.median(scores)), p95=float(np.percentile(scores, 95)),
                 share_above_run=float((scores >= res["r2"]).mean()),
-                hist=np.histogram(np.clip(scores, -3, 1), bins=40, range=(-3, 1))[0].tolist())   # below -3 at -3
+                examples=examples)
+
+
+def bootstrap(res: dict, ev: pd.DataFrame, draws: int = 2000, seed: int = 0) -> dict:
+    """How much a repeat of the run would vary from trial noise alone: each pulse count's trains resampled
+    with replacement, through the same network (y = b_out + the sum of w_out x spikes). 2.5 and 97.5
+    percentiles of R² and of y at each time, and the share of resamples at or below the plain decay's R².
+    The resamples add noise to means that already carry it, so R² sits below the run's own (y does not:
+    it is linear in the means). Day-to-day change is not in it."""
+    kept, w = res["kept"], np.array(res["weights"]["w_out"])
+    units = [tuple(kept[j % len(kept)]) for j in range(res["width"])]       # as in N.Net
+    trials = {k: g.response.dropna().to_numpy() for k, g in ev.groupby(["stim", "rec", "pulses"])}
+    keys = sorted({(*u, int(n)) for row in res["pulses"] for u, n in zip(units, row)})
+    idx = np.array([[keys.index((*u, int(n))) for u, n in zip(units, row)] for row in res["pulses"]])
+    rng = np.random.default_rng(seed)
+    means = np.array([[rng.choice(trials[k], len(trials[k])).mean() for k in keys] for _ in range(draws)])
+    y = res["weights"]["b_out"] + (means[:, idx] * w).sum(-1)                # draws x times
+    exact = np.array(res["exact"])
+    score = 1 - ((y - exact) ** 2).sum(1) / ((exact - exact.mean()) ** 2).sum()
+    return dict(r2=np.percentile(score, [2.5, 97.5]).tolist(), y=np.percentile(y, [2.5, 97.5], axis=0).tolist(),
+                below_decay=float((score <= res["decay_r2"]).mean()))
 
 
 def refresh(step_dir: Path) -> dict:
     """A finished run's result.json brought up to date (trains usable, the shuffled control, the
-    verdict), for its report."""
+    intervals, the verdict), for its report."""
     res = json.loads((step_dir / "result.json").read_text())
     for part in ("sweep", "evaluate"):
         f = step_dir / part / "responses.csv"
@@ -202,7 +235,8 @@ def refresh(step_dir: Path) -> dict:
                 for s, r in res["kept"]]
         net = N.Net(keep, res["ode"]["T"], res["width"])
         net.load_state_dict(torch.load(step_dir / "model.pt"))
-        res.update(shuffle=shuffle_null(net, res), verdict=verdict(res))
+        res.update(weights=weights(net), shuffle=shuffle_null(net, res), verdict=verdict(res))
+        res["bootstrap"] = bootstrap(res, pd.read_csv(step_dir / "evaluate" / "responses.csv"))
     return res
 
 

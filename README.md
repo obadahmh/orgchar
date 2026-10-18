@@ -153,11 +153,16 @@ Each step directory contains `plan.json` (the step's settings), `result.json` an
 - census and codetest: directly in the step directory;
 - screen: in `pass/` (and `retry1/`, `retry2/` for trains requested again), each with its own
   `plan.json`, and `responses.csv` per recording and for the whole step;
-- solve: the same layout in `sweep/` and `evaluate/`, plus `model.pt`. Its report gives the verdict,
-  the solution (true, network on the curve, network on the tissue, as TUM's Fig. 4f), the measured
-  curve with the run's responses on it, and the checks.
+- solve: the same layout in `sweep/` and `evaluate/`, plus `model.pt`. Its report is written for
+  the project's PIs, as a short paper: run facts; a summary with every R² on one axis; the task and
+  the session's checks; two raw trains read back from the recordings with the spike count worked out,
+  and the response curve; the network, traced one test time at a time; the output with a 95% band
+  from resampling the run's trains; controls (shuffled spikes, the same network on the computer);
+  limitations, checks, methods and the list of recordings. Hover a point for its numbers. The data
+  travel inside the page.
 
-`analyze` re-reads a census or a screen (one recorded since 16 Oct 2026) from its recordings.
+`analyze` re-reads a census or a screen (one recorded since 16 Oct 2026) from its recordings, and
+rebuilds a finished solve's report.
 
 **Raw recordings stay where the platform saves them**, `/mnt/s3-intanraws` (read at ~60 MB/s);
 `remote_path.txt` points to each one. Hardware runs before 5 Oct 2026 copied them into the segment

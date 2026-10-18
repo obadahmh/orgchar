@@ -59,14 +59,19 @@ def r2(pred, true) -> float:
     return float(1 - ((pred - true) ** 2).sum() / ((true - true.mean()) ** 2).sum())
 
 
-def decay_r2(ode: Oscillator, t) -> float:
-    """R² of the best plain decay a exp(-k t) + b at times t. A network that drops to 0 and misses the
-    oscillation scores about this much (0.80 at the 25 default times), so an R² shows the oscillation
-    only above it."""
+def decay_fit(ode: Oscillator, t):
+    """(a, k, b) of the best plain decay a exp(-k t) + b to the solution at times t."""
     t = np.asarray(t, float).ravel()
-    y = ode.exact(t)
-    p, _ = optimize.curve_fit(lambda x, a, k, b: a * np.exp(-k * x) + b, t, y, p0=(ode.y0, 1.0, 0.0), maxfev=20000)
-    return r2(p[0] * np.exp(-p[1] * t) + p[2], y)
+    return optimize.curve_fit(lambda x, a, k, b: a * np.exp(-k * x) + b, t, ode.exact(t), p0=(ode.y0, 1.0, 0.0),
+                              maxfev=20000)[0]
+
+
+def decay_r2(ode: Oscillator, t) -> float:
+    """R² of the best plain decay at times t. A network that drops to 0 and misses the oscillation scores
+    about this much (0.80 at the 25 default times), so an R² shows the oscillation only above it."""
+    t = np.asarray(t, float).ravel()
+    a, k, b = decay_fit(ode, t)
+    return r2(a * np.exp(-k * t) + b, ode.exact(t))
 
 
 @dataclass(frozen=True)

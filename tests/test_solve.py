@@ -137,6 +137,8 @@ def test_solve_stops_after_the_sweep_when_nothing_responds(tmp_path):
     res = SV.run("fstest", [(21, 22)], SimBackend(simulate.Organoid(seed=7)), tmp_path, False, sweep_reps=5)
     assert res["verdict"].startswith("STOPPED after the sweep") and res["curves"][0]["p"] >= SV.GATE_P
     assert not (tmp_path / "evaluate").exists() and not (tmp_path / "model.pt").exists()
+    R.solve_page(tmp_path / "report.html", res, "today")
+    assert "Stopped after the first measurement" in (tmp_path / "report.html").read_text()
 
 
 def test_solve_stops_after_training_when_it_cannot_beat_a_plain_decay(tmp_path):
@@ -144,6 +146,8 @@ def test_solve_stops_after_training_when_it_cannot_beat_a_plain_decay(tmp_path):
                  width=4, starts=2, steps=300)
     assert res["verdict"].startswith("STOPPED after training") and res["expected"]["noisy_median"] <= res["decay_r2"]
     assert (tmp_path / "model.pt").exists() and not (tmp_path / "evaluate").exists()
+    R.solve_page(tmp_path / "report.html", res, "today")
+    assert "Stopped before the run" in (tmp_path / "report.html").read_text()
 
 
 def test_solve_end_to_end(tmp_path, monkeypatch):
@@ -159,11 +163,18 @@ def test_solve_end_to_end(tmp_path, monkeypatch):
     assert res["eval_trains"] == 2 * len(needed) and len(res["y"]) == len(res["t"]) == 10
     assert np.isfinite(res["r2"]) and res["drift_max"] is not None and res["eval_usable"] == res["eval_trains"]
     assert -1e9 < res["shuffle"]["median"] < res["shuffle"]["p95"]
-    assert SV.refresh(tmp_path)["shuffle"] == res["shuffle"]      # `analyze` rebuilds the same control from disk
+    again = SV.refresh(tmp_path)                                   # `analyze` rebuilds the same controls from disk
+    assert again["shuffle"] == res["shuffle"] and again["bootstrap"] == res["bootstrap"]
+    lo, hi = np.array(res["bootstrap"]["y"])
+    assert np.all((lo - 1e-9 <= res["y"]) & (res["y"] <= hi + 1e-9))   # resampled around the run's own output
     assert json.loads((tmp_path / "result.json").read_text())["verdict"] == res["verdict"]
     R.solve_page(tmp_path / "report.html", dict(res, code_version="test", simulated=True), "today")
     page = (tmp_path / "report.html").read_text()
-    keys = {k for m in re.findall(r'data-k="([^"]+)"', page) for k in m.split()}       # hover a time point ...
-    assert keys and all(f'id="crv-{k}"' in page and f'id="use-n{k.split("-")[-1]}"' in page for k in keys)  # ... lights these
+    D = json.loads(re.search(r"<script type=application/json id=netdata>(.*?)</script>", page, re.S)[1])
+    assert np.allclose([D["b"] + sum(w * s for w, s in zip(D["w"], row)) for row in D["s"]], res["y"])  # same arithmetic
+    assert all(f'id="crv-{k}"' in page for row in D["k"] for k in row)          # every highlight has a target
+    assert all(f'id="{k}-{i}"' in page for k in ("sol", "hit") for i in range(len(res["t"])))
+    assert page.index("id=netdata") < page.index('id="sol-0"') < page.index("function show")  # script after its targets
+    assert "Two single trains" in page                                          # raw voltage read back
     data = json.loads(base64.b64decode(re.search(r"base64,([\w+/=]+)", page)[1]))     # the data travels with the page
     assert len(data["trains"]) == sum(len(pd.read_csv(tmp_path / d / "responses.csv")) for d in ("sweep", "evaluate"))

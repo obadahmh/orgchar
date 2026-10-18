@@ -86,12 +86,12 @@ def measure_trial(baseline, post, n_pulses, ipi_ms, phase_us, threshold_uV, spec
     fb = bandpass(baseline[-nb:], spec)
     a, b = [int(math.ceil((end + ms) * rate / 1000)) for ms in spec["response_window_ms_after_train"]]
     resp, idx = count_events(fp[a:b], threshold_uV, spec["refractory_ms"], rate)
-    base, _ = count_events(fb, threshold_uV, spec["refractory_ms"], rate)
+    base, base_idx = count_events(fb, threshold_uV, spec["refractory_ms"], rate)
     out = dict(response_events=resp, baseline_events=base,
                adjusted=resp - base * (b - a) / nb, window_samples=[a, b])
-    if keep_trace:
-        out["trace"] = fp[a:b].astype(np.float32)
-        out["event_samples"] = idx
+    if keep_trace:      # the filtered voltage and the crossings (window ones from the window's start)
+        out.update(trace=fp[a:b].astype(np.float32), event_samples=idx, baseline=fb, post=fp,
+                   baseline_samples=base_idx)
     return out
 
 
