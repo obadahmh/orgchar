@@ -109,7 +109,7 @@ def run(fsname, pairs, backend, step_dir: Path, codes: bool, ode=N.Oscillator(),
           f"about {max(mins, 1):.0f} min, until ~{datetime.now() + timedelta(minutes=mins):%H:%M})", flush=True)
     net, losses = N.train(keep, ode, width, reps_eff, starts, steps)
     torch.save(net.state_dict(), step_dir / "model.pt")
-    res["weights"] = weights(net)
+    res.update(weights=weights(net), counts_used=net.counts.int().tolist())
     t = N.held_out_times(ode, points)
     exp, decay = N.expected_r2(net, ode, t, reps_eff), N.decay_r2(ode, t)
     res.update(expected=exp, decay_r2=decay, train_loss={str(k): v for k, v in losses.items()},

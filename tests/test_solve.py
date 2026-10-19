@@ -160,6 +160,7 @@ def test_solve_end_to_end(tmp_path, monkeypatch):
     assert len(set(tags)) == len(tags)          # the platform finds each recording by its tag (fs675, 18 Oct 2026)
     assert res["curves"][0]["p"] < SV.GATE_P and res["curves"][0]["artifact"] < ARTIFACT_LIMIT
     needed = {(13, n) for row in res["pulses"] for n in row}
+    assert {n for _, n in needed} <= set(SV.SWEEP_COUNTS) == set(res["counts_used"])    # never a count it guessed
     assert res["eval_trains"] == 2 * len(needed) and len(res["y"]) == len(res["t"]) == 10
     assert np.isfinite(res["r2"]) and res["drift_max"] is not None and res["eval_usable"] == res["eval_trains"]
     assert -1e9 < res["shuffle"]["median"] < res["shuffle"]["p95"]

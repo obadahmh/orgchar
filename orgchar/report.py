@@ -229,6 +229,15 @@ def _keys(res):
     return [[f"{kept[j % len(kept)][0]}-{kept[j % len(kept)][1]}-{n}" for j, n in enumerate(row)] for row in res["pulses"]]
 
 
+def _rule(res) -> str:
+    """How a unit turns a + b t into a pulse count, as this run did it (runs before 19 Oct 2026 rounded)."""
+    c = res.get("counts_used")
+    if not c:
+        return "round(a<sub>j</sub> t + b<sub>j</sub>) pulses, kept within 2 to 20"
+    listed = f"{c[0]}, {c[1]}, …, {c[-1]}" if len(c) > 3 else ", ".join(map(str, c))
+    return f"the measured pulse count ({listed}) nearest to a<sub>j</sub> t + b<sub>j</sub>"
+
+
 def _swing(ode, t, y):
     """Indices into t of y's dip (its lowest point before the exact rebound) and rebound (its highest point
     after the exact dip, up to as far beyond the exact rebound)."""
@@ -543,7 +552,8 @@ def _network(res, stims, recs, start):
     spikes = [[means[tuple(int(v) for v in key.split("-"))] for key in row] for row in keys]
     contrib = [abs(w * x) for row in spikes for w, x in zip(wt["w_out"], row)]
     data = dict(t=res["t"], exact=res["exact"], N=res["pulses"], s=spikes, w=wt["w_out"], b=wt["b_out"],
-                wi=wt["w_in"], bi=wt["b_in"], k=keys, cmax=max(contrib + [1e-9]), start=start)
+                wi=wt["w_in"], bi=wt["b_in"], k=keys, cmax=max(contrib + [1e-9]), start=start,
+                rule=re.sub("<[^>]+>", "", _rule(res)).replace("aj t + bj", "{a} t {b}"))
     g = [f"<svg id=net viewBox='0 0 760 {h}' role=img aria-label='the network at one moment'>",
          "<text class=hd x=60 y=16>input</text><text class=hd x=250 y=16>units</text>"
          f"<text class=hd x=395 y=16>organoid: pulses on {stims}, spikes on {recs}</text>"
@@ -579,7 +589,7 @@ function show(i) {
     e.style.stroke = c < 0 ? '#eb6834' : '#2a78d6';
     e.style.strokeWidth = 1 + 9 * Math.abs(c) / D.cmax;
     $('et' + j).textContent = `${g(s)} spikes × ${D.w[j].toFixed(3).replace('-', '−')} = ${f(c)}`;
-    $('ut' + j).textContent = `unit ${j + 1}: pulses = round(${D.wi[j].toFixed(2).replace('-', '−')} t ${f(D.bi[j])}), kept within 2 to 20`;
+    $('ut' + j).textContent = `unit ${j + 1}: ` + D.rule.replace('{a}', D.wi[j].toFixed(2).replace('-', '−')).replace('{b}', f(D.bi[j]));
   });
   $('yv').textContent = 'y = ' + f(y);
   $('yt').textContent = 'exact ' + f(D.exact[i]);
@@ -719,8 +729,7 @@ def solve_page(path, res: dict, when: str):
         body.append("<h2>The network</h2>" + _figure(
             [("", _network(res, stims, recs, dip))],
             "<b>Figure 3.</b> The trained network at one test time, with the organoid's answers from the run. Unit j "
-            "asks for N<sub>j</sub> = round(a<sub>j</sub> t + b<sub>j</sub>) pulses, kept within 2 to 20. The organoid "
-            "answers with spikes. The computer forms y = c + Σ<sub>j</sub> v<sub>j</sub> × spikes<sub>j</sub>. Line "
+            f"asks for {_rule(res)}. The organoid answers with spikes. The computer forms y = c + Σ<sub>j</sub> v<sub>j</sub> × spikes<sub>j</sub>. Line "
             "width: each unit's share of y. Blue adds, orange subtracts. Move the slider, press play, or hover "
             "Figure 4. Hover a unit or a line for its numbers."))
 
@@ -841,8 +850,8 @@ def solve_page(path, res: dict, when: str):
                            f"count, linear in between. Checks before training: Kruskal–Wallis test across counts, p < "
                            f"{GATE_P:g}, and no artifact in the window (the median across trials of its first 5 ms below "
                            f"{ARTIFACT_LIMIT:g}× what trial-to-trial spread gives)."),
-        ("Network", f"{res['width']} hidden units. Unit j asks for N<sub>j</sub>(t) = round(a<sub>j</sub> t + "
-                    "b<sub>j</sub>) pulses, kept within 2 to 20, and outputs the organoid's evoked spikes for that train. "
+        ("Network", f"{res['width']} hidden units. Unit j asks for {_rule(res)}, and outputs the organoid's "
+                    "evoked spikes for that train. "
                     "y(t) = c + Σ<sub>j</sub> v<sub>j</sub> × spikes<sub>j</sub>, computed on the computer."),
         ("Training", "Physics-informed, in weak form: the equation's residual against overlapping smooth test functions, "
                      "integrated by parts, with the starting conditions. Added: the output variance expected from the "

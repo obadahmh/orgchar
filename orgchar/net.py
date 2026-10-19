@@ -1,8 +1,10 @@
 """The hybrid network: one hidden layer whose activations are organoid responses, trained to solve the
 damped oscillator m y'' + c y' + k y = 0, y(0) = y0, y'(0) = v0 on [0, T].
 
-A hidden unit turns t into a pulse count (linear map, clipped to the measured range, rounded to a
-whole number: the tissue only takes whole trains). Its output is the evoked response of one
+A hidden unit turns t into a pulse count (linear map, clipped to the measured range, then the nearest
+count every curve measured: the tissue only takes whole trains, and a count between measured ones
+is a guess. On fs675, 19 Oct 2026, 15 pulses gave +1.4 spikes against −2.2 interpolated from 14 and 16,
+and the network's 71 requests for unmeasured counts took R² from 0.38 to −0.38). Its output is the evoked response of one
 stimulating -> recording pair to that train, divided by the curve's maximum. The output is a weighted
 sum, computed on the computer. Units take the available curves in turn, so one curve or several give
 the same architecture; a falling curve read with its input reversed is a rising one, and the linear
@@ -104,6 +106,7 @@ class Net(torch.nn.Module):
         self.register_buffer("scale", torch.stack([response(c, grid).abs().max().clamp(min=1e-9) for c in self.curves]))
         self.register_buffer("sd", torch.tensor(np.array([np.interp(grid.numpy(), c.counts, c.sd) for c in self.curves])))
         self.t_scale, self.integer = t_scale, True
+        self.counts = torch.tensor(sorted(set.intersection(*(set(c.counts) for c in curves))), dtype=torch.float64)
         self.hidden, self.out = torch.nn.Linear(1, width), torch.nn.Linear(width, 1)
         span = self.hi - self.lo                     # start every unit inside the measured range
         torch.nn.init.uniform_(self.hidden.weight, -span, span)
@@ -111,10 +114,12 @@ class Net(torch.nn.Module):
         self.double()
 
     def pulses(self, t: torch.Tensor) -> torch.Tensor:
-        """Pulse counts the units ask for at times t [time, unit]; whole numbers unless training's first
-        phase (straight-through rounding)."""
+        """Pulse counts the units ask for at times t [time, unit]: the nearest measured count, unless
+        training's first phase (fractional; straight-through in the second)."""
         p = self.hidden(t / self.t_scale).clamp(self.lo, self.hi)
-        return p + (p.round() - p).detach() if self.integer else p
+        if not self.integer:
+            return p
+        return p + (self.counts[(p.detach().unsqueeze(-1) - self.counts).abs().argmin(-1)] - p).detach()
 
     def sd_at(self, p: torch.Tensor) -> torch.Tensor:
         """Single-trial spread of each unit at pulse counts p: exact at whole counts, linear in between

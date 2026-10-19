@@ -77,7 +77,8 @@ Why not single pulses: on fs666 (1 Oct 2026) a single-pulse screen picked e2, e2
 ### Step 3: solve (the hybrid network on the tissue)
 
 **The network.** One hidden layer of 12 units. Unit *j* turns the time *t* into a pulse count
-p = round(w t / T + b), clipped to 2–20; the tissue answers with its pair's evoked spikes after a train
+p = w t / T + b, clipped to 2–20 and moved to the nearest count the sweep measured (2, 4, …, 20: a
+count in between would be a guess, and on 19 Oct 2026 the guesses were far off); the tissue answers with its pair's evoked spikes after a train
 of p pulses; the computer sums the units' responses with weights. The activation is the measured
 table (mean evoked spikes per pulse count, linear in between), not a fitted formula. Units take the
 available curves in turn: one pair is enough in principle
