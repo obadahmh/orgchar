@@ -154,13 +154,12 @@ Each step directory contains `plan.json` (the step's settings), `result.json` an
 - census and codetest: directly in the step directory;
 - screen: in `pass/` (and `retry1/`, `retry2/` for trains requested again), each with its own
   `plan.json`, and `responses.csv` per recording and for the whole step;
-- solve: the same layout in `sweep/` and `evaluate/`, plus `model.pt`. Its report is written for
-  the project's PIs, as a short paper: run facts; a summary with every R² on one axis; the task and
-  the session's checks; two raw trains read back from the recordings with the spike count worked out,
-  and the response curve; the network, traced one test time at a time; the output with a 95% band
-  from resampling the run's trains; controls (shuffled spikes, the same network on the computer);
-  limitations, checks, methods and the list of recordings. Hover a point for its numbers. The data
-  travel inside the page.
+- solve: the same layout in `sweep/` and `evaluate/`, plus `model.pt`. Its report leads with the result
+  and its match score, then every check (each linked to its figure), what the organoid did (its
+  response before and during the Run, and how a response is counted on a real voltage trace), how the
+  network turns time into an answer (interactive), the session as a timeline, and the details. A box
+  under the title defines the few words it uses. `sessions/runs.html` lists every solve run on this
+  machine, one row each, linking to its report; solve and `analyze` rewrite it.
 
 `analyze` re-reads a census or a screen (one recorded since 16 Oct 2026) from its recordings, and
 rebuilds a finished solve's report.

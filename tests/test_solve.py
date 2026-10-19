@@ -138,7 +138,7 @@ def test_solve_stops_after_the_sweep_when_nothing_responds(tmp_path):
     assert res["verdict"].startswith("STOPPED after the sweep") and res["curves"][0]["p"] >= SV.GATE_P
     assert not (tmp_path / "evaluate").exists() and not (tmp_path / "model.pt").exists()
     R.solve_page(tmp_path / "report.html", res, "today")
-    assert "Stopped after the first measurement" in (tmp_path / "report.html").read_text()
+    assert "Stopped after Measure" in (tmp_path / "report.html").read_text()
 
 
 def test_solve_stops_after_training_when_it_cannot_beat_a_plain_decay(tmp_path):
@@ -147,7 +147,7 @@ def test_solve_stops_after_training_when_it_cannot_beat_a_plain_decay(tmp_path):
     assert res["verdict"].startswith("STOPPED after training") and res["expected"]["noisy_median"] <= res["decay_r2"]
     assert (tmp_path / "model.pt").exists() and not (tmp_path / "evaluate").exists()
     R.solve_page(tmp_path / "report.html", res, "today")
-    assert "Stopped before the run" in (tmp_path / "report.html").read_text()
+    assert "Stopped before the Run" in (tmp_path / "report.html").read_text()
 
 
 def test_solve_end_to_end(tmp_path, monkeypatch):
@@ -175,7 +175,13 @@ def test_solve_end_to_end(tmp_path, monkeypatch):
     assert np.allclose([D["b"] + sum(w * s for w, s in zip(D["w"], row)) for row in D["s"]], res["y"])  # same arithmetic
     assert all(f'id="crv-{k}"' in page for row in D["k"] for k in row)          # every highlight has a target
     assert all(f'id="{k}-{i}"' in page for k in ("sol", "hit") for i in range(len(res["t"])))
-    assert page.index("id=netdata") < page.index('id="sol-0"') < page.index("function show")  # script after its targets
-    assert "Two single trains" in page                                          # raw voltage read back
+    assert max(page.index("id=netdata"), page.index('id="sol-0"')) < page.index("function show")  # script after its targets
+    assert "How a response is counted" in page                                  # raw voltage read back
+    root = tmp_path / "sessions"                                               # as sessions/<fsname>/<run>
+    (root / "fstest").mkdir(parents=True)
+    (root / "fstest" / "20261019T074653_solve").symlink_to(tmp_path)
+    R.runs_page(root)
+    runs = (root / "runs.html").read_text()
+    assert "fstest/20261019T074653_solve/report.html" in runs and "1 completed run," in runs
     data = json.loads(base64.b64decode(re.search(r"base64,([\w+/=]+)", page)[1]))     # the data travels with the page
     assert len(data["trains"]) == sum(len(pd.read_csv(tmp_path / d / "responses.csv")) for d in ("sweep", "evaluate"))

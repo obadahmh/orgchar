@@ -554,7 +554,8 @@ def cmd_analyze(a):
         res = SV.refresh(step_dir)
         (step_dir / "result.json").write_text(json.dumps(res, indent=1, default=float))
         R.solve_page(step_dir / "report.html", res, _when(step_dir))
-        print(f"{res['verdict']}\nReport: {step_dir / 'report.html'}")
+        R.runs_page(step_dir.parent.parent)
+        print(f"{res['verdict']}\nReport: {step_dir / 'report.html'}\nAll runs: {step_dir.parent.parent / 'runs.html'}")
         return
     else:
         sys.exit(f"{step_dir.name}: only a census, a finished solve or a screen recorded since 16 Oct 2026 can be re-analysed "
@@ -621,8 +622,9 @@ def cmd_solve(a):
     res.update(code_version=code_version(), simulated=bool(a.simulate))
     (step_dir / "result.json").write_text(json.dumps(res, indent=1, default=float))
     R.solve_page(step_dir / "report.html", res, _when(step_dir))
+    R.runs_page(step_dir.parent.parent)
     print(f"\n{res['verdict']}" + (f"\nLargest change since the sweep: {res['drift_max']:.0%} of the curve's range."
-                                   if res.get("drift_max") is not None else "") + f"\nReport: {step_dir / 'report.html'}")
+                                   if res.get("drift_max") is not None else "") + f"\nReport: {step_dir / 'report.html'}\nAll runs: {step_dir.parent.parent / 'runs.html'}")
 
 
 def _confirm(a):
