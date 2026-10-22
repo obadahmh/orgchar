@@ -70,7 +70,7 @@ events apart). This is a heuristic with ~24 such pairs per electrode, and none w
 organoid is screened. On fs666 (1 Oct) it drops e13→e14, the only peaked candidate, which e19→e14
 and e26→e14 beat and a full curve did not confirm; it keeps all nine falling pairs from e9/e10.
 
-solve measures the clearest of these pairs (highest single-trial win, then the largest difference); `--pairs` chooses others. One upload holds at most 8 stimulating electrodes (keys 8–14 carry train codes), so electrodes are dealt two per organoid per recording and all organoids run side by side; each electrode gets its lengths in random order. No sham trials since 16 Oct 2026 (see Step 3).
+solve measures the steadiest of these pairs: the one whose train length explains most of its trial-to-trial variation (omega squared). Ranking by single-trial win, then difference, picked big irregular bursts (fs682 e3→e4, 11th of 42 by omega squared, R² 0.57 on 21 Oct 2026). `--pairs` chooses others. One upload holds at most 8 stimulating electrodes (keys 8–14 carry train codes), so electrodes are dealt two per organoid per recording and all organoids run side by side; each electrode gets its lengths in random order. No sham trials since 16 Oct 2026 (see Step 3).
 
 Why not single pulses: on fs666 (1 Oct 2026) a single-pulse screen picked e2, e20, e29 and e10; only e10 responded after trains.
 
@@ -134,7 +134,7 @@ cd ~/Documents/orgchar
 ./orgchar.sh census --fsname fs652 --dry-run    # shows the plan and its duration, touches nothing
 ./orgchar.sh census --fsname fs652              # asks you to type the fsname to confirm
 ./orgchar.sh screen --fsname fs652              # after-train screen of the live organoids from the census
-./orgchar.sh solve  --fsname fs652              # the screen's clearest pair: sweep, train, run the network
+./orgchar.sh solve  --fsname fs652              # the screen's steadiest pair: sweep, train, run the network
 ./orgchar.sh status                             # every organoid run in the last 7 days (or --fsname fs652)
 ./orgchar.sh analyze sessions/fs652/<step dir>  # re-analyse offline, e.g. after changing a setting
 ```
@@ -181,7 +181,7 @@ responses change within a day (fs666 e10's reference fell from 22 to 8.5 events 
 |---|---|---|
 | census | `GO: screen blocks …` | run screen |
 | census | `NO-GO` | do not stimulate; re-check later, contact FinalSpark |
-| screen | `CANDIDATES_FOUND` | run solve (it measures the clearest pair) |
+| screen | `CANDIDATES_FOUND` | run solve (it measures the steadiest pair) |
 | screen | `NO_CANDIDATE` | nothing responds to these trains; try `--amplitude 3`, or re-check the census |
 | screen | `CONTROLS_FAILED` | far more other-organoid pairs pass than p < 0.01 allows: artifact reaches the readout; do not trust the candidates |
 | solve | `STOPPED after the sweep` | no pair responds cleanly now; try another screen candidate (`--pairs`) or re-screen |

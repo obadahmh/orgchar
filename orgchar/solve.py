@@ -26,28 +26,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from scipy import stats
 
 from . import net as N
 from .measure import ARTIFACT_LIMIT, artifact_score, measure
+from .screen import dependence
 
 SWEEP_COUNTS = tuple(range(2, 21, 2))
 SWEEP_REPS, EVAL_REPS, WIDTH, EVAL_POINTS = 8, 6, 12, 26
 GATE_P = 0.01
-
-
-def dependence(values_by_count: dict[int, np.ndarray]) -> tuple[float, float]:
-    """Does the response depend on the pulse count? Kruskal-Wallis p, and omega squared: the share of
-    single-trial variance the count explains, unbiased for the number of trials."""
-    groups = [v for v in values_by_count.values() if len(v)]
-    if len(groups) < 2:
-        return 1.0, float("nan")
-    p = float(stats.kruskal(*groups).pvalue) if np.ptp(np.concatenate(groups)) > 0 else 1.0
-    allv = np.concatenate(groups)
-    ss_b = sum(len(g) * (g.mean() - allv.mean()) ** 2 for g in groups)
-    ss_w = sum(((g - g.mean()) ** 2).sum() for g in groups)
-    ms_w = ss_w / max(len(allv) - len(groups), 1)
-    return p, float((ss_b - (len(groups) - 1) * ms_w) / (ss_b + ss_w + ms_w))
 
 
 def curves_from(responses: pd.DataFrame, pairs, counts):

@@ -236,8 +236,9 @@ def _conclude(step_dir: Path, plan: dict, r: dict) -> dict:
                  f"{r['n_trials']} of {r['n_requests']} trains usable; evoked spikes 10-210 ms after the train."]
         for role in SC.ROLES:
             v = r["best"].get(role)
-            lines.append(f"{SHAPE[role]}: " + (f"e{v['stim']}→e{v['rec']} (a single trial wins {v['win']:.0%} of the time, "
-                                               f"{v['diff']:.1f} events apart; {v['n_candidates']} candidate pair(s))"
+            lines.append(f"{SHAPE[role]}: " + (f"e{v['stim']}→e{v['rec']} (train length explains {v['explained']:.0%} of the "
+                                               f"trial-to-trial variation, {v['diff']:.1f} events apart; "
+                                               f"{v['n_candidates']} candidate pair(s))"
                                                if v else "no candidate"))
         for x in r["chance"]:
             lines.append(f"Dropped e{x['stim']}→e{x['rec']} {SHAPE[x['role']]}: e{x['beaten_by']}→e{x['rec']}, from "
@@ -247,8 +248,8 @@ def _conclude(step_dir: Path, plan: dict, r: dict) -> dict:
                      f"(p < {SC.SCOUT_MAX_P:g} alone would let up to about {c['nominal_ceiling']:g} through).")
         lines += [f"WARNING: {w}" for w in r["warnings"]]
         if r["best"]:
-            v = max(r["best"].values(), key=lambda v: (v["win"], v["diff"]))
-            lines.append(f"Next: ./orgchar.sh solve --fsname {plan['fsname']}   (the clearest pair, e{v['stim']}→e{v['rec']})")
+            v = SC.steadiest(r["best"])
+            lines.append(f"Next: ./orgchar.sh solve --fsname {plan['fsname']}   (the steadiest pair, e{v['stim']}→e{v['rec']})")
         verdict, problems = r["verdict"], []
     r["incomplete"] = bool(problems)
     if problems:
@@ -597,10 +598,11 @@ def cmd_solve(a):
             sys.exit(f"The latest screen ({d.name}) found no candidate pair. Pass --pairs stim:rec to try one anyway.")
         # one pair: one response type is enough, and each pair adds ~80 sweep trains and its own pulse counts
         # (sim, 16 Oct 2026: three pairs, 558 trains, expected R² 0.59; one pair, ~200 trains, 0.68)
-        v = max(s["best"].values(), key=lambda v: (v["win"], v["diff"]))
+        v = SC.steadiest(s["best"])
         pairs = [(v["stim"], v["rec"])]
-        print(f"Pair from screen {d.name}: e{v['stim']}→e{v['rec']}, the clearest response (a single trial wins "
-              f"{v['win']:.0%}, {v['diff']:.1f} spikes apart). --pairs to choose others.")
+        print(f"Pair from screen {d.name}: e{v['stim']}→e{v['rec']}, the steadiest response ("
+              + (f"train length explains {v['explained']:.0%} of the trial-to-trial variation, " if "explained" in v else "")
+              + f"{v['diff']:.1f} spikes apart). --pairs to choose others.")
         if _age_h(d) > STALE_H:
             print(f"  Warning: the screen is {_age_h(d):.0f} h old; responses change within a day.")
     stims = sorted({x for x, _ in pairs})
@@ -673,7 +675,7 @@ def main(argv=None):
 
     p = sub.add_parser("solve", help="≤ 50 min: measure the pair's curve now, train the network on it, run it on the tissue")
     common(p)
-    p.add_argument("--pairs", help="stim:rec,... (default: the latest screen's clearest pair)")
+    p.add_argument("--pairs", help="stim:rec,... (default: the latest screen's steadiest pair)")
     p.add_argument("--sweep-reps", type=int, default=8, help="trains per pulse count when measuring the curve")
     p.add_argument("--reps", type=int, default=6, help="trains per pulse count when running the network")
     p.add_argument("--width", type=int, default=12, help="hidden units")

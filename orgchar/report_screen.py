@@ -120,7 +120,7 @@ def _candidate_figure(cands, responses, levels):
         ax.set_xticklabels(levels)
         ax.tick_params(labelsize=7)
         ax.set_title(f"e{p['stim']} → e{p['rec']}  {TYPE[role]}\n"
-                     f"wins {p['scores'][role]['win']:.0%}, {p['scores'][role]['diff']:.1f} spikes apart",
+                     f"explains {p['explained']:.0%}, {p['scores'][role]['diff']:.1f} spikes apart",
                      fontsize=7.5, loc="left")
         if k % ncol == 0:
             ax.set_ylabel("evoked spikes per trial", fontsize=7.5)
@@ -144,11 +144,11 @@ def screen_page(path, plan, r, when):
             f"{', '.join(map(str, levels))} pulses, {plan['ipi_ms']:g} ms apart, {plan['amplitude_uA']:g} µA, "
             f"{plan['phase_us']:g} µs per phase; {r['n_trials']} of {planned} trains usable</p>",
             f"<p>This step is a quick scan. It stimulates every electrode with {len(levels)} train lengths and looks "
-            "for pairs that might show one of the three response types. The solve step then measures the clearest "
+            "for pairs that might show one of the three response types. The solve step then measures the steadiest "
             "pair's curve in full, trains the network on it and runs it on the tissue.</p>"]
-    top = max(best.values(), key=lambda v: (v["win"], v["diff"])) if best else None
+    top = SC.steadiest(best) if best else None
     if top:
-        lede = (f"Next, solve measures {_pair(top['stim'], top['rec'])}, the clearest pair. Candidates found for "
+        lede = (f"Next, solve measures {_pair(top['stim'], top['rec'])}, the steadiest pair. Candidates found for "
                 + ", ".join(TYPE[k] for k in SC.ROLES if k in best) + "."
                 + ("" if len(best) == 3 else " None for " + ", ".join(TYPE[k] for k in SC.ROLES if k not in best) + "."))
     else:
@@ -163,12 +163,12 @@ def screen_page(path, plan, r, when):
         if v:
             p = next(q for q in r["pairs"] if q["stim"] == v["stim"] and q["rec"] == v["rec"])
             rows.append(f"<tr><td>{name}</td><td>{_pair(v['stim'], v['rec'])}</td><td class=n>{v['win']:.0%}</td>"
-                        f"<td class=n>{v['diff']:.1f}</td><td class=n>{', '.join(f'{m:.1f}' for m in p['means'])}</td>"
+                        f"<td class=n>{v['explained']:.0%}</td><td class=n>{v['diff']:.1f}</td><td class=n>{', '.join(f'{m:.1f}' for m in p['means'])}</td>"
                         f"<td class=n>{v['n_candidates'] - 1}</td></tr>")
         else:
-            rows.append(f"<tr><td>{name}</td><td>{_icon(CHECK_BAD)}none</td><td></td><td></td><td></td><td></td></tr>")
+            rows.append(f"<tr><td>{name}</td><td>{_icon(CHECK_BAD)}none</td><td></td><td></td><td></td><td></td><td></td></tr>")
     body.append("<div class=wrap><table><tr><th>Response type</th><th>Best pair</th><th class=n>Single trial wins</th>"
-                "<th class=n>Difference (spikes)</th>"
+                "<th class=n>Train length explains</th><th class=n>Difference (spikes)</th>"
                 f"<th class=n>Mean evoked spikes at {', '.join(map(str, levels))} pulses</th>"
                 "<th class=n>Other candidates</th></tr>" + "".join(rows) + "</table></div>")
 
@@ -177,6 +177,9 @@ def screen_page(path, plan, r, when):
                               "short-pass, 20 for long-pass, the middle lengths for band-pass) and one at the length "
                               "that should give fewer. This is how often the first has more spikes. 50% means no "
                               "difference. 100% means always."),
+        ("Train length explains", "The share of a pair's trial-to-trial variation that the train length accounts "
+                                  "for (omega squared). The rest is noise the network cannot use. The best pair of "
+                                  "each type is the candidate with the highest share; solve takes the highest of those."),
         ("Candidate", f"A pair whose single trial wins clearly (one-sided rank test, p below {SC.SCOUT_MAX_P:g}) and "
                       f"whose means differ by at least {SC.SCOUT_MIN_EVENTS:g} spikes. A pair is dropped if a pair "
                       "from another organoid does as well on the same recording electrode."),
@@ -218,7 +221,7 @@ def screen_page(path, plan, r, when):
     cands = []
     for role in SC.ROLES:
         cands += [(role, p) for p in sorted([q for q in r["pairs"] if role in q["shapes"]],
-                                            key=lambda q: -q["scores"][role]["win"])[:4]]
+                                            key=lambda q: -q["explained"])[:4]]
     if cands:
         body.append("<h2>The candidates</h2><p class=note>Up to four per response type, best first. Dots are "
                     "single trials. The line joins the means.</p>"

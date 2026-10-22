@@ -1,6 +1,6 @@
 """The screen: every electrode of the live organoids gets trains of 2, 10 and 20 pulses, read out on every
 other electrode; which stim -> rec pairs respond to the train length, and how (response types: short =
-falling, band = peaked, long = rising with the number of pulses). solve then measures the clearest pair's
+falling, band = peaked, long = rising with the number of pulses). solve then measures the steadiest pair's
 curve in full.
 
 Pairs across organoids cannot respond: they are the negative controls (drop_chance, CONTROLS_FAILED).
@@ -48,6 +48,21 @@ def shape_scores(g, levels):
     return out
 
 
+def dependence(values_by_count: dict[int, np.ndarray]) -> tuple[float, float]:
+    """Does the response depend on the pulse count? Kruskal-Wallis p, and omega squared: the share of
+    single-trial variance the count explains, unbiased for the number of trials."""
+    groups = [v for v in values_by_count.values() if len(v)]
+    if len(groups) < 2:
+        return 1.0, float("nan")
+    p = float(stats.kruskal(*groups).pvalue) if np.ptp(np.concatenate(groups)) > 0 else 1.0
+    allv = np.concatenate(groups)
+    ss_b = sum(len(g) * (g.mean() - allv.mean()) ** 2 for g in groups)
+    ss_w = sum(((g - g.mean()) ** 2).sum() for g in groups)
+    ms_w = ss_w / max(len(allv) - len(groups), 1)
+    total = ss_b + ss_w + ms_w
+    return p, float((ss_b - (len(groups) - 1) * ms_w) / total) if total > 0 else float("nan")
+
+
 def drop_chance(same, cross):
     """A pair from another organoid cannot respond, so on its recording electrode it shows what chance
     reaches there; bursting electrodes reach a lot (fs666 1 Oct 2026: e19→e14 and e26→e14 passed,
@@ -88,6 +103,12 @@ def reanalyse(step_dir: Path, plan: dict) -> dict:
     return scout(responses, traces, plan["levels"], len(plan["stims"]) * len(plan["levels"]) * plan["reps"], thr)
 
 
+def steadiest(best: dict) -> dict:
+    """The pair solve measures: the steadiest of the best per shape. Screens analysed before 22 Oct 2026
+    have no omega² and fall back to the old order (single trial wins, then size)."""
+    return max(best.values(), key=lambda v: (v.get("explained", -np.inf), v["win"], v["diff"]))
+
+
 def scout(responses, traces, levels, n_requests, thresholds, warnings_=()) -> dict:
     """For every electrode pair, the response to trains of each length, and which pairs look falling,
     peaked or rising."""
@@ -102,23 +123,30 @@ def scout(responses, traces, levels, n_requests, thresholds, warnings_=()) -> di
         row = dict(stim=int(e), rec=int(c), same_organoid=e // 8 == c // 8, levels=[int(n) for n in levels],
                    means=g.groupby("level").y.mean().reindex(levels).round(3).tolist(),
                    sd=g.groupby("level").y.std().reindex(levels).round(3).tolist(), artifact=a,
-                   artifact_ok=a < ARTIFACT_LIMIT, scores=sc)
+                   artifact_ok=a < ARTIFACT_LIMIT, scores=sc,
+                   explained=dependence({n: g[g.level == n].y.to_numpy() for n in levels})[1])
         row["shapes"] = [k for k, v in sc.items()
                          if v["p"] < SCOUT_MAX_P and v["diff"] >= SCOUT_MIN_EVENTS and row["artifact_ok"]]
         pairs.append(row)
     same = [p for p in pairs if p["same_organoid"]]
     cross = [p for p in pairs if not p["same_organoid"]]
     chance = drop_chance(same, cross)
-    # the best pair per shape: the one whose single trials separate most often, then by size;
-    # one electrode may serve two shapes (on different recording electrodes)
+    # the best pair per shape: the steadiest, i.e. the train length explains most of its single-trial
+    # variance. Ranking by single trial wins (most pairs win 100%) left the size of the difference to decide,
+    # which picked big, irregular bursts: fs682 e3→e4 (omega² 0.79, 11th of 42) solved to R² 0.57 on
+    # 21 Oct 2026, while fs675 e18→e16 (0.97, 1st of 12) solved to 0.90 on 18 Oct.
+    # A pair that passes two shapes counts first for its main one (largest difference): fs682 e12→e13
+    # (12, 70, 26 spikes) also passes as rising. One electrode may serve two shapes (on different
+    # recording electrodes).
     best = {}
+    main = lambda p: max(p["shapes"], key=lambda k: p["scores"][k]["diff"])
     for role in ROLES:
-        cands = sorted([p for p in same if role in p["shapes"]],
-                       key=lambda p: (-p["scores"][role]["win"], -p["scores"][role]["diff"]))
+        cands = sorted([p for p in same if role in p["shapes"]], key=lambda p: (main(p) != role, -p["explained"]))
         if cands:
             sc = cands[0]["scores"][role]
             best[role] = dict(stim=cands[0]["stim"], rec=cands[0]["rec"], win=sc["win"], diff=sc["diff"],
-                              p=sc["p"], n_candidates=len(cands), others=[[p["stim"], p["rec"]] for p in cands[1:6]])
+                              p=sc["p"], explained=cands[0]["explained"], n_candidates=len(cands),
+                              others=[[p["stim"], p["rec"]] for p in cands[1:6]])
     # gross-leak alarm: far more other-organoid pairs pass than p < 0.01 alone would let through
     false_pos = sum(bool(p["shapes"]) for p in cross)
     ceiling = round(len(cross) * len(ROLES) * SCOUT_MAX_P, 1)
