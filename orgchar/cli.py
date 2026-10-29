@@ -3,6 +3,7 @@
     orgchar census --fsname fs652          # ~8 min, no stimulation: which organoids fire?
     orgchar screen --fsname fs652          # ~30 min: which pairs respond to the train length?
     orgchar solve  --fsname fs652          # ≤ 50 min: measure a pair's curve, train the network on it, run it on the tissue
+    orgchar chain --fsname-a fs652 --fsname-b fs653   # two organoids in series, one per MEA (pauses to switch MEAs)
     orgchar status [--fsname fs652]        # where each organoid stands (default: every organoid run this week)
     orgchar analyze <step dir>             # re-run the analysis of a finished step, offline
     orgchar codetest --fsname fs652        # ~3 min: check that train codes (--codes) are safe and readable
@@ -586,25 +587,32 @@ def cmd_disable(a):
             h.close()
 
 
+def _screen_pair(fsname, simulate) -> tuple[int, int]:
+    """The latest screen's steadiest pair (stim, rec); exits if there is none."""
+    d, s = _latest(fsname, simulate, "screen")
+    if s is None or s.get("mode") != "trains" or s.get("incomplete"):
+        sys.exit(f"No complete screen for {fsname}. Run `orgchar screen` first, or pass the pair as stim:rec.")
+    if not s["best"]:
+        sys.exit(f"The latest screen of {fsname} ({d.name}) found no candidate pair. Pass one as stim:rec to try it anyway.")
+    v = SC.steadiest(s["best"])
+    print(f"{fsname}: pair from screen {d.name}: e{v['stim']}→e{v['rec']}, the steadiest response ("
+          + (f"train length explains {v['explained']:.0%} of the trial-to-trial variation, " if "explained" in v else "")
+          + f"{v['diff']:.1f} spikes apart).")
+    if _age_h(d) > STALE_H:
+        print(f"  Warning: the screen is {_age_h(d):.0f} h old; responses change within a day.")
+    return v["stim"], v["rec"]
+
+
+def _pair(text) -> tuple[int, int]:
+    stim, rec = (int(v) for v in text.split(":"))
+    return stim, rec
+
+
 def cmd_solve(a):
     from . import solve as SV
-    if a.pairs:
-        pairs = [tuple(int(v) for v in p.split(":")) for p in a.pairs.split(",")]
-    else:
-        d, s = _latest(a.fsname, a.simulate, "screen")
-        if s is None or s.get("mode") != "trains" or s.get("incomplete"):
-            sys.exit("No complete screen for this organoid. Run `orgchar screen` first, or pass --pairs stim:rec.")
-        if not s["best"]:
-            sys.exit(f"The latest screen ({d.name}) found no candidate pair. Pass --pairs stim:rec to try one anyway.")
-        # one pair: one response type is enough, and each pair adds ~80 sweep trains and its own pulse counts
-        # (sim, 16 Oct 2026: three pairs, 558 trains, expected R² 0.59; one pair, ~200 trains, 0.68)
-        v = SC.steadiest(s["best"])
-        pairs = [(v["stim"], v["rec"])]
-        print(f"Pair from screen {d.name}: e{v['stim']}→e{v['rec']}, the steadiest response ("
-              + (f"train length explains {v['explained']:.0%} of the trial-to-trial variation, " if "explained" in v else "")
-              + f"{v['diff']:.1f} spikes apart). --pairs to choose others.")
-        if _age_h(d) > STALE_H:
-            print(f"  Warning: the screen is {_age_h(d):.0f} h old; responses change within a day.")
+    # one pair by default: one response type is enough, and each pair adds ~80 sweep trains and its own pulse
+    # counts (sim, 16 Oct 2026: three pairs, 558 trains, expected R² 0.59; one pair, ~200 trains, 0.68)
+    pairs = [_pair(p) for p in a.pairs.split(",")] if a.pairs else [_screen_pair(a.fsname, a.simulate)]
     stims = sorted({x for x, _ in pairs})
     sweep = P.plan_trials([(x, n) for x in stims for n in SV.SWEEP_COUNTS for _ in range(a.sweep_reps)])
     evaluate = P.plan_trials([(x, n) for x in stims for n in range(2, 21) for _ in range(a.reps)])   # at most
@@ -629,6 +637,39 @@ def cmd_solve(a):
                                    if res.get("drift_max") is not None else "") + f"\nReport: {step_dir / 'report.html'}\nAll runs: {step_dir.parent.parent / 'runs.html'}")
 
 
+def cmd_chain(a):
+    from . import chain as CH
+    from . import solve as SV
+    pa = _pair(a.pair_a) if a.pair_a else _screen_pair(a.fsname_a, a.simulate)
+    pb = _pair(a.pair_b) if a.pair_b else _screen_pair(a.fsname_b, a.simulate)
+    sweep = sum(P.plan_duration_s(P.plan_trials([(s, n) for n in SV.SWEEP_COUNTS for _ in range(a.sweep_reps)]))
+                for s in (pa[0], pb[0]))
+    evaluate = sum(P.plan_duration_s(P.plan_trials([(s, n) for n in SV.SWEEP_COUNTS for _ in range(a.reps)]))
+                   for s in (pa[0], pb[0]))                                                     # at most
+    print(f"Plan: A = {a.fsname_a} e{pa[0]}→e{pa[1]}, B = {a.fsname_b} e{pb[0]}→e{pb[1]}. Sweep B, switch to A, "
+          f"sweep A, train ({a.n1} -> {a.n2} units), evaluate A, switch to B, evaluate B: at most "
+          f"{(sweep + evaluate) / 60 + CH.TRAIN_MIN:.0f} min plus the two switches. Each step stops the run if its check fails.")
+    a.fsname = f"{a.fsname_a}+{a.fsname_b}"          # the session folder, and the name to type to confirm
+    if a.dry_run or not _confirm(a):
+        return
+    codes = _use_codes(a)
+
+    def swap(fs):
+        if a.simulate:
+            return
+        while input(f"\nThe platform must drive {fs} now. Switch if needed, then type {fs}: ").strip() != fs:
+            print("  Not confirmed; nothing sent.")
+
+    step_dir, res = _run(a, dict(step="chain", fs_a=a.fsname_a, pair_a=pa, fs_b=a.fsname_b, pair_b=pb,
+                                 sweep_reps=a.sweep_reps, reps=a.reps, n1=a.n1, n2=a.n2, codes=codes),
+                         lambda backend, step_dir: CH.run(a.fsname_a, pa, a.fsname_b, pb, backend, step_dir, codes,
+                                                          swap, sweep_reps=a.sweep_reps, eval_reps=a.reps,
+                                                          n1=a.n1, n2=a.n2))
+    res.update(code_version=code_version(), simulated=bool(a.simulate))
+    (step_dir / "result.json").write_text(json.dumps(res, indent=1, default=float))
+    print(f"\n{res['verdict']}\nResults: {step_dir / 'result.json'}")
+
+
 def _confirm(a):
     if a.simulate or a.yes:
         return True
@@ -643,8 +684,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="orgchar", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    def common(p):
-        p.add_argument("--fsname", required=True)
+    def common(p, fsname=True):
+        if fsname:
+            p.add_argument("--fsname", required=True)
         p.add_argument("--simulate", action="store_true", help="synthetic organoid, no hardware")
         p.add_argument("--dry-run", action="store_true", help="print the plan only")
         p.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
@@ -683,6 +725,20 @@ def main(argv=None):
     p.add_argument("--codes", action=argparse.BooleanOptionalAction, default=None,
                    help="train codes (default: on once codetest has passed on this machine)")
     p.set_defaults(func=cmd_solve)
+
+    p = sub.add_parser("chain", help="two organoids in series, one per MEA: sweep both, train, run the chain")
+    common(p, fsname=False)
+    p.add_argument("--fsname-a", required=True, help="MEA of organoid A (layer 1)")
+    p.add_argument("--fsname-b", required=True, help="MEA of organoid B (layer 2)")
+    p.add_argument("--pair-a", help="stim:rec on A (default: A's latest screen's steadiest pair)")
+    p.add_argument("--pair-b", help="stim:rec on B (default: B's latest screen's steadiest pair)")
+    p.add_argument("--sweep-reps", type=int, default=8, help="trains per pulse count when measuring each curve")
+    p.add_argument("--reps", type=int, default=6, help="trains per pulse count when running the chain")
+    p.add_argument("--n1", type=int, default=6, help="units on organoid A")
+    p.add_argument("--n2", type=int, default=6, help="units on organoid B")
+    p.add_argument("--codes", action=argparse.BooleanOptionalAction, default=None,
+                   help="train codes (default: on once codetest has passed on this machine)")
+    p.set_defaults(func=cmd_chain)
 
     p = sub.add_parser("codetest", help="~3 min: check that train codes are safe and readable")
     common(p)

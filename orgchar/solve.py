@@ -52,6 +52,31 @@ def _save(step_dir: Path, result: dict):
     (step_dir / "result.json").write_text(json.dumps(result, indent=1, default=float))
 
 
+def sweep(pairs, backend, out_dir: Path, tag: str, codes: bool, reps=SWEEP_REPS, seed=0):
+    """Measure each pair's curve (reps trains at every SWEEP_COUNTS) and gate it: the response must depend
+    on the pulse count and the artifact must be gone by the counting window. Returns (info for
+    result.json, the curves that passed)."""
+    stims = sorted({s for s, _ in pairs})
+    req = [(s, n) for s in stims for n in SWEEP_COUNTS for _ in range(reps)]
+    traces = {}
+    df, thr, problems = measure(req, backend, out_dir, tag, codes, seed=seed, traces=traces)
+    art = {(s, r): max((artifact_score(v) for (s2, r2, _), v in traces.items() if (s2, r2) == (s, r) and len(v) >= 3),
+                       default=0.0) for s, r in pairs}
+    measured = curves_from(df, pairs, SWEEP_COUNTS)
+    info = dict(sweep_trains=len(req), sweep_pulses=sum(n for _, n in req), thresholds_uV=thr, warnings=problems,
+                sweep_usable=int(df.request.nunique()),
+                curves=[dict(stim=c.stim, rec=c.rec, counts=c.counts, mean=c.mean, sd=c.sd, p=pv, explained=w,
+                             artifact=art[(c.stim, c.rec)]) for c, pv, w in measured])
+    keep = [c for c, pv, _ in measured if pv < GATE_P and art[(c.stim, c.rec)] < ARTIFACT_LIMIT]
+    for c, pv, w in measured:
+        a = art[(c.stim, c.rec)]
+        why = ("" if pv < GATE_P and a < ARTIFACT_LIMIT else "  (dropped: " + ("no dependence on pulse count" if pv >= GATE_P
+               else f"artifact {a:.1f}x its noise floor reaches the counting window") + ")")
+        print(f"  e{c.stim}→e{c.rec}: range {np.ptp(c.mean):.1f} spikes, pulse count explains {w:.0%} of single-trial "
+              f"variance (p {pv:.1g}), artifact {a:.1f}x" + why)
+    return info, keep
+
+
 def run(fsname, pairs, backend, step_dir: Path, codes: bool, ode=N.Oscillator(), sweep_reps=SWEEP_REPS,
         eval_reps=EVAL_REPS, width=WIDTH, points=EVAL_POINTS, starts=8, steps=N.STEPS, seed=0) -> dict:
     tag = f"orgchar_{fsname}_{step_dir.name}"
@@ -62,24 +87,9 @@ def run(fsname, pairs, backend, step_dir: Path, codes: bool, ode=N.Oscillator(),
     # 1. sweep
     print(f"\n1/3 Measuring the curve: {sweep_reps} trains at {', '.join(map(str, SWEEP_COUNTS))} pulses on "
           f"e{', e'.join(map(str, stims))}")
-    sweep_req = [(s, n) for s in stims for n in SWEEP_COUNTS for _ in range(sweep_reps)]
-    traces = {}
-    sweep, thr, problems = measure(sweep_req, backend, step_dir / "sweep", f"{tag}_sweep", codes, seed=seed,
-                                   traces=traces)
-    art = {(s, r): max((artifact_score(v) for (s2, r2, _), v in traces.items() if (s2, r2) == (s, r) and len(v) >= 3),
-                       default=0.0) for s, r in pairs}
-    measured = curves_from(sweep, pairs, SWEEP_COUNTS)
-    res.update(sweep_trains=len(sweep_req), sweep_pulses=sum(n for _, n in sweep_req), thresholds_uV=thr, warnings=problems,
-               sweep_usable=int(sweep.request.nunique()),
-               curves=[dict(stim=c.stim, rec=c.rec, counts=c.counts, mean=c.mean, sd=c.sd, p=pv, explained=w,
-                            artifact=art[(c.stim, c.rec)]) for c, pv, w in measured])
-    keep = [c for c, pv, _ in measured if pv < GATE_P and art[(c.stim, c.rec)] < ARTIFACT_LIMIT]
-    for c, pv, w in measured:
-        a = art[(c.stim, c.rec)]
-        why = ("" if pv < GATE_P and a < ARTIFACT_LIMIT else "  (dropped: " + ("no dependence on pulse count" if pv >= GATE_P
-               else f"artifact {a:.1f}x its noise floor reaches the counting window") + ")")
-        print(f"  e{c.stim}→e{c.rec}: range {np.ptp(c.mean):.1f} spikes, pulse count explains {w:.0%} of single-trial "
-              f"variance (p {pv:.1g}), artifact {a:.1f}x" + why)
+    info, keep = sweep(pairs, backend, step_dir / "sweep", f"{tag}_sweep", codes, sweep_reps, seed)
+    res.update(info)
+    thr = info["thresholds_uV"]
     if not keep:
         res["verdict"] = "STOPPED after the sweep: no pair responds cleanly to the pulse count. No further stimulation."
         _save(step_dir, res)

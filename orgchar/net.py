@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from functools import partial
 from multiprocessing import Pool
 
 import numpy as np
@@ -117,9 +118,7 @@ class Net(torch.nn.Module):
         """Pulse counts the units ask for at times t [time, unit]: the nearest measured count, unless
         training's first phase (fractional; straight-through in the second)."""
         p = self.hidden(t / self.t_scale).clamp(self.lo, self.hi)
-        if not self.integer:
-            return p
-        return p + (self.counts[(p.detach().unsqueeze(-1) - self.counts).abs().argmin(-1)] - p).detach()
+        return snap(p, self.counts) if self.integer else p
 
     def sd_at(self, p: torch.Tensor) -> torch.Tensor:
         """Single-trial spread of each unit at pulse counts p: exact at whole counts, linear in between
@@ -144,6 +143,11 @@ class Net(torch.nn.Module):
         """Variance of y at times t from single-trial noise, each response the mean of `repeats` trials."""
         sd = self.sd_at(self.pulses(t)) / self.scale
         return (self.out.weight ** 2 * sd ** 2).sum(1, keepdim=True) / repeats
+
+
+def snap(p: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    """The nearest of `counts` to each pulse count p, with a straight-through gradient."""
+    return p + (counts[(p.detach().unsqueeze(-1) - counts).abs().argmin(-1)] - p).detach()
 
 
 def grid(ode: Oscillator, n: int = POINTS) -> torch.Tensor:
@@ -180,10 +184,10 @@ def weak_loss(y: torch.Tensor, ode: Oscillator, kernel, phi0, dphi0) -> torch.Te
 
 
 def _fit(job):
-    curves, ode, width, repeats, steps, seed = job
+    make, ode, repeats, steps, seed = job
     torch.set_num_threads(1)
     torch.manual_seed(seed)
-    net = Net(curves, ode.T, width)
+    net = make()
     t = grid(ode)
     tf = bump_kernels(ode, t)
 
@@ -204,7 +208,9 @@ def _fit(job):
     best = (float("inf"), None)
     for _ in range(FINETUNE_STEPS + 1):
         opt.zero_grad()
-        loss = loss_fn()
+        with torch.random.fork_rng():   # same draws at every step if noise_var samples, so states compare
+            torch.manual_seed(seed)
+            loss = loss_fn()
         if loss.item() < best[0]:
             best = (loss.item(), {k: v.clone() for k, v in net.state_dict().items()})
         loss.backward()
@@ -217,16 +223,21 @@ def train_minutes(starts: int = 8, steps: int = STEPS) -> float:
     return 0.004 * (steps + FINETUNE_STEPS) * -(-starts // os.cpu_count()) / 60
 
 
-def train(curves, ode: Oscillator, width: int = 12, repeats: float = 6, starts: int = 8, steps: int = STEPS):
-    """Train from `starts` initialisations in parallel; keep the one with the lowest loss (the exact
-    solution is never used). Returns the network and {start: loss}."""
-    jobs = [(list(curves), ode, width, repeats, steps, seed) for seed in range(starts)]
+def fit(make, ode: Oscillator, repeats: float = 6, starts: int = 8, steps: int = STEPS):
+    """Train the network `make()` builds from `starts` initialisations in parallel; keep the one with the
+    lowest loss (the exact solution is never used). Returns the network and {start: loss}."""
+    jobs = [(make, ode, repeats, steps, seed) for seed in range(starts)]
     with Pool(min(starts, torch.multiprocessing.cpu_count())) as pool:
         results = pool.map(_fit, jobs)
     seed, _, state = min(results, key=lambda r: r[1])
-    net = Net(list(curves), ode.T, width)
+    net = make()
     net.load_state_dict(state)
     return net, {s: v for s, v, _ in results}
+
+
+def train(curves, ode: Oscillator, width: int = 12, repeats: float = 6, starts: int = 8, steps: int = STEPS):
+    """The one-layer network on `curves`, trained by fit."""
+    return fit(partial(Net, list(curves), ode.T, width), ode, repeats, starts, steps)
 
 
 def expected_r2(net: Net, ode: Oscillator, t: torch.Tensor, repeats: float, draws: int = 200, seed: int = 0) -> dict:
