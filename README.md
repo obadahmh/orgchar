@@ -131,9 +131,10 @@ Organoid A's measured responses set organoid B's train lengths, and B's response
 answer to the same oscillator. A and B are organoids on different MEAs, so cross-talk cannot link them.
 Layer 1 is 6 units on A's pair, as in solve. Each of the 6 layer-2 units takes a weighted sum of all six
 A responses as its pulse count on B, capped so a full swing of A moves B by at most 18 pulses (uncapped,
-offline: A's trial noise changed 9–22 % of B's lengths). One machine drives one MEA, so the run asks the
-operator to switch MEAs twice: sweep B, switch to A, sweep A, train (~10 min), evaluate A, switch to B,
-evaluate B at the lengths A's responses set. The gates are solve's. Control: B's responses shuffled
+offline: A's trial noise changed 9–22 % of B's lengths). One machine drives both MEAs, each through its
+own Intan/trigger box (`--box-a`, `--box-b`; default: this machine's): sweep A, sweep B, train (~10 min),
+evaluate A, evaluate B at the lengths A's responses set. The gates are solve's. The lock covers this
+machine only: the other machine must not drive its box during the run. Control: B's responses shuffled
 across its pulse counts. Everything goes to `result.json`, written after every step; there is no report page yet.
 
 ## Running it
@@ -156,7 +157,7 @@ cd ~/Documents/orgchar
 
 Useful options:
 - `screen --blocks 1,2`: override the census choice. `screen --electrodes 21,15`: a subset.
-- `chain --fsname-a fs690 --fsname-b fs691`: A's and B's pairs come from each MEA's latest screen; `--pair-a 13:10 --pair-b 5:3` to choose.
+- `chain --fsname-a fs682 --fsname-b fs683 --box-b 172.30.1.139`: A on np14's box (172.30.2.170), B on neuroplatform10's. A's and B's pairs come from each MEA's latest screen on this machine; `--pair-a 13:10 --pair-b 5:3` to choose.
 - `solve --pairs 13:10`: choose the pair(s) (stim:rec); `--sweep-reps 8`, `--reps 6` (trains per pulse count in the sweep and the run), `--width 12`, `--points 26`.
 - `screen --amplitude 3` / `--phase 150`: more current. Stimulation limits are enforced before any upload: ≤ 3 µA, ≤ 200 µs, ≤ 0.4 nC/phase, ≤ 20 pulses. Change them in `orgchar/protocol.py` (`LIMITS`).
 

@@ -8,6 +8,7 @@ Use FinalSpark organoid pairs (stim→rec) as the activation functions of a hybr
 
 ## Machines
 - **np14** runs fs666 (MEA 6); **neuroplatform10** runs fs667 (MEA 7). FinalSpark replaces all four organoids at once, under a new fsXXX, when the user asks.
+- Box addresses (`INTAN_SOFTWARE_IP` = `TRIGGER_IP`): np14 172.30.2.170, neuroplatform10 172.30.1.139. np14 reaches both; a census of fs683 ran from np14 on 29 Oct 2026.
 - Keep both machines on the same commit. GitHub: `obadahmh/orgchar` (private). `sessions/` is local to each machine and stays out of git; raw recordings of both machines are on the shared S3 mount.
 - fs667 sessions were copied from neuroplatform10 to np14 (`sessions/fs667/`).
 - Tools on np14 without sudo: `~/.local/bin/tectonic` (LaTeX), `~/.local/bin/soffice` (LibreOffice AppImage, for pptx rendering).

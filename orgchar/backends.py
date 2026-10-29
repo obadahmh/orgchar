@@ -310,9 +310,11 @@ def clear_status():
 
 
 class HardwareBackend:
-    def __init__(self, operator: str = "admin", log=print):
+    def __init__(self, operator: str = "admin", log=print, box: str | None = None):
+        """box: the Intan/trigger address of the MEA to drive (default: INTAN_SOFTWARE_IP / TRIGGER_IP)."""
         self.operator = operator
         self.log = log
+        self.box = box
 
     @staticmethod
     def _params(seg):
@@ -338,9 +340,12 @@ class HardwareBackend:
             raise RuntimeError(f"{label} rejected by platform: {getattr(r, 'message', r)}")
 
     async def _segment(self, seg, tag, sent):
-        from neuroplatformv2.core.intan import IntanController
-        from neuroplatformv2.core.trigger import TriggerController
-        intan, trig, recording = IntanController(), None, False
+        from neuroplatformv2.core import intan as sdk_intan, trigger as sdk_trigger
+        if self.box:
+            # The SDK reads its address once, at import; each box serves Intan and triggers on one
+            # address (np14: 172.30.2.170, neuroplatform10: 172.30.1.139, 29 Oct 2026).
+            sdk_intan.INTAN_SERVICE_IP = sdk_trigger.TRIGGER_IP = self.box
+        intan, trig, recording = sdk_intan.IntanController(), None, False
         try:
             status("disabling stimulation…")
             await self._ack("disable all stimulation", intan._disable_all_stim())
@@ -361,7 +366,7 @@ class HardwareBackend:
                        live=True)
             status(f"recording {dur:.0f} s" + (f", {n_tr} trains" if n_tr else ", no stimulation"))
             if seg["events"]:
-                trig = TriggerController(self.operator)
+                trig = sdk_trigger.TriggerController(self.operator)
                 # Send every 16-byte trigger at once. With TCP's default batching (Nagle), triggers
                 # 30 ms apart were held back and delivered in bursts (fs666 curve, 30 Sep 2026).
                 trig.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)

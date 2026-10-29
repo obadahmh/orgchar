@@ -7,9 +7,8 @@ y is a weighted sum of B's responses. Each layer-2 unit's summed |weight| is cap
 per unit of A's normalised response, so A's trial noise moves B's lengths little (uncapped, offline on
 27 Oct 2026: 49-110, and A's noise changed 9-22 % of B's lengths).
 
-One machine drives one MEA, so the run pauses for the operator to switch MEAs (`swap`). The order needs
-two switches: sweep B, switch to A, sweep A, train, evaluate A, switch to B, evaluate B. Each step is
-gated as in solve; result.json is written after every step.
+Each organoid has its own backend (its MEA's box): sweep A, sweep B, train, evaluate A, evaluate B.
+Each step is gated as in solve; result.json is written after every step.
 """
 from __future__ import annotations
 
@@ -125,10 +124,10 @@ def _drift(curve: N.Curve, means: dict) -> float:
     return max(abs(means[n] - m) for n, m in zip(curve.counts, curve.mean) if n in means) / max(np.ptp(curve.mean), 1e-9)
 
 
-def run(fs_a, pair_a, fs_b, pair_b, backend, step_dir: Path, codes: bool, swap, ode=N.Oscillator(),
+def run(fs_a, pair_a, fs_b, pair_b, backends: dict, step_dir: Path, codes: bool, ode=N.Oscillator(),
         sweep_reps=SWEEP_REPS, eval_reps=EVAL_REPS, n1=N1, n2=N2, points=EVAL_POINTS, starts=8, steps=N.STEPS,
         seed=0) -> dict:
-    """`swap(fsname)` returns once the platform drives that MEA."""
+    """backends: {"A": organoid A's MEA, "B": organoid B's MEA}."""
     res = dict(step="chain", fs_a=fs_a, pair_a=list(pair_a), fs_b=fs_b, pair_b=list(pair_b), sweep_reps=sweep_reps,
                eval_reps=eval_reps, n1=n1, n2=n2, gain_cap=GAIN_CAP, points=points, ode=vars(ode))
 
@@ -137,13 +136,12 @@ def run(fs_a, pair_a, fs_b, pair_b, backend, step_dir: Path, codes: bool, swap, 
         _save(step_dir, res)
         return res
 
-    # 1-2. sweep B, then A (two MEA switches in all)
+    # 1-2. sweep A, then B
     curves, thr = {}, {}
-    for k, (name, fs, pair) in enumerate((("B", fs_b, pair_b), ("A", fs_a, pair_a))):
-        swap(fs)
+    for k, (name, fs, pair) in enumerate((("A", fs_a, pair_a), ("B", fs_b, pair_b))):
         print(f"\n{k + 1}/5 Measuring organoid {name}'s curve ({fs}, e{pair[0]}→e{pair[1]}): {sweep_reps} trains at "
               f"{', '.join(map(str, SWEEP_COUNTS))} pulses")
-        info, keep = sweep([tuple(pair)], backend, step_dir / f"sweep_{name.lower()}",
+        info, keep = sweep([tuple(pair)], backends[name], step_dir / f"sweep_{name.lower()}",
                            f"orgchar_{fs}_{step_dir.name}_sweep_{name.lower()}", codes, sweep_reps, seed)
         res[f"sweep_{name.lower()}"] = info
         _save(step_dir, res)
@@ -171,7 +169,7 @@ def run(fs_a, pair_a, fs_b, pair_b, backend, step_dir: Path, codes: bool, swap, 
     with torch.no_grad():
         p1 = net.p1(t).numpy().round().astype(int)
     print(f"\n4/5 Organoid A ({fs_a}): {len(set(p1.ravel()))} pulse counts x {eval_reps} trains")
-    means_a, n_a, prob_a = _evaluate(fs_a, pair_a, p1.ravel(), backend, step_dir, "evaluate_a", codes, thr["A"],
+    means_a, n_a, prob_a = _evaluate(fs_a, pair_a, p1.ravel(), backends["A"], step_dir, "evaluate_a", codes, thr["A"],
                                      eval_reps, seed + 100)
     res.update(t=t.numpy().ravel().tolist(), exact=ode.exact(t.numpy().ravel()).tolist(), p1=p1.tolist(),
                eval_a=means_a, eval_a_trains=n_a, warnings=prob_a)
@@ -183,9 +181,8 @@ def run(fs_a, pair_a, fs_b, pair_b, backend, step_dir: Path, codes: bool, swap, 
     r1 = np.vectorize(means_a.get)(p1).astype(float)
     with torch.no_grad():
         p2 = net.p2(torch.from_numpy(r1)).numpy().round().astype(int)
-    swap(fs_b)
     print(f"\n5/5 Organoid B ({fs_b}): {len(set(p2.ravel()))} pulse counts x {eval_reps} trains, set by organoid A")
-    means_b, n_b, prob_b = _evaluate(fs_b, pair_b, p2.ravel(), backend, step_dir, "evaluate_b", codes, thr["B"],
+    means_b, n_b, prob_b = _evaluate(fs_b, pair_b, p2.ravel(), backends["B"], step_dir, "evaluate_b", codes, thr["B"],
                                      eval_reps, seed + 200)
     res.update(r1=r1.tolist(), p2=p2.tolist(), eval_b=means_b, eval_b_trains=n_b, warnings=prob_a + prob_b)
     if any(int(n) not in means_b for n in p2.ravel()):

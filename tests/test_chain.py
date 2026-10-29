@@ -38,14 +38,15 @@ def test_expected_r2_without_noise_is_the_curve_r2():
 
 def test_chain_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr(N, "decay_r2", lambda *a: -np.inf)            # a short training; check the plumbing
-    swaps, tags = [], []
-    backend = SimBackend(simulate.demo_organoid())                     # organoids 1 and 2 stand in for two MEAs
-    run_segment = backend.run_segment
-    backend.run_segment = lambda seg, seg_dir, tag: tags.append(tag) or run_segment(seg, seg_dir, tag)
-    res = CH.run("fsA", (13, 10), "fsB", (21, 22), backend, tmp_path, False, swaps.append, sweep_reps=4,
+    backends, tags = {}, {}
+    for name in "AB":                                                  # one simulated MEA each
+        b, tags[name] = SimBackend(simulate.demo_organoid()), []
+        b.run_segment = lambda seg, seg_dir, tag, run=b.run_segment, log=tags[name]: log.append(tag) or run(seg, seg_dir, tag)
+        backends[name] = b
+    res = CH.run("fsA", (13, 10), "fsB", (21, 22), backends, tmp_path, False, sweep_reps=4,
                  eval_reps=2, n1=3, n2=3, points=11, starts=2, steps=300)
-    assert swaps == ["fsB", "fsA", "fsB"] and len(set(tags)) == len(tags)
-    assert all("_fsA_" in t for t in tags if "_a_" in t) and all("_fsB_" in t for t in tags if "_b_" in t)
+    assert all("_fsA_" in t and "_a_" in t for t in tags["A"]) and all("_fsB_" in t and "_b_" in t for t in tags["B"])
+    assert len(set(tags["A"] + tags["B"])) == len(tags["A"]) + len(tags["B"])
     p1, p2 = np.array(res["p1"]), np.array(res["p2"])
     assert p1.shape == p2.shape == (10, 3) and set(p1.ravel()) | set(p2.ravel()) <= set(COUNTS)
     assert res["eval_a_trains"] == 2 * len(set(p1.ravel())) and res["eval_b_trains"] == 2 * len(set(p2.ravel()))

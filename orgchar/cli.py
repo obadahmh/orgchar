@@ -3,7 +3,7 @@
     orgchar census --fsname fs652          # ~8 min, no stimulation: which organoids fire?
     orgchar screen --fsname fs652          # ~30 min: which pairs respond to the train length?
     orgchar solve  --fsname fs652          # ≤ 50 min: measure a pair's curve, train the network on it, run it on the tissue
-    orgchar chain --fsname-a fs652 --fsname-b fs653   # two organoids in series, one per MEA (pauses to switch MEAs)
+    orgchar chain --fsname-a fs652 --fsname-b fs653 --box-b 172.30.1.139   # two organoids in series, one per MEA
     orgchar status [--fsname fs652]        # where each organoid stands (default: every organoid run this week)
     orgchar analyze <step dir>             # re-run the analysis of a finished step, offline
     orgchar codetest --fsname fs652        # ~3 min: check that train codes (--codes) are safe and readable
@@ -108,13 +108,7 @@ def _run(a, plan: dict, fn):
     plan = dict(plan, fsname=a.fsname, created_utc=_now().isoformat(), code_version=code_version(),
                 backend="simulated" if a.simulate else "hardware", limits=P.LIMITS)
     (step_dir / "plan.json").write_text(json.dumps(plan, indent=1))
-    if a.simulate:
-        from .backends import SimBackend
-        from .simulate import demo_organoid
-        backend, locks = SimBackend(demo_organoid()), []
-    else:
-        from .backends import HardwareBackend
-        backend, locks = HardwareBackend(a.operator), hardware_lock()
+    backend, locks = _backend(a), [] if a.simulate else hardware_lock()
     print(f"\n{plan['step']}, {a.fsname}{' (SIMULATED)' if a.simulate else ''}, started {_local():%H:%M %Z}")
     try:
         return step_dir, fn(backend, step_dir)
@@ -126,6 +120,16 @@ def _run(a, plan: dict, fn):
     finally:
         for h in locks:
             h.close()
+
+
+def _backend(a, box=None):
+    """The simulated organoid, or the platform at `box` (default: this machine's Intan/trigger address)."""
+    if a.simulate:
+        from .backends import SimBackend
+        from .simulate import demo_organoid
+        return SimBackend(demo_organoid())
+    from .backends import HardwareBackend
+    return HardwareBackend(a.operator, box=box)
 
 
 def _segments(plan, backend, step_dir):
@@ -646,25 +650,21 @@ def cmd_chain(a):
                 for s in (pa[0], pb[0]))
     evaluate = sum(P.plan_duration_s(P.plan_trials([(s, n) for n in SV.SWEEP_COUNTS for _ in range(a.reps)]))
                    for s in (pa[0], pb[0]))                                                     # at most
-    print(f"Plan: A = {a.fsname_a} e{pa[0]}→e{pa[1]}, B = {a.fsname_b} e{pb[0]}→e{pb[1]}. Sweep B, switch to A, "
-          f"sweep A, train ({a.n1} -> {a.n2} units), evaluate A, switch to B, evaluate B: at most "
-          f"{(sweep + evaluate) / 60 + CH.TRAIN_MIN:.0f} min plus the two switches. Each step stops the run if its check fails.")
+    box_a, box_b = (b or os.environ.get("INTAN_SOFTWARE_IP") for b in (a.box_a, a.box_b))
+    print(f"Plan: A = {a.fsname_a} e{pa[0]}→e{pa[1]} (box {box_a}), B = {a.fsname_b} e{pb[0]}→e{pb[1]} (box {box_b}). "
+          f"Sweep A, sweep B, train ({a.n1} -> {a.n2} units), evaluate A, evaluate B: at most "
+          f"{(sweep + evaluate) / 60 + CH.TRAIN_MIN:.0f} min. Each step stops the run if its check fails.")
+    if box_a == box_b and not a.simulate:
+        sys.exit(f"A and B are both on box {box_a}: give each MEA's box with --box-a / --box-b.")
     a.fsname = f"{a.fsname_a}+{a.fsname_b}"          # the session folder, and the name to type to confirm
     if a.dry_run or not _confirm(a):
         return
     codes = _use_codes(a)
-
-    def swap(fs):
-        if a.simulate:
-            return
-        while input(f"\nThe platform must drive {fs} now. Switch if needed, then type {fs}: ").strip() != fs:
-            print("  Not confirmed; nothing sent.")
-
-    step_dir, res = _run(a, dict(step="chain", fs_a=a.fsname_a, pair_a=pa, fs_b=a.fsname_b, pair_b=pb,
-                                 sweep_reps=a.sweep_reps, reps=a.reps, n1=a.n1, n2=a.n2, codes=codes),
-                         lambda backend, step_dir: CH.run(a.fsname_a, pa, a.fsname_b, pb, backend, step_dir, codes,
-                                                          swap, sweep_reps=a.sweep_reps, eval_reps=a.reps,
-                                                          n1=a.n1, n2=a.n2))
+    step_dir, res = _run(a, dict(step="chain", fs_a=a.fsname_a, pair_a=pa, box_a=box_a, fs_b=a.fsname_b, pair_b=pb,
+                                 box_b=box_b, sweep_reps=a.sweep_reps, reps=a.reps, n1=a.n1, n2=a.n2, codes=codes),
+                         lambda _, step_dir: CH.run(a.fsname_a, pa, a.fsname_b, pb,
+                                                    dict(A=_backend(a, box_a), B=_backend(a, box_b)), step_dir, codes,
+                                                    sweep_reps=a.sweep_reps, eval_reps=a.reps, n1=a.n1, n2=a.n2))
     res.update(code_version=code_version(), simulated=bool(a.simulate))
     (step_dir / "result.json").write_text(json.dumps(res, indent=1, default=float))
     print(f"\n{res['verdict']}\nResults: {step_dir / 'result.json'}")
@@ -732,6 +732,8 @@ def main(argv=None):
     p.add_argument("--fsname-b", required=True, help="MEA of organoid B (layer 2)")
     p.add_argument("--pair-a", help="stim:rec on A (default: A's latest screen's steadiest pair)")
     p.add_argument("--pair-b", help="stim:rec on B (default: B's latest screen's steadiest pair)")
+    p.add_argument("--box-a", help="Intan/trigger address of A's MEA (default: this machine's, INTAN_SOFTWARE_IP)")
+    p.add_argument("--box-b", help="Intan/trigger address of B's MEA (default: this machine's, INTAN_SOFTWARE_IP)")
     p.add_argument("--sweep-reps", type=int, default=8, help="trains per pulse count when measuring each curve")
     p.add_argument("--reps", type=int, default=6, help="trains per pulse count when running the chain")
     p.add_argument("--n1", type=int, default=6, help="units on organoid A")
