@@ -53,3 +53,10 @@ def test_chain_end_to_end(tmp_path, monkeypatch):
     assert np.isfinite(res["r2"]) and res["drift_a"] is not None and res["drift_b"] is not None
     assert res["shuffle_b"]["median"] <= res["shuffle_b"]["p95"]
     assert json.loads((tmp_path / "result.json").read_text())["verdict"] == res["verdict"]
+
+
+def test_medians_ignore_an_outlier_train_and_sd_is_the_medians_error():
+    from orgchar.solve import center_spread
+    assert center_spread(np.array([10.0, 11, 9, 10, 78]), robust=True)[0] == 10.0
+    x = np.random.default_rng(0).normal(0, 2.0, 200_000)
+    assert center_spread(x, robust=True)[1] == pytest.approx(1.2533 * 2.0, rel=0.02)

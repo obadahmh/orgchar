@@ -8,7 +8,9 @@ per unit of A's normalised response, so A's trial noise moves B's lengths little
 27 Oct 2026: 49-110, and A's noise changed 9-22 % of B's lengths).
 
 Each organoid has its own backend (its MEA's box): sweep A, sweep B, train, evaluate A, evaluate B.
-Each step is gated as in solve; result.json is written after every step.
+Each step is gated as in solve; result.json is written after every step. Every response is the median of
+its trains (solve.center_spread), not the mean: A's errors move B's lengths, and single outlier trains
+moved A's means (offline replay of the 2 Nov 2026 chain: R² 0.24 with means, 0.61 with medians).
 """
 from __future__ import annotations
 
@@ -21,7 +23,7 @@ import torch
 
 from . import net as N
 from .measure import measure
-from .solve import EVAL_POINTS, EVAL_REPS, SWEEP_COUNTS, SWEEP_REPS, _save, sweep
+from .solve import EVAL_POINTS, EVAL_REPS, SWEEP_COUNTS, SWEEP_REPS, _save, center_spread, sweep
 
 N1, N2, GAIN_CAP, MC = 6, 6, 18.0, 4     # MC: noise samples per training step for the output variance
 TRAIN_MIN = 10                            # 6 -> 6, 8 starts, 40000 steps on np14: 9.3 min (offline, 27 Oct 2026)
@@ -111,12 +113,12 @@ def shuffle_null(p2, means_b: dict, w_out, b_out, exact, r2_run, draws=2000, see
 
 
 def _evaluate(fs, pair, lengths, backend, step_dir, part, codes, thresholds, reps, seed):
-    """Measure `pair` at each of `lengths` (reps trains each); {pulses: mean response}, and the train count."""
+    """Measure `pair` at each of `lengths` (reps trains each); {pulses: median response}, and the train count."""
     req = [(pair[0], int(n)) for n in sorted(set(lengths)) for _ in range(reps)]
     ev, _, problems = measure(req, backend, step_dir / part, f"orgchar_{fs}_{step_dir.name}_{part}", codes,
                               thresholds=thresholds, seed=seed)
     d = ev[(ev.stim == pair[0]) & (ev.rec == pair[1])].dropna(subset=["response"])
-    return {int(n): float(g.response.mean()) for n, g in d.groupby("pulses")}, len(req), problems
+    return {int(n): center_spread(g.response.to_numpy(), robust=True)[0] for n, g in d.groupby("pulses")}, len(req), problems
 
 
 def _drift(curve: N.Curve, means: dict) -> float:
@@ -129,7 +131,7 @@ def run(fs_a, pair_a, fs_b, pair_b, backends: dict, step_dir: Path, codes: bool,
         seed=0) -> dict:
     """backends: {"A": organoid A's MEA, "B": organoid B's MEA}."""
     res = dict(step="chain", fs_a=fs_a, pair_a=list(pair_a), fs_b=fs_b, pair_b=list(pair_b), sweep_reps=sweep_reps,
-               eval_reps=eval_reps, n1=n1, n2=n2, gain_cap=GAIN_CAP, points=points, ode=vars(ode))
+               eval_reps=eval_reps, n1=n1, n2=n2, gain_cap=GAIN_CAP, points=points, ode=vars(ode), response="median")
 
     def stop(verdict):
         res["verdict"] = verdict
@@ -142,7 +144,7 @@ def run(fs_a, pair_a, fs_b, pair_b, backends: dict, step_dir: Path, codes: bool,
         print(f"\n{k + 1}/5 Measuring organoid {name}'s curve ({fs}, e{pair[0]}→e{pair[1]}): {sweep_reps} trains at "
               f"{', '.join(map(str, SWEEP_COUNTS))} pulses")
         info, keep = sweep([tuple(pair)], backends[name], step_dir / f"sweep_{name.lower()}",
-                           f"orgchar_{fs}_{step_dir.name}_sweep_{name.lower()}", codes, sweep_reps, seed)
+                           f"orgchar_{fs}_{step_dir.name}_sweep_{name.lower()}", codes, sweep_reps, seed, robust=True)
         res[f"sweep_{name.lower()}"] = info
         _save(step_dir, res)
         if not keep:

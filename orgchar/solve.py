@@ -36,15 +36,24 @@ SWEEP_REPS, EVAL_REPS, WIDTH, EVAL_POINTS = 8, 6, 12, 26
 GATE_P = 0.01
 
 
-def curves_from(responses: pd.DataFrame, pairs, counts):
+def center_spread(x: np.ndarray, robust: bool = False) -> tuple[float, float]:
+    """Mean and sd, or (robust) the median and an sd such that sd/sqrt(n) is the median's error: 1.4826 x MAD
+    is sd for normal trials, and the median of n is 1.2533x noisier than their mean. The median ignores
+    single outlier trains (2 Nov 2026 chain: 2 of 8 trains at 50 and 78 among 9-18 moved the mean 2x)."""
+    if not robust:
+        return float(x.mean()), float(x.std(ddof=1))
+    med = float(np.median(x))
+    return med, float(1.2533 * 1.4826 * np.median(np.abs(x - med)))
+
+
+def curves_from(responses: pd.DataFrame, pairs, counts, robust: bool = False):
     """Measured curve of each (stim, rec) pair, with its dependence on the pulse count (p, omega²)."""
     out = []
     for s, r in pairs:
         d = responses[(responses.stim == s) & (responses.rec == r)]
         by = {n: d[d.pulses == n].response.dropna().to_numpy() for n in counts}
-        c = N.Curve(int(s), int(r), tuple(int(n) for n in counts), tuple(float(by[n].mean()) for n in counts),
-                    tuple(float(by[n].std(ddof=1)) for n in counts))
-        out.append((c, *dependence(by)))
+        mean, sd = zip(*(center_spread(by[n], robust) for n in counts))
+        out.append((N.Curve(int(s), int(r), tuple(int(n) for n in counts), mean, sd), *dependence(by)))
     return out
 
 
@@ -52,7 +61,7 @@ def _save(step_dir: Path, result: dict):
     (step_dir / "result.json").write_text(json.dumps(result, indent=1, default=float))
 
 
-def sweep(pairs, backend, out_dir: Path, tag: str, codes: bool, reps=SWEEP_REPS, seed=0):
+def sweep(pairs, backend, out_dir: Path, tag: str, codes: bool, reps=SWEEP_REPS, seed=0, robust=False):
     """Measure each pair's curve (reps trains at every SWEEP_COUNTS) and gate it: the response must depend
     on the pulse count and the artifact must be gone by the counting window. Returns (info for
     result.json, the curves that passed)."""
@@ -62,7 +71,7 @@ def sweep(pairs, backend, out_dir: Path, tag: str, codes: bool, reps=SWEEP_REPS,
     df, thr, problems = measure(req, backend, out_dir, tag, codes, seed=seed, traces=traces)
     art = {(s, r): max((artifact_score(v) for (s2, r2, _), v in traces.items() if (s2, r2) == (s, r) and len(v) >= 3),
                        default=0.0) for s, r in pairs}
-    measured = curves_from(df, pairs, SWEEP_COUNTS)
+    measured = curves_from(df, pairs, SWEEP_COUNTS, robust)
     info = dict(sweep_trains=len(req), sweep_pulses=sum(n for _, n in req), thresholds_uV=thr, warnings=problems,
                 sweep_usable=int(df.request.nunique()),
                 curves=[dict(stim=c.stim, rec=c.rec, counts=c.counts, mean=c.mean, sd=c.sd, p=pv, explained=w,
