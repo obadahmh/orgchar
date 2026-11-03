@@ -22,8 +22,7 @@ import numpy as np
 import torch
 
 from . import net as N
-from .measure import measure
-from .solve import EVAL_POINTS, EVAL_REPS, SWEEP_COUNTS, SWEEP_REPS, _save, center_spread, sweep
+from .solve import EVAL_POINTS, EVAL_REPS, SWEEP_COUNTS, SWEEP_REPS, _save, drift, measure_at, sweep
 
 N1, N2, GAIN_CAP, MC = 6, 6, 18.0, 4     # MC: noise samples per training step for the output variance
 TRAIN_MIN = 10                            # 6 -> 6, 8 starts, 40000 steps on np14: 9.3 min (offline, 27 Oct 2026)
@@ -112,20 +111,6 @@ def shuffle_null(p2, means_b: dict, w_out, b_out, exact, r2_run, draws=2000, see
                 share_above_run=float((np.array(scores) >= r2_run).mean()))
 
 
-def _evaluate(fs, pair, lengths, backend, step_dir, part, codes, thresholds, reps, seed):
-    """Measure `pair` at each of `lengths` (reps trains each); {pulses: median response}, and the train count."""
-    req = [(pair[0], int(n)) for n in sorted(set(lengths)) for _ in range(reps)]
-    ev, _, problems = measure(req, backend, step_dir / part, f"orgchar_{fs}_{step_dir.name}_{part}", codes,
-                              thresholds=thresholds, seed=seed)
-    d = ev[(ev.stim == pair[0]) & (ev.rec == pair[1])].dropna(subset=["response"])
-    return {int(n): center_spread(g.response.to_numpy(), robust=True)[0] for n, g in d.groupby("pulses")}, len(req), problems
-
-
-def _drift(curve: N.Curve, means: dict) -> float:
-    """Largest change between the sweep and the evaluation, as a share of the curve's range."""
-    return max(abs(means[n] - m) for n, m in zip(curve.counts, curve.mean) if n in means) / max(np.ptp(curve.mean), 1e-9)
-
-
 def run(fs_a, pair_a, fs_b, pair_b, backends: dict, step_dir: Path, codes: bool, ode=N.Oscillator(),
         sweep_reps=SWEEP_REPS, eval_reps=EVAL_REPS, n1=N1, n2=N2, points=EVAL_POINTS, starts=8, steps=N.STEPS,
         seed=0) -> dict:
@@ -156,7 +141,7 @@ def run(fs_a, pair_a, fs_b, pair_b, backends: dict, step_dir: Path, codes: bool,
     reps_eff = 1 / (1 / eval_reps + 1 / sweep_reps)     # the run's noise plus the sweep's own (see solve)
     print(f"\n3/5 Training the chain ({n1} -> {n2} units, {starts} starts; no stimulation; about {TRAIN_MIN} min)",
           flush=True)
-    net, losses = N.fit(partial(Chain, curves["A"], curves["B"], ode.T, n1, n2), ode, reps_eff, starts, steps)
+    net, losses = N.fit(partial(Chain, curves["A"], curves["B"], ode.T, n1, n2), N.ode_problem(ode), reps_eff, starts, steps)
     torch.save(net.state_dict(), step_dir / "model.pt")
     t = N.held_out_times(ode, points)
     exp, decay = expected_r2(net, ode, t, reps_eff), N.decay_r2(ode, t)
@@ -171,7 +156,7 @@ def run(fs_a, pair_a, fs_b, pair_b, backends: dict, step_dir: Path, codes: bool,
     with torch.no_grad():
         p1 = net.p1(t).numpy().round().astype(int)
     print(f"\n4/5 Organoid A ({fs_a}): {len(set(p1.ravel()))} pulse counts x {eval_reps} trains")
-    means_a, n_a, prob_a = _evaluate(fs_a, pair_a, p1.ravel(), backends["A"], step_dir, "evaluate_a", codes, thr["A"],
+    means_a, n_a, prob_a = measure_at(fs_a, pair_a, p1.ravel(), backends["A"], step_dir, "evaluate_a", codes, thr["A"],
                                      eval_reps, seed + 100)
     res.update(t=t.numpy().ravel().tolist(), exact=ode.exact(t.numpy().ravel()).tolist(), p1=p1.tolist(),
                eval_a=means_a, eval_a_trains=n_a, warnings=prob_a)
@@ -184,7 +169,7 @@ def run(fs_a, pair_a, fs_b, pair_b, backends: dict, step_dir: Path, codes: bool,
     with torch.no_grad():
         p2 = net.p2(torch.from_numpy(r1)).numpy().round().astype(int)
     print(f"\n5/5 Organoid B ({fs_b}): {len(set(p2.ravel()))} pulse counts x {eval_reps} trains, set by organoid A")
-    means_b, n_b, prob_b = _evaluate(fs_b, pair_b, p2.ravel(), backends["B"], step_dir, "evaluate_b", codes, thr["B"],
+    means_b, n_b, prob_b = measure_at(fs_b, pair_b, p2.ravel(), backends["B"], step_dir, "evaluate_b", codes, thr["B"],
                                      eval_reps, seed + 200)
     res.update(r1=r1.tolist(), p2=p2.tolist(), eval_b=means_b, eval_b_trains=n_b, warnings=prob_a + prob_b)
     if any(int(n) not in means_b for n in p2.ravel()):
@@ -198,7 +183,7 @@ def run(fs_a, pair_a, fs_b, pair_b, backends: dict, step_dir: Path, codes: bool,
         w_out, b_out = (net.out.weight.ravel() / net.scale_b).numpy(), float(net.out.bias)
     score = N.r2(y, exact)
     res.update(r2_responses=r2_.tolist(), y=y.tolist(), y_model=model.tolist(), r2=score,
-               drift_a=_drift(curves["A"], means_a), drift_b=_drift(curves["B"], means_b),
+               drift_a=drift(curves["A"], means_a), drift_b=drift(curves["B"], means_b),
                shuffle_b=shuffle_null(p2, means_b, w_out, b_out, exact, score))
     return stop(f"R² {score:.2f} on the two organoids (expected {exp['noisy_median']:.2f}). "
                 + (f"Above the plain decay's {decay:.2f}: the chain shows the oscillation." if score > decay else

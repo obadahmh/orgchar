@@ -86,6 +86,21 @@ def sweep(pairs, backend, out_dir: Path, tag: str, codes: bool, reps=SWEEP_REPS,
     return info, keep
 
 
+def measure_at(fs, pair, lengths, backend, step_dir, part, codes, thresholds, reps, seed):
+    """Measure `pair` at each of `lengths` (reps trains each), into step_dir/part. Returns {pulses: median
+    response}, the number of trains and the recordings' problems."""
+    req = [(pair[0], int(n)) for n in sorted(set(lengths)) for _ in range(reps)]
+    ev, _, problems = measure(req, backend, step_dir / part, f"orgchar_{fs}_{step_dir.name}_{part}", codes,
+                              thresholds=thresholds, seed=seed)
+    d = ev[(ev.stim == pair[0]) & (ev.rec == pair[1])].dropna(subset=["response"])
+    return {int(n): center_spread(g.response.to_numpy(), robust=True)[0] for n, g in d.groupby("pulses")}, len(req), problems
+
+
+def drift(curve: N.Curve, means: dict) -> float:
+    """Largest change between the sweep and the evaluation, as a share of the curve's range."""
+    return max(abs(means[n] - m) for n, m in zip(curve.counts, curve.mean) if n in means) / max(np.ptp(curve.mean), 1e-9)
+
+
 def run(fsname, pairs, backend, step_dir: Path, codes: bool, ode=N.Oscillator(), sweep_reps=SWEEP_REPS,
         eval_reps=EVAL_REPS, width=WIDTH, points=EVAL_POINTS, starts=8, steps=N.STEPS, seed=0) -> dict:
     tag = f"orgchar_{fsname}_{step_dir.name}"

@@ -4,6 +4,7 @@
     orgchar screen --fsname fs652          # ~30 min: which pairs respond to the train length?
     orgchar solve  --fsname fs652          # ≤ 50 min: measure a pair's curve, train the network on it, run it on the tissue
     orgchar chain --fsname-a fs652 --fsname-b fs653 --box-b 172.30.1.139   # two organoids in series, one per MEA
+    orgchar compose --fsname-a fs652 --fsname-b fs653 --box-b 172.30.1.139 # a block per organoid, trained apart, then in series
     orgchar status [--fsname fs652]        # where each organoid stands (default: every organoid run this week)
     orgchar analyze <step dir>             # re-run the analysis of a finished step, offline
     orgchar codetest --fsname fs652        # ~3 min: check that train codes (--codes) are safe and readable
@@ -641,22 +642,36 @@ def cmd_solve(a):
                                    if res.get("drift_max") is not None else "") + f"\nReport: {step_dir / 'report.html'}\nAll runs: {step_dir.parent.parent / 'runs.html'}")
 
 
-def cmd_chain(a):
-    from . import chain as CH
-    from . import solve as SV
+def _two(a):
+    """Organoid A's and B's pairs and Intan/trigger boxes; the session folder is A+B."""
     pa = _pair(a.pair_a) if a.pair_a else _screen_pair(a.fsname_a, a.simulate)
     pb = _pair(a.pair_b) if a.pair_b else _screen_pair(a.fsname_b, a.simulate)
-    sweep = sum(P.plan_duration_s(P.plan_trials([(s, n) for n in SV.SWEEP_COUNTS for _ in range(a.sweep_reps)]))
-                for s in (pa[0], pb[0]))
-    evaluate = sum(P.plan_duration_s(P.plan_trials([(s, n) for n in SV.SWEEP_COUNTS for _ in range(a.reps)]))
-                   for s in (pa[0], pb[0]))                                                     # at most
     box_a, box_b = (b or os.environ.get("INTAN_SOFTWARE_IP") for b in (a.box_a, a.box_b))
-    print(f"Plan: A = {a.fsname_a} e{pa[0]}→e{pa[1]} (box {box_a}), B = {a.fsname_b} e{pb[0]}→e{pb[1]} (box {box_b}). "
-          f"Sweep A, sweep B, train ({a.n1} -> {a.n2} units), evaluate A, evaluate B: at most "
-          f"{(sweep + evaluate) / 60 + CH.TRAIN_MIN:.0f} min. Each step stops the run if its check fails.")
     if box_a == box_b and not a.simulate:
         sys.exit(f"A and B are both on box {box_a}: give each MEA's box with --box-a / --box-b.")
     a.fsname = f"{a.fsname_a}+{a.fsname_b}"          # the session folder, and the name to type to confirm
+    return pa, pb, box_a, box_b
+
+
+def _sweep_min(stim, reps):
+    """Minutes to measure one electrode at every sweep count, reps trains each."""
+    from .solve import SWEEP_COUNTS
+    return P.plan_duration_s(P.plan_trials([(stim, n) for n in SWEEP_COUNTS for _ in range(reps)])) / 60
+
+
+def _finish(a, step_dir, res):
+    res.update(code_version=code_version(), simulated=bool(a.simulate))
+    (step_dir / "result.json").write_text(json.dumps(res, indent=1, default=float))
+    print(f"\n{res['verdict']}\nResults: {step_dir / 'result.json'}")
+
+
+def cmd_chain(a):
+    from . import chain as CH
+    pa, pb, box_a, box_b = _two(a)
+    mins = sum(_sweep_min(s, a.sweep_reps) + _sweep_min(s, a.reps) for s in (pa[0], pb[0])) + CH.TRAIN_MIN   # at most
+    print(f"Plan: A = {a.fsname_a} e{pa[0]}→e{pa[1]} (box {box_a}), B = {a.fsname_b} e{pb[0]}→e{pb[1]} (box {box_b}). "
+          f"Sweep A, sweep B, train ({a.n1} -> {a.n2} units), evaluate A, evaluate B: at most {mins:.0f} min. "
+          "Each step stops the run if its check fails.")
     if a.dry_run or not _confirm(a):
         return
     codes = _use_codes(a)
@@ -665,9 +680,28 @@ def cmd_chain(a):
                          lambda _, step_dir: CH.run(a.fsname_a, pa, a.fsname_b, pb,
                                                     dict(A=_backend(a, box_a), B=_backend(a, box_b)), step_dir, codes,
                                                     sweep_reps=a.sweep_reps, eval_reps=a.reps, n1=a.n1, n2=a.n2))
-    res.update(code_version=code_version(), simulated=bool(a.simulate))
-    (step_dir / "result.json").write_text(json.dumps(res, indent=1, default=float))
-    print(f"\n{res['verdict']}\nResults: {step_dir / 'result.json'}")
+    _finish(a, step_dir, res)
+
+
+def cmd_compose(a):
+    from . import compose as CO
+    pa, pb, box_a, box_b = _two(a)
+    mins = (sum(_sweep_min(s, a.sweep_reps) for s in (pa[0], pb[0])) + 2 * _sweep_min(pa[0], a.reps)
+            + _sweep_min(pb[0], a.reps) + CO.TRAIN_MIN)                                         # at most
+    blocks = "; ".join(f"{' and '.join(b)} on {o}" for o, b in CO.BLOCKS.items())
+    print(f"Plan: A = {a.fsname_a} e{pa[0]}→e{pa[1]} (box {box_a}), B = {a.fsname_b} e{pb[0]}→e{pb[1]} (box {box_b}). "
+          f"Blocks: {blocks}, each trained on its own organoid's curve. Sweep B, sweep A, train, then run A, B, A, "
+          f"each at the lengths the outputs before it set: at most {mins:.0f} min. Each step stops the run if its "
+          "check fails.")
+    if a.dry_run or not _confirm(a):
+        return
+    codes = _use_codes(a)
+    step_dir, res = _run(a, dict(step="compose", fs_a=a.fsname_a, pair_a=pa, box_a=box_a, fs_b=a.fsname_b, pair_b=pb,
+                                 box_b=box_b, sweep_reps=a.sweep_reps, reps=a.reps, width=a.width, codes=codes),
+                         lambda _, step_dir: CO.run(a.fsname_a, pa, a.fsname_b, pb,
+                                                    dict(A=_backend(a, box_a), B=_backend(a, box_b)), step_dir, codes,
+                                                    sweep_reps=a.sweep_reps, eval_reps=a.reps, width=a.width))
+    _finish(a, step_dir, res)
 
 
 def _confirm(a):
@@ -726,21 +760,30 @@ def main(argv=None):
                    help="train codes (default: on once codetest has passed on this machine)")
     p.set_defaults(func=cmd_solve)
 
-    p = sub.add_parser("chain", help="two organoids in series, one per MEA: sweep both, train, run the chain")
-    common(p, fsname=False)
-    p.add_argument("--fsname-a", required=True, help="MEA of organoid A (layer 1)")
-    p.add_argument("--fsname-b", required=True, help="MEA of organoid B (layer 2)")
-    p.add_argument("--pair-a", help="stim:rec on A (default: A's latest screen's steadiest pair)")
-    p.add_argument("--pair-b", help="stim:rec on B (default: B's latest screen's steadiest pair)")
-    p.add_argument("--box-a", help="Intan/trigger address of A's MEA (default: this machine's, INTAN_SOFTWARE_IP)")
-    p.add_argument("--box-b", help="Intan/trigger address of B's MEA (default: this machine's, INTAN_SOFTWARE_IP)")
-    p.add_argument("--sweep-reps", type=int, default=8, help="trains per pulse count when measuring each curve")
-    p.add_argument("--reps", type=int, default=6, help="trains per pulse count when running the chain")
+    def two_organoids(p):
+        common(p, fsname=False)
+        p.add_argument("--fsname-a", required=True, help="MEA of organoid A")
+        p.add_argument("--fsname-b", required=True, help="MEA of organoid B")
+        p.add_argument("--pair-a", help="stim:rec on A (default: A's latest screen's steadiest pair)")
+        p.add_argument("--pair-b", help="stim:rec on B (default: B's latest screen's steadiest pair)")
+        p.add_argument("--box-a", help="Intan/trigger address of A's MEA (default: this machine's, INTAN_SOFTWARE_IP)")
+        p.add_argument("--box-b", help="Intan/trigger address of B's MEA (default: this machine's, INTAN_SOFTWARE_IP)")
+        p.add_argument("--sweep-reps", type=int, default=8, help="trains per pulse count when measuring each curve")
+        p.add_argument("--reps", type=int, default=6, help="trains per pulse count when running the network")
+        p.add_argument("--codes", action=argparse.BooleanOptionalAction, default=None,
+                       help="train codes (default: on once codetest has passed on this machine)")
+
+    p = sub.add_parser("chain", help="archived (see compose): two organoids trained jointly as one network")
+    two_organoids(p)
     p.add_argument("--n1", type=int, default=6, help="units on organoid A")
     p.add_argument("--n2", type=int, default=6, help="units on organoid B")
-    p.add_argument("--codes", action=argparse.BooleanOptionalAction, default=None,
-                   help="train codes (default: on once codetest has passed on this machine)")
     p.set_defaults(func=cmd_chain)
+
+    p = sub.add_parser("compose", help="≤ 80 min: a block per organoid, each trained on its own, then both in series, "
+                                       "in both orders")
+    two_organoids(p)
+    p.add_argument("--width", type=int, default=6, help="units per block")
+    p.set_defaults(func=cmd_compose)
 
     p = sub.add_parser("codetest", help="~3 min: check that train codes are safe and readable")
     common(p)

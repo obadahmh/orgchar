@@ -26,6 +26,11 @@ Use FinalSpark organoid pairs (stim→rec) as the activation functions of a hybr
 - The screen runs on `measure` too (no shams; every other electrode read, for the cross-organoid controls). `plan_trials` deals electrodes across organoids and gives each its lengths in random order.
 - Next: merge into `main` once the user agrees; both machines then `git pull`.
 
+## Branch `compose` (3 Nov 2026, from `chain`)
+- `orgchar compose`: a block per organoid, each trained on its own curve, then connected in series in both orders (README). Replaces the joint training of `chain`, whose two live runs failed on organoid A's drift (30 Oct R² −0.31, 2 Nov 0.40).
+- `net.fit` takes a problem (`ode_problem` or `map_problem`); `solve.measure_at` and `solve.drift` are shared by chain and compose.
+- Not yet run on hardware.
+
 ## Open questions / next steps
 1. **R² has a bar: 0.80.** A plain decay a × exp(−kt) + b, with no oscillation, scores R² 0.80 at the 25 evaluation times. At 6,000 training steps every network stopped there (0.72–0.82), so earlier R² of 0.7–0.8, offline or live, did not show the oscillation. The fix was training longer, not more types or width: at 40,000 steps one curve reaches 0.95 with trial noise (steep falling; peaked 0.93 and shallow falling 0.86 at 20,000), and the simulated solve gives 0.92 on the tissue with the trough and the rebound. Gate 2 requires the expected R² to beat the decay. Not yet run on hardware.
 2. **Drift within a run.** The sweep and the evaluation are ~1 h apart at most; the drift check reports it (simulated: 9 % of the curve's range).

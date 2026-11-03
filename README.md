@@ -125,8 +125,9 @@ the train, so later for longer trains. On fs666 e10, 2–4 pulses set off a burs
 organoid lasting ~400 ms; longer trains cut it short and leave the organoid quiet. Both effects make
 the curve fall.
 
-### chain (two organoids in series, the base case of a deep network)
+### chain (archived: replaced by compose)
 
+Kept for its two live runs (30 Oct and 2 Nov 2026, R² −0.31 and 0.40, both lost to organoid A's drift).
 Organoid A's measured responses set organoid B's train lengths, and B's responses, weighted, are the
 answer to the same oscillator. A and B are organoids on different MEAs, so cross-talk cannot link them.
 Layer 1 is 6 units on A's pair, as in solve. Each of the 6 layer-2 units takes a weighted sum of all six
@@ -136,6 +137,26 @@ own Intan/trigger box (`--box-a`, `--box-b`; default: this machine's): sweep A, 
 evaluate A, evaluate B at the lengths A's responses set. The gates are solve's. The lock covers this
 machine only: the other machine must not drive its box during the run. Control: B's responses shuffled
 across its pulse counts. Everything goes to `result.json`, written after every step; there is no report page yet.
+
+### compose (a block per organoid, trained apart, then in series)
+
+Each organoid gets its own network, trained on that organoid's curve alone, to a function from [0, 1]
+to [0, 1]: a block (signal in, train lengths, the organoid's responses, signal out). Organoid A hosts
+square (u²) and saturate (an S-curve), organoid B hosts invert (1 − u). Every block takes and gives a
+signal in [0, 1], so blocks connect in series without retraining, in either order. In series they should
+give the composition of their functions. Linear blocks commute; nonlinear ones in general do not.
+saturate is symmetric about (0.5, 0.5), so saturate and invert commute; square and invert do not
+((1 − u)² against 1 − u²). The run measures each block alone and both orders of both pairs, at 25 inputs.
+
+Steps: sweep B, sweep A, train the three blocks (about 2 min; gate: every block's expected R² ≥ 0.9),
+then organoid A, B, A, each at the lengths the outputs measured before it ask for: B's from A's measured
+outputs, the second A stage's from B's. B is swept first so that neither organoid waits more than about
+30 min between its curve and its use; at most about 78 min in all. The order gap is the root-mean-square
+difference between a pair's two orders, shown against its expected range from trial noise. Control: each
+block's responses shuffled across pulse counts. Offline, on the curves measured 18 Oct–2 Nov: every block
+and order expected at R² 0.94–0.98; on the drifted chain runs' later responses, blocks 0.64–0.89 (the
+chain itself: −0.31 and 0.40), with the order gaps still apart (0.30 against 0.06–0.09). Everything goes to
+`result.json`, written after every step; there is no report page yet.
 
 ## Running it
 
@@ -158,6 +179,7 @@ cd ~/Documents/orgchar
 Useful options:
 - `screen --blocks 1,2`: override the census choice. `screen --electrodes 21,15`: a subset.
 - `chain --fsname-a fs682 --fsname-b fs683 --box-b 172.30.1.139`: A on np14's box (172.30.2.170), B on neuroplatform10's. A's and B's pairs come from each MEA's latest screen on this machine; `--pair-a 13:10 --pair-b 5:3` to choose.
+- `compose --fsname-a fs689 --fsname-b fs691 --box-b 172.30.1.139 --pair-a 14:12 --pair-b 25:26`: the same boxes and pairs as chain; `--width 6` units per block.
 - `solve --pairs 13:10`: choose the pair(s) (stim:rec); `--sweep-reps 8`, `--reps 6` (trains per pulse count in the sweep and the run), `--width 12`, `--points 26`.
 - `screen --amplitude 3` / `--phase 150`: more current. Stimulation limits are enforced before any upload: ≤ 3 µA, ≤ 200 µs, ≤ 0.4 nC/phase, ≤ 20 pulses. Change them in `orgchar/protocol.py` (`LIMITS`).
 
@@ -238,5 +260,5 @@ Timing alone says *where* each train is, not *which* train it is; the alignment 
 - **Not verified:** `solve` itself on hardware.
 - **Codes on keys 8–14 (and codetest's marker key 15) assume no electrode is bound to them.** Each segment starts with disable-all and only the planned electrodes (keys 0–7) are uploaded; every coded run checks for an artifact after code triggers.
 
-Tests: 28, about 4 min. pytest is not in `ncp`, so use a side venv that leaves `ncp` untouched:
+Tests: 36, about 5 min. pytest is not in `ncp`, so use a side venv that leaves `ncp` untouched:
 `python -m venv --system-site-packages /tmp/t && /tmp/t/bin/pip install pytest && /tmp/t/bin/python -m pytest -q` (create the venv with the `ncp` python).

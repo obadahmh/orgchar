@@ -19,6 +19,8 @@ and tissue has no derivative). Plus y(0), a penalty on the output weights, and t
 variance from the measured single-trial spread (the integrals alone average noise away). Two phases:
 fractional pulse counts with exact gradients, then whole counts at a low learning rate, keeping the
 state with the lowest rounded loss (the straight-through gradient alone drove training uphill).
+fit takes the problem as (grid, loss of y on it): the oscillator's weak form here, or the squared
+error to a function from [0, 1] to [0, 1] (compose's blocks).
 """
 from __future__ import annotations
 
@@ -183,16 +185,32 @@ def weak_loss(y: torch.Tensor, ode: Oscillator, kernel, phi0, dphi0) -> torch.Te
     return r.pow(2).mean() + IC_WEIGHT * (y0 - ode.y0) ** 2
 
 
+def ode_problem(ode: Oscillator):
+    """The oscillator as (training grid, loss of y on it): the weak form plus y(0)."""
+    t = grid(ode)
+    kernel, phi0, dphi0 = bump_kernels(ode, t)
+    return t, partial(weak_loss, ode=ode, kernel=kernel, phi0=phi0, dphi0=dphi0)
+
+
+def squared_error(y: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return (y - target).pow(2).mean()
+
+
+def map_problem(f, n: int = POINTS):
+    """A function f from [0, 1] to [0, 1] as (training grid, squared error of y to f). With the noise
+    variance added at NOISE_WEIGHT 1, the loss is the expected squared error on the tissue."""
+    u = torch.linspace(0, 1, n, dtype=torch.float64).unsqueeze(1)
+    return u, partial(squared_error, target=torch.from_numpy(f(u.numpy())))
+
+
 def _fit(job):
-    make, ode, repeats, steps, seed = job
+    make, (x, data_loss), repeats, steps, seed = job
     torch.set_num_threads(1)
     torch.manual_seed(seed)
     net = make()
-    t = grid(ode)
-    tf = bump_kernels(ode, t)
 
     def loss_fn():
-        return (weak_loss(net(t), ode, *tf) + NOISE_WEIGHT * net.noise_var(t, repeats).mean()
+        return (data_loss(net(x)) + NOISE_WEIGHT * net.noise_var(x, repeats).mean()
                 + WEIGHT_DECAY * net.out.weight.pow(2).sum())
 
     net.integer = False                                   # phase 1: fractional pulses, exact gradients
@@ -223,10 +241,11 @@ def train_minutes(starts: int = 8, steps: int = STEPS) -> float:
     return 0.004 * (steps + FINETUNE_STEPS) * -(-starts // os.cpu_count()) / 60
 
 
-def fit(make, ode: Oscillator, repeats: float = 6, starts: int = 8, steps: int = STEPS):
-    """Train the network `make()` builds from `starts` initialisations in parallel; keep the one with the
-    lowest loss (the exact solution is never used). Returns the network and {start: loss}."""
-    jobs = [(make, ode, repeats, steps, seed) for seed in range(starts)]
+def fit(make, problem, repeats: float = 6, starts: int = 8, steps: int = STEPS):
+    """Train the network `make()` builds on `problem` (ode_problem or map_problem) from `starts`
+    initialisations in parallel; keep the one with the lowest loss (for the oscillator, the exact solution
+    is never used). Returns the network and {start: loss}."""
+    jobs = [(make, problem, repeats, steps, seed) for seed in range(starts)]
     with Pool(min(starts, torch.multiprocessing.cpu_count())) as pool:
         results = pool.map(_fit, jobs)
     seed, _, state = min(results, key=lambda r: r[1])
@@ -237,7 +256,7 @@ def fit(make, ode: Oscillator, repeats: float = 6, starts: int = 8, steps: int =
 
 def train(curves, ode: Oscillator, width: int = 12, repeats: float = 6, starts: int = 8, steps: int = STEPS):
     """The one-layer network on `curves`, trained by fit."""
-    return fit(partial(Net, list(curves), ode.T, width), ode, repeats, starts, steps)
+    return fit(partial(Net, list(curves), ode.T, width), ode_problem(ode), repeats, starts, steps)
 
 
 def expected_r2(net: Net, ode: Oscillator, t: torch.Tensor, repeats: float, draws: int = 200, seed: int = 0) -> dict:
