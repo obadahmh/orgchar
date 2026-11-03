@@ -7,19 +7,25 @@ signal in [0, 1] (a block's input is clipped to it), so any block can follow any
 retraining, as blocks with a standard signal range do in a control loop.
 
 In series the blocks should give the composition f_B(f_A(u)). Its error is about e_B + f_B' e_A, so
-every function's slope stays at or below 2. The order of linear blocks never matters; for nonlinear ones
+every function's slope stays at or below about 2 (saturate's peaks at 2.07). The order of linear blocks never matters; for nonlinear ones
 it does, except for special pairs. saturate is symmetric about (0.5, 0.5), so it commutes with invert;
 square does not: invert then square is (1 - u)², square then invert 1 - u². The run measures both orders
 of both pairs. Offline, on the measured curves of 18 Oct-2 Nov 2026: every block and order expected at
 R² 0.94-0.98, and the two orders of the non-commuting pair 0.36 apart against 0.08-0.10 for the
-commuting one. Replayed on the 30 Oct and 2 Nov chain runs, where organoid A drifted: blocks 0.64-0.89
-(the chain: -0.31 and 0.40), and the order gaps still 0.30 against 0.06-0.09.
+commuting one. Replayed on the later responses of the 30 Oct and 2 Nov chain runs, after organoid A had
+changed: A's blocks 0.64-0.89 and the series 0.58-0.89, below the bar, but the order gaps still 0.30
+against 0.06-0.09.
 
 Steps: sweep B, sweep A, train each block on its own organoid's curve (gate: every block's expected R²
 at least GATE_R2), then three stages, each organoid's train lengths set by the outputs measured before:
 A (A's blocks on u), B (invert on u and on A's outputs), A (A's blocks on B's outputs). B is swept first
-so that neither organoid waits more than about 30 min between its curve and its use. Responses are
-medians (solve.center_spread). result.json is written after every step.
+so the waits balance: each measurement starts within about 33 min of its organoid's sweep, about as long
+as in the chain runs, so the design relies on steady pairs, not on a shorter wait. Responses are medians
+(solve.center_spread). result.json is written after every step.
+
+Pass: every series R² at least GATE_R2, each commuting pair's order gap at most its predicted 95th
+percentile, and each other pair's gap above that. A system working as modelled passes about 90 % of the
+time (1000 draws on the simulated session's blocks, 3 Nov 2026).
 """
 from __future__ import annotations
 
@@ -94,7 +100,8 @@ def gap(y1, y2) -> float:
 
 
 def spread(x) -> dict:
-    return dict(median=float(np.median(x)), p10=float(np.percentile(x, 10)), p90=float(np.percentile(x, 90)))
+    return dict(median=float(np.median(x)), p10=float(np.percentile(x, 10)), p90=float(np.percentile(x, 90)),
+                p95=float(np.percentile(x, 95)))
 
 
 def expected(nets: dict, curves: dict, u, sweep_reps, eval_reps, draws=300, seed=0) -> dict:
@@ -121,21 +128,24 @@ def shuffle_null(net: N.Net, u, table: dict, r2_run: float, goal, draws=2000, se
                 share_above_run=float((scores >= r2_run).mean()))
 
 
+def commutes(a, b) -> bool:
+    u = np.linspace(0, 1, 1001)
+    return gap(target((a, b), u), target((b, a), u)) < 1e-9
+
+
 def verdict(res: dict) -> str:
-    r2 = res["r2"]
+    r2, gaps = res["r2"], res["gaps"]
     series = [p for p in PATHS if len(p) > 1]
+    bar = max(gaps[name(ab)]["expected"]["p95"] for ab in PAIRS if commutes(*ab))
+    fits = all(r2[name(p)] >= GATE_R2 for p in series)
+    orders = all((gaps[name(ab)]["measured"] <= bar) == commutes(*ab) for ab in PAIRS)
     alone = ", ".join(f"{b} R² {r2[b]:.2f}" for b in HOME)
     chained = ", ".join(f"{' → '.join(p)} {r2[name(p)]:.2f}" for p in series)
-    ok = all(r2[name(p)] >= GATE_R2 for p in series)
-    order = []
-    for a, b in PAIRS:
-        g = res["gaps"][name((a, b))]
-        order.append(f"{a} and {b} {'commute' if g['targets'] < 1e-9 else 'do not commute'}: the two orders "
-                     f"{g['measured']:.2f} apart (expected {g['expected']['p10']:.2f}-{g['expected']['p90']:.2f}, "
-                     f"targets {g['targets']:.2f} apart)")
-    return (f"Alone: {alone}. In series: {chained}. "
-            + (f"Every series output matches its composition (R² ≥ {GATE_R2})." if ok else
-               f"Not every series output matches its composition (some R² below {GATE_R2}).") + f" Order: {'; '.join(order)}.")
+    order = "; ".join(f"{a} and {b} {'commute' if commutes(a, b) else 'do not commute'}: the two orders "
+                      f"{gaps[name((a, b))]['measured']:.2f} apart (targets {gaps[name((a, b))]['targets']:.2f} apart)"
+                      for a, b in PAIRS)
+    return (f"{'PASS' if fits and orders else 'FAIL'}. Alone: {alone}. In series: {chained} (bar {GATE_R2}). "
+            f"Order, against {bar:.2f} (the commuting pair's predicted 95th percentile): {order}.")
 
 
 def run(fs_a, pair_a, fs_b, pair_b, backends: dict, step_dir: Path, codes: bool, sweep_reps=SWEEP_REPS,

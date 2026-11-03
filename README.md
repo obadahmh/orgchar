@@ -151,12 +151,15 @@ saturate is symmetric about (0.5, 0.5), so saturate and invert commute; square a
 
 Steps: sweep B, sweep A, train the three blocks (about 2 min; gate: every block's expected R² ≥ 0.9),
 then organoid A, B, A, each at the lengths the outputs measured before it ask for: B's from A's measured
-outputs, the second A stage's from B's. B is swept first so that neither organoid waits more than about
-30 min between its curve and its use; at most about 78 min in all. The order gap is the root-mean-square
-difference between a pair's two orders, shown against its expected range from trial noise. Control: each
-block's responses shuffled across pulse counts. Offline, on the curves measured 18 Oct–2 Nov: every block
-and order expected at R² 0.94–0.98; on the drifted chain runs' later responses, blocks 0.64–0.89 (the
-chain itself: −0.31 and 0.40), with the order gaps still apart (0.30 against 0.06–0.09). Everything goes to
+outputs, the second A stage's from B's. B is swept first so the waits balance: each measurement starts
+within about 33 min of its organoid's sweep, about as long as in the chain runs, so the design relies on
+steady pairs. About 78 min in all. The order gap is the root-mean-square difference between a pair's two
+orders. Pass: every series R² ≥ 0.9, the commuting pair's gap at most its predicted 95th percentile and the
+other pair's above it (a system working as modelled passes about 90 % of the time). Control: each block's
+responses shuffled across pulse counts. Offline, on the curves measured 18 Oct–2 Nov: every block and
+order expected at R² 0.94–0.98; on the chain runs' later responses, after organoid A had changed, A's
+blocks 0.64–0.89 and the series 0.58–0.89, below the bar, with the order gaps still apart (0.30 against
+0.06–0.09). Everything goes to
 `result.json`, written after every step; there is no report page yet.
 
 ## Running it

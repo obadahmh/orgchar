@@ -67,3 +67,14 @@ def test_compose_end_to_end(tmp_path, monkeypatch):
     assert all(np.isfinite(v) for v in res["r2"].values())
     assert res["gaps"]["saturate>invert"]["targets"] < 1e-9 < res["gaps"]["square>invert"]["targets"]
     assert json.loads((tmp_path / "result.json").read_text())["verdict"] == res["verdict"]
+
+
+def test_verdict_needs_fits_and_the_predicted_order_behaviour():
+    res = dict(r2={CO.name(p): 0.95 for p in CO.PATHS},
+               gaps={"square>invert": dict(measured=0.35, targets=0.37, expected=dict(p95=0.40)),
+                     "saturate>invert": dict(measured=0.08, targets=0.0, expected=dict(p95=0.11))})
+    assert CO.verdict(res).startswith("PASS")
+    res["gaps"]["saturate>invert"]["measured"] = 0.2                  # the commuting pair's orders came apart
+    assert CO.verdict(res).startswith("FAIL")
+    res["gaps"]["saturate>invert"]["measured"], res["r2"]["invert>square"] = 0.08, 0.85
+    assert CO.verdict(res).startswith("FAIL")
