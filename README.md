@@ -128,6 +128,7 @@ the curve fall.
 ### chain (archived: replaced by compose)
 
 Kept for its two live runs (30 Oct and 2 Nov 2026, R² −0.31 and 0.40, both lost to organoid A's drift).
+
 Organoid A's measured responses set organoid B's train lengths, and B's responses, weighted, are the
 answer to the same oscillator. A and B are organoids on different MEAs, so cross-talk cannot link them.
 Layer 1 is 6 units on A's pair, as in solve. Each of the 6 layer-2 units takes a weighted sum of all six
