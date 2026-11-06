@@ -78,3 +78,11 @@ def test_verdict_needs_fits_and_the_predicted_order_behaviour():
     assert CO.verdict(res).startswith("FAIL")
     res["gaps"]["saturate>invert"]["measured"], res["r2"]["invert>square"] = 0.08, 0.85
     assert CO.verdict(res).startswith("FAIL")
+
+
+def test_a_curve_too_small_stops_before_training(tmp_path, monkeypatch):
+    monkeypatch.setattr(CO, "MIN_RANGE", 1e6)
+    backends = {o: SimBackend(simulate.demo_organoid()) for o in "AB"}
+    res = CO.run("fsA", (13, 10), "fsB", (21, 22), backends, tmp_path, False, sweep_reps=4, points=11, starts=2,
+                 steps=300)
+    assert res["verdict"].startswith("STOPPED after organoid B's sweep") and "stages" not in res

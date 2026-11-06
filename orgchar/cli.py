@@ -643,12 +643,20 @@ def cmd_solve(a):
 
 
 def _two(a):
-    """Organoid A's and B's pairs and Intan/trigger boxes; the session folder is A+B."""
+    """Organoid A's and B's pairs and Intan/trigger boxes; the session folder is A+B. A and B are two of
+    the four organoids of one MEA (same fsname, one box) or organoids on two MEAs (one box each)."""
+    from .signals import block_of
     pa = _pair(a.pair_a) if a.pair_a else _screen_pair(a.fsname_a, a.simulate)
     pb = _pair(a.pair_b) if a.pair_b else _screen_pair(a.fsname_b, a.simulate)
-    box_a, box_b = (b or os.environ.get("INTAN_SOFTWARE_IP") for b in (a.box_a, a.box_b))
-    if box_a == box_b and not a.simulate:
-        sys.exit(f"A and B are both on box {box_a}: give each MEA's box with --box-a / --box-b.")
+    if a.fsname_a == a.fsname_b:
+        if block_of(pa[0]) == block_of(pb[0]):
+            sys.exit("A and B are the same organoid: give pairs on two of the MEA's organoids "
+                     "(electrodes 0-7, 8-15, 16-23, 24-31).")
+        box_a = box_b = a.box_a or a.box_b or os.environ.get("INTAN_SOFTWARE_IP")
+    else:
+        box_a, box_b = (b or os.environ.get("INTAN_SOFTWARE_IP") for b in (a.box_a, a.box_b))
+        if box_a == box_b and not a.simulate:
+            sys.exit(f"A and B are both on box {box_a}: give each MEA's box with --box-a / --box-b.")
     a.fsname = f"{a.fsname_a}+{a.fsname_b}"          # the session folder, and the name to type to confirm
     return pa, pb, box_a, box_b
 

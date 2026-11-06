@@ -149,7 +149,11 @@ give the composition of their functions. Linear blocks commute; nonlinear ones i
 saturate is symmetric about (0.5, 0.5), so saturate and invert commute; square and invert do not
 ((1 − u)² against 1 − u²). The run measures each block alone and both orders of both pairs, at 25 inputs.
 
-Steps: sweep B, sweep A, train the three blocks (about 2 min; gate: every block's expected R² ≥ 0.9),
+A and B are organoids on two MEAs (one box each), or two of the four organoids on one MEA (same fsname,
+one box; the screen's cross-organoid controls show whether they drive each other).
+
+Steps: sweep B, sweep A (gate: each curve spans at least 15 spikes), train the three blocks (about 2 min;
+gate: every block's expected R² ≥ 0.9),
 then organoid A, B, A, each at the lengths the outputs measured before it ask for: B's from A's measured
 outputs, the second A stage's from B's. B is swept first so the waits balance: each measurement starts
 within about 33 min of its organoid's sweep, about as long as in the chain runs, so the design relies on
@@ -184,6 +188,7 @@ Useful options:
 - `screen --blocks 1,2`: override the census choice. `screen --electrodes 21,15`: a subset.
 - `chain --fsname-a fs682 --fsname-b fs683 --box-b 172.30.1.139`: A on np14's box (172.30.2.170), B on neuroplatform10's. A's and B's pairs come from each MEA's latest screen on this machine; `--pair-a 13:10 --pair-b 5:3` to choose.
 - `compose --fsname-a fs689 --fsname-b fs691 --box-b 172.30.1.139 --pair-a 14:12 --pair-b 25:26`: the same boxes and pairs as chain; `--width 6` units per block.
+- `compose --fsname-a fs691 --fsname-b fs691 --box-a 172.30.1.139 --pair-a 21:20 --pair-b 15:13`: two organoids of one MEA, through its one box.
 - `solve --pairs 13:10`: choose the pair(s) (stim:rec); `--sweep-reps 8`, `--reps 6` (trains per pulse count in the sweep and the run), `--width 12`, `--points 26`.
 - `screen --amplitude 3` / `--phase 150`: more current. Stimulation limits are enforced before any upload: ≤ 3 µA, ≤ 200 µs, ≤ 0.4 nC/phase, ≤ 20 pulses. Change them in `orgchar/protocol.py` (`LIMITS`).
 

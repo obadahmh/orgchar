@@ -16,8 +16,8 @@ commuting one. Replayed on the later responses of the 30 Oct and 2 Nov chain run
 changed: A's blocks 0.64-0.89 and the series 0.58-0.89, below the bar, but the order gaps still 0.30
 against 0.06-0.09.
 
-Steps: sweep B, sweep A, train each block on its own organoid's curve (gate: every block's expected R²
-at least GATE_R2), then three stages, each organoid's train lengths set by the outputs measured before:
+Steps: sweep B, sweep A (gate: each curve spans at least MIN_RANGE spikes), train each block on its own
+organoid's curve (gate: every block's expected R² at least GATE_R2), then three stages, each organoid's train lengths set by the outputs measured before:
 A (A's blocks on u), B (invert on u and on A's outputs), A (A's blocks on B's outputs). B is swept first
 so the waits balance: each measurement starts within about 33 min of its organoid's sweep, about as long
 as in the chain runs, so the design relies on steady pairs, not on a shorter wait. Responses are medians
@@ -47,6 +47,9 @@ PATHS = [(b,) for b in HOME] + [p for a, b in PAIRS for p in ((a, b), (b, a))]
 STAGES = ("A", "B", "A")
 # 6 units, 4000 steps: blocks at expected R² 0.94-0.99 on the measured curves, ~30 s each on np14 (3 Nov 2026)
 WIDTH, STEPS, POINTS, GATE_R2, TRAIN_MIN = 6, 4000, 26, 0.9, 2
+# a curve spanning fewer spikes is too small to build on: on 5 Nov 2026 a 6-spike curve (57 three days
+# before) passed the R² gate at 0.91, lost its 2-pulse response within 35 min, and its blocks scored 0.34-0.42
+MIN_RANGE = 15
 
 
 class Missing(Exception):
@@ -172,6 +175,9 @@ def run(fs_a, pair_a, fs_b, pair_b, backends: dict, step_dir: Path, codes: bool,
         if not keep:
             return stop(f"STOPPED after organoid {org}'s sweep: its pair does not respond cleanly to the pulse count. "
                         "No further stimulation.")
+        if np.ptp(keep[0].mean) < MIN_RANGE:
+            return stop(f"STOPPED after organoid {org}'s sweep: its response spans {np.ptp(keep[0].mean):.1f} spikes, "
+                        f"under {MIN_RANGE}. No further stimulation.")
         curves[org], thr[org] = keep[0], info["thresholds_uV"]
 
     # 3. train each block on its own organoid's curve only (no stimulation)
